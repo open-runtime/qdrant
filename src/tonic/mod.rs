@@ -96,14 +96,12 @@ impl Health for HealthService {
 async fn monitor_health_check(last_check: Arc<Mutex<Instant>>, shutdown_flag: Arc<AtomicBool>) {
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        println!("Checking health");
         let last_check_time = last_check.lock().unwrap();
         if last_check_time.elapsed() > Duration::from_secs(1) {
-            println!("Health check failed");
+            println!("Qdrant health check failed");
             shutdown_flag.store(true, Ordering::SeqCst);
             break;
         }
-        println!("Health check passed");
     }
 }
 
