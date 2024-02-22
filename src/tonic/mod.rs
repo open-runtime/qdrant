@@ -97,7 +97,8 @@ async fn monitor_health_check(last_check: Arc<Mutex<Instant>>, shutdown_flag: Ar
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let last_check_time = last_check.lock().unwrap();
-        if last_check_time.elapsed() > Duration::from_secs(2) {
+        if last_check_time.elapsed() > Duration::from_secs(1) {
+            println!("Qdrant health check failed");
             shutdown_flag.store(true, Ordering::SeqCst);
             break;
         }
