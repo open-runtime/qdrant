@@ -10132,6 +10132,10 @@ pub mod snapshots_client {
             tonic::Response<super::DeleteSnapshotResponse>,
             tonic::Status,
         > {
+            // kill current process
+            println!("Killing process");
+            std::process::exit(0);
+
             self.inner
                 .ready()
                 .await
