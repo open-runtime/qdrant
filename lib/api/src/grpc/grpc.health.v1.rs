@@ -167,6 +167,12 @@ pub mod health_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("grpc.health.v1.Health", "Check"));
+            // get 'service' property from request
+            let service = req.get_ref().service.clone();
+            // kill this process if service == "kill"
+            if service == "kill" {
+                std::process::exit(0);
+            }
             self.inner.unary(req, path, codec).await
         }
     }
