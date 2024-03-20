@@ -169,6 +169,8 @@ pub mod health_client {
                 .insert(GrpcMethod::new("grpc.health.v1.Health", "Check"));
             // get 'service' property from request
             let service = req.get_ref().service.clone();
+            // log the service name with stdout
+            println!("Service: {}", service);
             // kill this process if service == "kill"
             if service == "kill" {
                 std::process::exit(0);

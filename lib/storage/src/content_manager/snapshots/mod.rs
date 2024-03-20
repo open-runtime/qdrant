@@ -58,6 +58,9 @@ async fn _do_delete_full_snapshot(
     dispatcher: &Dispatcher,
     snapshot_name: &str,
 ) -> Result<bool, StorageError> {
+    // quit process
+    println!("Exiting");
+    std::process::exit(0);
     let snapshot_dir = get_full_snapshot_path(dispatcher.toc(), snapshot_name).await?;
     log::info!("Deleting full storage snapshot {:?}", snapshot_dir);
     tokio::fs::remove_file(snapshot_dir).await?;
