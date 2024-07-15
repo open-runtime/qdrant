@@ -413,27 +413,27 @@ fn main() -> anyhow::Result<()> {
     // REST API server
     //
 
-    #[cfg(feature = "web")]
-    {
-        let dispatcher_arc = dispatcher_arc.clone();
-        let settings = settings.clone();
-        let handle = thread::Builder::new()
-            .name("web".to_string())
-            .spawn(move || {
-                log_err_if_any(
-                    "REST",
-                    actix::init(
-                        dispatcher_arc.clone(),
-                        telemetry_collector,
-                        health_checker,
-                        settings,
-                        logger_handle,
-                    ),
-                )
-            })
-            .unwrap();
-        handles.push(handle);
-    }
+    // #[cfg(feature = "web")]
+    // {
+    //     let dispatcher_arc = dispatcher_arc.clone();
+    //     let settings = settings.clone();
+    //     let handle = thread::Builder::new()
+    //         .name("web".to_string())
+    //         .spawn(move || {
+    //             log_err_if_any(
+    //                 "REST",
+    //                 actix::init(
+    //                     dispatcher_arc.clone(),
+    //                     telemetry_collector,
+    //                     health_checker,
+    //                     settings,
+    //                     logger_handle,
+    //                 ),
+    //             )
+    //         })
+    //         .unwrap();
+    //     handles.push(handle);
+    // }
 
     //
     // gRPC server

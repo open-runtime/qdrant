@@ -3955,6 +3955,77 @@ dependencies = [
 ]
 
 [[package]]
+name = "pieces_qdrant_server"
+version = "1.10.1"
+dependencies = [
+ "actix-cors",
+ "actix-files",
+ "actix-multipart",
+ "actix-web",
+ "actix-web-extras",
+ "actix-web-validator",
+ "anyhow",
+ "api",
+ "cancel",
+ "chrono",
+ "clap 4.5.8",
+ "collection",
+ "colored",
+ "common",
+ "config",
+ "console-subscriber",
+ "constant_time_eq 0.3.0",
+ "futures",
+ "futures-util",
+ "issues",
+ "itertools 0.13.0",
+ "jsonwebtoken",
+ "log",
+ "memory",
+ "parking_lot",
+ "prometheus",
+ "prost 0.11.9",
+ "pyroscope",
+ "pyroscope_pprofrs",
+ "raft",
+ "raft-proto",
+ "rand 0.8.5",
+ "reqwest 0.12.5",
+ "rstack-self",
+ "rustls 0.23.11",
+ "rustls-pemfile 2.1.2",
+ "rustls-pki-types",
+ "rusty-hook",
+ "schemars",
+ "sealed_test",
+ "segment",
+ "serde",
+ "serde_cbor",
+ "serde_json",
+ "serde_urlencoded",
+ "slog",
+ "slog-stdlog",
+ "storage",
+ "sys-info",
+ "tempfile",
+ "thiserror",
+ "tikv-jemallocator",
+ "tokio",
+ "tonic",
+ "tonic-reflection",
+ "tower",
+ "tower-layer",
+ "tracing",
+ "tracing-log",
+ "tracing-subscriber",
+ "tracing-tracy",
+ "uuid",
+ "validator",
+ "wal",
+ "winres",
+]
+
+[[package]]
 name = "pin-project"
 version = "1.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4399,76 +4470,6 @@ dependencies = [
  "pprof",
  "pyroscope",
  "thiserror",
-]
-
-[[package]]
-name = "qdrant"
-version = "1.10.1"
-dependencies = [
- "actix-cors",
- "actix-files",
- "actix-multipart",
- "actix-web",
- "actix-web-extras",
- "actix-web-validator",
- "anyhow",
- "api",
- "cancel",
- "chrono",
- "clap 4.5.8",
- "collection",
- "colored",
- "common",
- "config",
- "console-subscriber",
- "constant_time_eq 0.3.0",
- "futures",
- "futures-util",
- "issues",
- "itertools 0.13.0",
- "jsonwebtoken",
- "log",
- "memory",
- "parking_lot",
- "prometheus",
- "prost 0.11.9",
- "pyroscope",
- "pyroscope_pprofrs",
- "raft",
- "raft-proto",
- "rand 0.8.5",
- "reqwest 0.12.5",
- "rstack-self",
- "rustls 0.23.11",
- "rustls-pemfile 2.1.2",
- "rustls-pki-types",
- "rusty-hook",
- "schemars",
- "sealed_test",
- "segment",
- "serde",
- "serde_cbor",
- "serde_json",
- "serde_urlencoded",
- "slog",
- "slog-stdlog",
- "storage",
- "sys-info",
- "tempfile",
- "thiserror",
- "tikv-jemallocator",
- "tokio",
- "tonic",
- "tonic-reflection",
- "tower",
- "tower-layer",
- "tracing",
- "tracing-log",
- "tracing-subscriber",
- "tracing-tracy",
- "uuid",
- "validator",
- "wal",
 ]
 
 [[package]]
@@ -7272,6 +7273,15 @@ checksum = "a277a57398d4bfa075df44f501a17cfdf8542d224f0d36095a2adc7aee4ef0a5"
 dependencies = [
  "cfg-if",
  "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "winres"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b68db261ef59e9e52806f688020631e987592bd83619edccda9c47d42cde4f6c"
+dependencies = [
+ "toml 0.5.10",
 ]
 
 [[package]]
