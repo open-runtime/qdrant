@@ -441,6 +441,7 @@ fn main() -> anyhow::Result<()> {
 
     if let Some(grpc_port) = settings.service.grpc_port {
         let settings = settings.clone();
+        let toc_arc_clone = toc_arc.clone();
         let handle = thread::Builder::new()
             .name("grpc".to_string())
             .spawn(move || {
@@ -452,6 +453,7 @@ fn main() -> anyhow::Result<()> {
                         settings,
                         grpc_port,
                         runtime_handle,
+                        toc_arc_clone,
                     ),
                 )
             })

@@ -174,6 +174,7 @@ pub fn init(
     settings: Settings,
     grpc_port: u16,
     runtime: Handle,
+    toc: Arc<TableOfContent>,
 ) -> io::Result<()> {
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shutdown_flag_clone = shutdown_flag.clone();
@@ -198,6 +199,8 @@ pub fn init(
         let collections_service = CollectionsService::new(dispatcher.clone());
         let points_service = PointsService::new(dispatcher.clone());
         let snapshot_service = SnapshotsService::new(dispatcher.clone());
+        let http_client = HttpClient::from_settings(&settings)?;
+        let shard_snapshots_service = ShardSnapshotsService::new(toc.clone(), http_client);
 
         // Only advertise the public services. By default, all services in QDRANT_DESCRIPTOR_SET
         // will be advertised, so explicitly list the services to be included.
@@ -208,6 +211,7 @@ pub fn init(
             .with_service_name("qdrant.Snapshots")
             .with_service_name("qdrant.Qdrant")
             .with_service_name("grpc.health.v1.Health")
+            .with_service_name("qdrant.ShardSnapshots")
             .build()
             .unwrap();
 
@@ -273,6 +277,12 @@ pub fn init(
             )
             .add_service(
                 HealthServer::new(health_service)
+                    .send_compressed(CompressionEncoding::Gzip)
+                    .accept_compressed(CompressionEncoding::Gzip)
+                    .max_decoding_message_size(usize::MAX),
+            )
+            .add_service(
+                ShardSnapshotsServer::new(shard_snapshots_service)
                     .send_compressed(CompressionEncoding::Gzip)
                     .accept_compressed(CompressionEncoding::Gzip)
                     .max_decoding_message_size(usize::MAX),
