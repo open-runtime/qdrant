@@ -10,6 +10,7 @@ use anyhow::{anyhow, Context};
 use chrono::Utc;
 use collection::collection_state;
 use collection::common::is_ready::IsReady;
+use collection::operations::types::PeerMetadata;
 use collection::shards::shard::PeerId;
 use collection::shards::CollectionId;
 use common::defaults;
@@ -33,7 +34,7 @@ use crate::content_manager::consensus::operation_sender::OperationSender;
 use crate::content_manager::consensus::persistent::Persistent;
 use crate::types::{
     ClusterInfo, ClusterStatus, ConsensusThreadStatus, MessageSendErrors, PeerAddressById,
-    PeerInfo, RaftInfo,
+    PeerInfo, PeerMetadataById, RaftInfo,
 };
 
 pub mod prelude {
@@ -42,11 +43,16 @@ pub mod prelude {
     pub type ConsensusState = super::ConsensusManager<TableOfContent>;
 }
 
+/// Allow us updating our peer metadata once every 60 seconds
+const CONSENSUS_PEER_METADATA_UPDATE_INTERVAL: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SnapshotData {
     pub collections_data: CollectionsSnapshot,
     #[serde(with = "crate::serialize_peer_addresses")]
     pub address_by_id: PeerAddressById,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata_by_id: PeerMetadataById,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -92,6 +98,8 @@ pub struct ConsensusManager<C: CollectionContainer> {
     consensus_thread_status: RwLock<ConsensusThreadStatus>,
     /// Consensus thread errors, changed by the consensus thread
     message_send_failures: RwLock<HashMap<String, MessageSendErrors>>,
+    /// Last time we attempted to update the peer metadata
+    next_peer_metadata_update_attempt: Mutex<Instant>,
 }
 
 impl<C: CollectionContainer> ConsensusManager<C> {
@@ -114,6 +122,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                 last_update: Utc::now(),
             }),
             message_send_failures: Default::default(),
+            next_peer_metadata_update_attempt: Mutex::new(Instant::now()),
         }
     }
 
@@ -142,6 +151,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         }
         entry.count += 1;
         entry.latest_error = Some(error.to_string());
+        entry.latest_error_timestamp = Some(Utc::now());
     }
 
     pub fn record_message_send_success(&self, peer_address: &Uri) {
@@ -172,6 +182,15 @@ impl<C: CollectionContainer> ConsensusManager<C> {
 
     pub fn this_peer_id(&self) -> PeerId {
         self.persistent.read().this_peer_id
+    }
+
+    pub fn peers(&self) -> Vec<PeerId> {
+        self.persistent
+            .read()
+            .peer_address_by_id()
+            .keys()
+            .copied()
+            .collect()
     }
 
     pub fn first_voter(&self) -> PeerId {
@@ -370,8 +389,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                 ConfChangeType::AddNode => {
                     debug_assert!(
                         self.peer_address_by_id()
-                            .get(&single_change.node_id)
-                            .is_some(),
+                            .contains_key(&single_change.node_id),
                         "Peer should be already known"
                     )
                 }
@@ -448,6 +466,13 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                 Ok(false)
             }
 
+            ConsensusOperations::UpdatePeerMetadata { peer_id, metadata } => {
+                self.persistent
+                    .write()
+                    .update_peer_metadata(peer_id, metadata)?;
+                Ok(true)
+            }
+
             ConsensusOperations::RequestSnapshot | ConsensusOperations::ReportSnapshot { .. } => {
                 unreachable!()
             }
@@ -471,9 +496,11 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         let data: SnapshotData = snapshot.get_data().try_into()?;
         self.toc.apply_collections_snapshot(data.collections_data)?;
         self.wal.lock().clear()?;
-        self.persistent
-            .write()
-            .update_from_snapshot(meta, data.address_by_id)?;
+        self.persistent.write().update_from_snapshot(
+            meta,
+            data.address_by_id,
+            data.metadata_by_id,
+        )?;
 
         Ok(Ok(()))
     }
@@ -523,23 +550,23 @@ impl<C: CollectionContainer> ConsensusManager<C> {
     }
 
     async fn await_receiver(
+        &self,
         mut receiver: Receiver<Result<bool, StorageError>>,
         wait_timeout: Duration,
+        operation: &ConsensusOperations,
     ) -> Result<bool, StorageError> {
         let timeout_res = tokio::time::timeout(wait_timeout, receiver.recv())
             .await
             .map_err(|_: Elapsed| {
+                self.on_consensus_op_apply.lock().remove(operation);
                 StorageError::service_error(format!(
                     "Waiting for consensus operation commit failed. Timeout set at: {} seconds",
-                    wait_timeout.as_secs_f64()
+                    wait_timeout.as_secs_f64(),
                 ))
             })?;
         // 2 possible errors to forward: channel sender dropped OR operation failed
         timeout_res.map_err(|err| {
-            StorageError::service_error(format!(
-                "Error occurred while waiting for consensus operation. Channel sender dropped ({})",
-                err
-            ))
+            StorageError::service_error(format!("Error occurred while waiting for consensus operation. Channel sender dropped ({err})"))
         })?
     }
 
@@ -636,7 +663,6 @@ impl<C: CollectionContainer> ConsensusManager<C> {
     ///
     /// * `operation` - operation to propose
     /// * `wait_timeout` - How long do we need to wait for the confirmation
-    ///
     pub async fn propose_consensus_op_with_await(
         &self,
         operation: ConsensusOperations,
@@ -676,12 +702,14 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                     // propose operation to consensus thread
                     self.propose_sender.send(operation.clone())?;
                     // insert new sender
-                    on_apply_lock.insert(operation, sender);
+                    on_apply_lock.insert(operation.clone(), sender);
                 }
             };
         }
 
-        let res = Self::await_receiver(receiver, wait_timeout).await?;
+        let res = self
+            .await_receiver(receiver, wait_timeout, &operation)
+            .await?;
         Ok(res)
     }
 
@@ -702,7 +730,37 @@ impl<C: CollectionContainer> ConsensusManager<C> {
     }
 
     pub fn sync_local_state(&self) -> Result<(), StorageError> {
+        self.try_update_peer_metadata()?;
         self.toc.sync_local_state()
+    }
+
+    /// Try to update our peer metadata if it's outdated
+    ///
+    /// It rate limits updating to `CONSENSUS_PEER_METADATA_UPDATE_INTERVAL`.
+    fn try_update_peer_metadata(&self) -> Result<(), StorageError> {
+        // Throttle updates to prevent spamming consensus
+        if Instant::now() < *self.next_peer_metadata_update_attempt.lock() {
+            return Ok(());
+        }
+
+        if !self.persistent.read().is_our_metadata_outdated() {
+            return Ok(());
+        }
+
+        log::debug!("Proposing consensus peer metadata update for this peer");
+        let result = self
+            .propose_sender
+            .send(ConsensusOperations::UpdatePeerMetadata {
+                peer_id: self.this_peer_id(),
+                metadata: PeerMetadata::current(),
+            });
+        if let Err(err) = result {
+            log::error!("Failed to propose consensus peer metadata update for this peer: {err}");
+        }
+        *self.next_peer_metadata_update_attempt.lock() =
+            Instant::now() + CONSENSUS_PEER_METADATA_UPDATE_INTERVAL;
+
+        Ok(())
     }
 }
 
@@ -770,6 +828,7 @@ impl<C: CollectionContainer> Storage for ConsensusManager<C> {
             let snapshot = SnapshotData {
                 collections_data,
                 address_by_id: persistent.peer_address_by_id(),
+                metadata_by_id: persistent.peer_metadata_by_id(),
             };
             Ok(raft::eraftpb::Snapshot {
                 data: serde_cbor::to_vec(&snapshot).map_err(raft_error_other)?,

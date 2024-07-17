@@ -3,6 +3,9 @@ use std::borrow::Cow;
 use serde::Serialize;
 use validator::{Validate, ValidationError, ValidationErrors};
 
+// Multivector should be small enough to fit the chunk of vector storage
+pub const MAX_MULTIVECTOR_FLATTENED_LEN: usize = 1024 * 1024;
+
 #[allow(clippy::manual_try_fold)] // `try_fold` can't be used because it shortcuts on Err
 pub fn validate_iter<T: Validate>(iter: impl Iterator<Item = T>) -> Result<(), ValidationErrors> {
     let errors = iter
@@ -69,7 +72,7 @@ pub fn validate_collection_name(value: &str) -> Result<(), ValidationError> {
 }
 
 /// Validate a polygon has at least 4 points and is closed.
-pub fn validate_geo_polygon<T>(points: &Vec<T>) -> Result<(), ValidationError>
+pub fn validate_geo_polygon<T>(points: &[T]) -> Result<(), ValidationError>
 where
     T: PartialEq,
 {
@@ -90,8 +93,8 @@ where
     Ok(())
 }
 
-/// Validate that move shard request has two different peers.
-pub fn validate_move_shard_different_peers(
+/// Validate that shard request has two different peers.
+pub fn validate_shard_different_peers(
     from_peer_id: u64,
     to_peer_id: u64,
 ) -> Result<(), ValidationErrors> {
@@ -107,11 +110,124 @@ pub fn validate_move_shard_different_peers(
         error.add_param(Cow::from("other_value"), &from_peer_id.to_string());
         error.add_param(
             Cow::from("message"),
-            &format!("cannot move shard to itself, \"to_peer_id\" must be different than {} in \"from_peer_id\"", from_peer_id),
+            &format!("cannot transfer shard to itself, \"to_peer_id\" must be different than {} in \"from_peer_id\"", from_peer_id),
         );
         error
     });
     Err(errors)
+}
+
+/// Validate optional lowercase hexadecimal sha256 hash string.
+pub fn validate_sha256_hash(value: &str) -> Result<(), ValidationError> {
+    if value.len() != 64 {
+        let mut err = ValidationError::new("invalid_sha256_hash");
+        err.add_param(Cow::from("length"), &value.len());
+        err.add_param(Cow::from("expected_length"), &64);
+        return Err(err);
+    }
+
+    if !value.chars().all(|c| c.is_ascii_hexdigit()) {
+        let mut err = ValidationError::new("invalid_sha256_hash");
+        err.add_param(
+            Cow::from("message"),
+            &"invalid characters, expected 0-9, a-f, A-F",
+        );
+        return Err(err);
+    }
+
+    Ok(())
+}
+
+pub fn validate_sha256_hash_option(value: &Option<impl AsRef<str>>) -> Result<(), ValidationError> {
+    value
+        .as_ref()
+        .map(|v| validate_sha256_hash(v.as_ref()))
+        .unwrap_or(Ok(()))
+}
+
+pub fn validate_multi_vector<T>(multivec: &[Vec<T>]) -> Result<(), ValidationErrors> {
+    // non_empty
+    if multivec.is_empty() {
+        let mut errors = ValidationErrors::default();
+        let mut err = ValidationError::new("empty_multi_vector");
+        err.add_param(Cow::from("message"), &"multi vector must not be empty");
+        errors.add("data", err);
+        return Err(errors);
+    }
+
+    // check all individual vectors non-empty
+    if multivec.iter().any(|v| v.is_empty()) {
+        let mut errors = ValidationErrors::default();
+        let mut err = ValidationError::new("empty_vector");
+        err.add_param(Cow::from("message"), &"all vectors must be non-empty");
+        errors.add("data", err);
+        return Err(errors);
+    }
+
+    // total size of all vectors must be less than MAX_MULTIVECTOR_FLATTENED_LEN
+    let flattened_len = multivec.iter().map(|v| v.len()).sum::<usize>();
+    if flattened_len >= MAX_MULTIVECTOR_FLATTENED_LEN {
+        let mut errors = ValidationErrors::default();
+        let mut err = ValidationError::new("multi_vector_too_large");
+        err.add_param(Cow::from("message"), &format!("Total size of all vectors ({flattened_len}) must be less than {MAX_MULTIVECTOR_FLATTENED_LEN}"));
+        errors.add("data", err);
+        return Err(errors);
+    }
+
+    // all vectors must have the same length
+    let dim = multivec[0].len();
+    if let Some(bad_vec) = multivec.iter().find(|v| v.len() != dim) {
+        let mut errors = ValidationErrors::default();
+        let mut err = ValidationError::new("inconsistent_multi_vector");
+        err.add_param(
+            Cow::from("message"),
+            &format!(
+                "all vectors must have the same dimension, found vector with dimension {}",
+                bad_vec.len()
+            ),
+        );
+        errors.add("data", err);
+        return Err(errors);
+    }
+
+    Ok(())
+}
+
+pub fn validate_multi_vector_len(
+    vectors_count: u32,
+    flatten_dense_vector: &[f32],
+) -> Result<(), ValidationErrors> {
+    if vectors_count == 0 {
+        let mut errors = ValidationErrors::default();
+        let mut err = ValidationError::new("invalid_vector_count");
+        err.add_param(
+            Cow::from("vectors_count"),
+            &"vectors count must be greater than 0",
+        );
+        errors.add("data", err);
+        return Err(errors);
+    }
+
+    let dense_vector_len = flatten_dense_vector.len();
+    if dense_vector_len >= MAX_MULTIVECTOR_FLATTENED_LEN {
+        let mut errors = ValidationErrors::default();
+        let mut err = ValidationError::new("Vector size is too large");
+        err.add_param(Cow::from("vector_len"), &dense_vector_len);
+        err.add_param(Cow::from("vectors_count"), &vectors_count);
+        errors.add("data", err);
+        return Err(errors);
+    }
+
+    if dense_vector_len % vectors_count as usize != 0 {
+        let mut errors = ValidationErrors::default();
+        let mut err = ValidationError::new("invalid dense vector length for vectors count");
+        err.add_param(Cow::from("vector_len"), &dense_vector_len);
+        err.add_param(Cow::from("vectors_count"), &vectors_count);
+        errors.add("data", err);
+        Err(errors)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -202,5 +318,25 @@ mod tests {
             validate_geo_polygon(&good_polygon).is_ok(),
             "good polygon should not error on validation",
         );
+    }
+
+    #[test]
+    fn test_validate_sha256_hash() {
+        assert!(validate_sha256_hash(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        )
+        .is_ok());
+        assert!(validate_sha256_hash(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde"
+        )
+        .is_err());
+        assert!(validate_sha256_hash(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0"
+        )
+        .is_err());
+        assert!(validate_sha256_hash(
+            "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEG"
+        )
+        .is_err());
     }
 }

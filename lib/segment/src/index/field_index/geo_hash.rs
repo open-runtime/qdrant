@@ -229,6 +229,13 @@ pub fn circle_hashes(circle: &GeoRadius, max_regions: usize) -> OperationResult<
     }
 
     let geo_bounding_box = minimum_bounding_rectangle_for_circle(circle);
+    if geo_bounding_box.top_left.lat.is_nan()
+        || geo_bounding_box.top_left.lon.is_nan()
+        || geo_bounding_box.bottom_right.lat.is_nan()
+        || geo_bounding_box.bottom_right.lat.is_nan()
+    {
+        return Err(OperationError::service_error("Invalid circle"));
+    }
     let full_geohash_bounding_box: GeohashBoundingBox = geo_bounding_box.into();
 
     let mapping_fn = |precision| {
@@ -573,6 +580,51 @@ mod tests {
         // falls back to finest region that encompasses the whole area
         let nyc_hashes_result = rectangle_hashes(&near_nyc_rectangle, 7);
         assert_eq!(nyc_hashes_result.unwrap(), ["dr5ru"]);
+    }
+
+    #[test]
+    fn rectangle_hashes_crossing_antimeridian() {
+        // conversion to lon/lat http://geohash.co/
+        // "ztnv2hjxn03k"
+        let top_left = GeoPoint {
+            lat: 74.071028,
+            lon: 167.0,
+        };
+
+        // "dr5ru7c02wnv"
+        let bottom_right = GeoPoint {
+            lat: 40.75798,
+            lon: -73.991516,
+        };
+
+        let crossing_usa_rectangle = GeoBoundingBox {
+            top_left,
+            bottom_right,
+        };
+
+        let usa_hashes_result = rectangle_hashes(&crossing_usa_rectangle, 200);
+        let usa_hashes = usa_hashes_result.unwrap();
+        assert_eq!(usa_hashes.len(), 84);
+        assert!(usa_hashes.iter().all(|h| h.len() == 2)); // low geohash precision
+
+        let mut usa_hashes_result = rectangle_hashes(&crossing_usa_rectangle, 10);
+        usa_hashes_result.as_mut().unwrap().sort_unstable();
+        let mut expected = vec!["8", "9", "b", "c", "d", "f", "x", "z"];
+        expected.sort_unstable();
+
+        assert_eq!(usa_hashes_result.unwrap(), expected);
+
+        // Graphical proof using https://www.movable-type.co.uk/scripts/geohash.html
+
+        // n p 0 1 4 5
+        // y z b c f g
+        // w x 8 9 d e
+        // q r 2 3 6 7
+
+        // - - - - - -
+        // | z b c f |
+        // | x 8 9 d |
+        // - - - - - -
     }
 
     #[test]
@@ -964,5 +1016,28 @@ mod tests {
 
         let polygon_hashes = polygon_hashes(&sample_polygon, invalid_max_hashes);
         assert!(polygon_hashes.is_err());
+    }
+
+    #[test]
+    fn geo_radius_zero_division() {
+        let circle = GeoRadius {
+            center: GeoPoint {
+                lon: 45.0,
+                lat: 80.0,
+            },
+            radius: 1000.0,
+        };
+        let hashes = circle_hashes(&circle, GEOHASH_MAX_LENGTH);
+        assert!(hashes.is_ok());
+
+        let circle2 = GeoRadius {
+            center: GeoPoint {
+                lon: 45.0,
+                lat: 90.0,
+            },
+            radius: -1.0,
+        };
+        let hashes2 = circle_hashes(&circle2, GEOHASH_MAX_LENGTH);
+        assert!(hashes2.is_err());
     }
 }

@@ -1,9 +1,10 @@
+use api::rest::SearchRequestInternal;
 use collection::operations::point_ops::{
     PointInsertOperationsInternal, PointOperations, PointStruct, WriteOrdering,
 };
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
-use collection::operations::types::SearchRequestInternal;
 use collection::operations::CollectionUpdateOperations;
+use segment::data_types::vectors::VectorStructInternal;
 use segment::types::WithPayloadInterface;
 use tempfile::Builder;
 
@@ -28,7 +29,7 @@ async fn test_collection_paginated_search_with_shards(shard_number: u32) {
     for i in 0..1000 {
         points.push(PointStruct {
             id: i.into(),
-            vector: vec![i as f32, 0.0, 0.0, 0.0].into(),
+            vector: VectorStructInternal::from(vec![i as f32, 0.0, 0.0, 0.0]).into(),
             payload: Some(serde_json::from_str(r#"{"number": "John Doe"}"#).unwrap()),
         });
     }

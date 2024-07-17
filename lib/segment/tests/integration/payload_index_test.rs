@@ -4,35 +4,39 @@ use std::sync::Arc;
 
 use atomic_refcell::AtomicRefCell;
 use common::types::PointOffsetType;
+use fnv::FnvBuildHasher;
+use indexmap::IndexSet;
 use itertools::Itertools;
 use rand::prelude::StdRng;
 use rand::{Rng, SeedableRng};
+use segment::data_types::index::{IntegerIndexParams, IntegerIndexType};
 use segment::data_types::vectors::{only_default_vector, DEFAULT_VECTOR_NAME};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_context_fixture::FixtureIdTracker;
 use segment::fixtures::payload_fixtures::{
     generate_diverse_nested_payload, generate_diverse_payload, random_filter, random_nested_filter,
-    random_vector, FLICKING_KEY, GEO_KEY, INT_KEY, INT_KEY_2, LAT_RANGE, LON_RANGE, STR_KEY,
-    STR_PROJ_KEY, STR_ROOT_PROJ_KEY, TEXT_KEY,
+    random_vector, FLICKING_KEY, GEO_KEY, INT_KEY, INT_KEY_2, INT_KEY_3, LAT_RANGE, LON_RANGE,
+    STR_KEY, STR_PROJ_KEY, STR_ROOT_PROJ_KEY, TEXT_KEY,
 };
-use segment::index::field_index::PrimaryCondition;
+use segment::index::field_index::{FieldIndex, PrimaryCondition};
 use segment::index::struct_payload_index::StructPayloadIndex;
 use segment::index::PayloadIndex;
+use segment::json_path::JsonPath;
 use segment::payload_storage::in_memory_payload_storage::InMemoryPayloadStorage;
 use segment::payload_storage::PayloadStorage;
 use segment::segment::Segment;
 use segment::segment_constructor::build_segment;
-use segment::types::PayloadFieldSchema::FieldType;
+use segment::types::PayloadFieldSchema::{FieldParams, FieldType};
 use segment::types::PayloadSchemaType::{Integer, Keyword};
 use segment::types::{
     AnyVariants, Condition, Distance, FieldCondition, Filter, GeoBoundingBox, GeoLineString,
     GeoPoint, GeoPolygon, GeoRadius, Indexes, IsEmptyCondition, Match, Payload, PayloadField,
-    PayloadSchemaType, Range, SegmentConfig, VectorDataConfig, VectorStorageType, WithPayload,
+    PayloadSchemaParams, PayloadSchemaType, Range, SegmentConfig, VectorDataConfig,
+    VectorStorageType, WithPayload,
 };
+use segment::utils::scored_point_ties::ScoredPointTies;
 use serde_json::json;
 use tempfile::Builder;
-
-use crate::utils::scored_point_ties::ScoredPointTies;
 
 const DIM: usize = 5;
 const ATTEMPTS: usize = 100;
@@ -49,6 +53,8 @@ fn build_test_segments(path_struct: &Path, path_plain: &Path) -> (Segment, Segme
                 storage_type: VectorStorageType::Memory,
                 index: Indexes::Plain {},
                 quantization_config: None,
+                multivector_config: None,
+                datatype: None,
             },
         )]),
         sparse_vector_data: Default::default(),
@@ -64,7 +70,7 @@ fn build_test_segments(path_struct: &Path, path_plain: &Path) -> (Segment, Segme
 
     let mut opnum = 0;
     struct_segment
-        .create_field_index(opnum, INT_KEY_2, Some(&Integer.into()))
+        .create_field_index(opnum, &JsonPath::new(INT_KEY_2), Some(&Integer.into()))
         .unwrap();
 
     opnum += 1;
@@ -90,19 +96,53 @@ fn build_test_segments(path_struct: &Path, path_plain: &Path) -> (Segment, Segme
     }
 
     struct_segment
-        .create_field_index(opnum, STR_KEY, Some(&Keyword.into()))
+        .create_field_index(opnum, &JsonPath::new(STR_KEY), Some(&Keyword.into()))
         .unwrap();
     struct_segment
-        .create_field_index(opnum, INT_KEY, None)
+        .create_field_index(opnum, &JsonPath::new(INT_KEY), None)
         .unwrap();
     struct_segment
-        .create_field_index(opnum, GEO_KEY, Some(&PayloadSchemaType::Geo.into()))
+        .create_field_index(
+            opnum,
+            &JsonPath::new(INT_KEY_2),
+            Some(&FieldParams(PayloadSchemaParams::Integer(
+                IntegerIndexParams {
+                    r#type: IntegerIndexType::Integer,
+                    lookup: true,
+                    range: false,
+                },
+            ))),
+        )
         .unwrap();
     struct_segment
-        .create_field_index(opnum, TEXT_KEY, Some(&PayloadSchemaType::Text.into()))
+        .create_field_index(
+            opnum,
+            &JsonPath::new(INT_KEY_3),
+            Some(&FieldParams(PayloadSchemaParams::Integer(
+                IntegerIndexParams {
+                    r#type: IntegerIndexType::Integer,
+                    lookup: false,
+                    range: true,
+                },
+            ))),
+        )
         .unwrap();
     struct_segment
-        .create_field_index(opnum, FLICKING_KEY, Some(&Integer.into()))
+        .create_field_index(
+            opnum,
+            &JsonPath::new(GEO_KEY),
+            Some(&PayloadSchemaType::Geo.into()),
+        )
+        .unwrap();
+    struct_segment
+        .create_field_index(
+            opnum,
+            &JsonPath::new(TEXT_KEY),
+            Some(&PayloadSchemaType::Text.into()),
+        )
+        .unwrap();
+    struct_segment
+        .create_field_index(opnum, &JsonPath::new(FLICKING_KEY), Some(&Integer.into()))
         .unwrap();
 
     for _ in 0..points_to_clear {
@@ -130,7 +170,7 @@ fn build_test_segments(path_struct: &Path, path_plain: &Path) -> (Segment, Segme
     for (field, indexes) in struct_segment.payload_index.borrow().field_indexes.iter() {
         for index in indexes {
             assert!(index.count_indexed_points() < num_points as usize);
-            if field != FLICKING_KEY {
+            if field.to_string() != FLICKING_KEY {
                 assert!(
                     index.count_indexed_points()
                         > (num_points as usize - points_to_delete - points_to_clear)
@@ -154,6 +194,8 @@ fn build_test_segments_nested_payload(path_struct: &Path, path_plain: &Path) -> 
                 storage_type: VectorStorageType::Memory,
                 index: Indexes::Plain {},
                 quantization_config: None,
+                multivector_config: None,
+                datatype: None,
             },
         )]),
         sparse_vector_data: Default::default(),
@@ -168,10 +210,13 @@ fn build_test_segments_nested_payload(path_struct: &Path, path_plain: &Path) -> 
     let points_to_clear = 500;
 
     // Nested payload keys
-    let nested_str_key = format!("{}.{}.{}", STR_KEY, "nested_1", "nested_2");
-    let nested_str_proj_key = format!("{}.{}[].{}", STR_PROJ_KEY, "nested_1", "nested_2");
-    let deep_nested_str_proj_key =
-        format!("{}[].{}[].{}", STR_ROOT_PROJ_KEY, "nested_1", "nested_2");
+    let nested_str_key = JsonPath::new(&format!("{}.{}.{}", STR_KEY, "nested_1", "nested_2"));
+    let nested_str_proj_key =
+        JsonPath::new(&format!("{}.{}[].{}", STR_PROJ_KEY, "nested_1", "nested_2"));
+    let deep_nested_str_proj_key = JsonPath::new(&format!(
+        "{}[].{}[].{}",
+        STR_ROOT_PROJ_KEY, "nested_1", "nested_2"
+    ));
 
     let mut opnum = 0;
     struct_segment
@@ -262,7 +307,6 @@ fn validate_geo_filter(query_filter: Filter) {
                 Some(&query_filter),
                 5,
                 None,
-                &false.into(),
             )
             .unwrap();
 
@@ -287,7 +331,6 @@ fn validate_geo_filter(query_filter: Filter) {
                 Some(&query_filter),
                 5,
                 None,
-                &false.into(),
             )
             .unwrap();
 
@@ -322,7 +365,7 @@ fn test_is_empty_conditions() {
 
     let filter = Filter::new_must(Condition::IsEmpty(IsEmptyCondition {
         is_empty: PayloadField {
-            key: FLICKING_KEY.to_string(),
+            key: JsonPath::new(FLICKING_KEY),
         },
     }));
 
@@ -361,6 +404,40 @@ fn test_is_empty_conditions() {
 }
 
 #[test]
+fn test_integer_index_types() {
+    let dir1 = Builder::new().prefix("segment1_dir").tempdir().unwrap();
+    let dir2 = Builder::new().prefix("segment2_dir").tempdir().unwrap();
+
+    let (struct_segment, _) = build_test_segments(dir1.path(), dir2.path());
+
+    let indexes = struct_segment.payload_index.borrow();
+    assert!(matches!(
+        indexes
+            .field_indexes
+            .get(&JsonPath::new(INT_KEY))
+            .unwrap()
+            .as_slice(),
+        [FieldIndex::IntMapIndex(_), FieldIndex::IntIndex(_)]
+    ));
+    assert!(matches!(
+        indexes
+            .field_indexes
+            .get(&JsonPath::new(INT_KEY_2))
+            .unwrap()
+            .as_slice(),
+        [FieldIndex::IntMapIndex(_)]
+    ));
+    assert!(matches!(
+        indexes
+            .field_indexes
+            .get(&JsonPath::new(INT_KEY_3))
+            .unwrap()
+            .as_slice(),
+        [FieldIndex::IntIndex(_)]
+    ));
+}
+
+#[test]
 fn test_cardinality_estimation() {
     let dir1 = Builder::new().prefix("segment1_dir").tempdir().unwrap();
     let dir2 = Builder::new().prefix("segment2_dir").tempdir().unwrap();
@@ -368,7 +445,7 @@ fn test_cardinality_estimation() {
     let (struct_segment, _) = build_test_segments(dir1.path(), dir2.path());
 
     let filter = Filter::new_must(Condition::Field(FieldCondition::new_range(
-        INT_KEY.to_owned(),
+        JsonPath::new(INT_KEY),
         Range {
             lt: None,
             gt: None,
@@ -409,9 +486,9 @@ fn test_root_nested_array_filter_cardinality_estimation() {
     // rely on test data from `build_test_segments_nested_payload`
     let nested_key = "nested_1[].nested_2";
     let nested_match =
-        FieldCondition::new_match(nested_key.to_owned(), "some value".to_owned().into());
+        FieldCondition::new_match(JsonPath::new(nested_key), "some value".to_owned().into());
     let filter = Filter::new_must(Condition::new_nested(
-        STR_ROOT_PROJ_KEY.to_string(),
+        JsonPath::new(STR_ROOT_PROJ_KEY),
         Filter::new_must(Condition::Field(nested_match)),
     ));
 
@@ -426,7 +503,7 @@ fn test_root_nested_array_filter_cardinality_estimation() {
     let primary_clause = estimation.primary_clauses.first().unwrap();
 
     let expected_primary_clause = FieldCondition::new_match(
-        format!("{}[].{}", STR_ROOT_PROJ_KEY, nested_key), // full key expected
+        JsonPath::new(&format!("{}[].{}", STR_ROOT_PROJ_KEY, nested_key)), // full key expected
         "some value".to_owned().into(),
     );
 
@@ -463,12 +540,14 @@ fn test_nesting_nested_array_filter_cardinality_estimation() {
 
     // rely on test data from `build_test_segments_nested_payload`
     let nested_match_key = "nested_2";
-    let nested_match =
-        FieldCondition::new_match(nested_match_key.to_owned(), "some value".to_owned().into());
+    let nested_match = FieldCondition::new_match(
+        JsonPath::new(nested_match_key),
+        "some value".to_owned().into(),
+    );
     let filter = Filter::new_must(Condition::new_nested(
-        STR_ROOT_PROJ_KEY.to_string(),
+        JsonPath::new(STR_ROOT_PROJ_KEY),
         Filter::new_must(Condition::new_nested(
-            "nested_1".to_string(),
+            JsonPath::new("nested_1"),
             Filter::new_must(Condition::Field(nested_match)),
         )),
     ));
@@ -484,7 +563,11 @@ fn test_nesting_nested_array_filter_cardinality_estimation() {
     let primary_clause = estimation.primary_clauses.first().unwrap();
 
     let expected_primary_clause = FieldCondition::new_match(
-        format!("{}[].nested_1[].{}", STR_ROOT_PROJ_KEY, nested_match_key), // full key expected
+        // full key expected
+        JsonPath::new(&format!(
+            "{}[].nested_1[].{}",
+            STR_ROOT_PROJ_KEY, nested_match_key
+        )),
         "some value".to_owned().into(),
     );
 
@@ -535,7 +618,6 @@ fn test_struct_payload_index() {
                 Some(&query_filter),
                 5,
                 None,
-                &false.into(),
             )
             .unwrap();
         let struct_result = struct_segment
@@ -547,7 +629,6 @@ fn test_struct_payload_index() {
                 Some(&query_filter),
                 5,
                 None,
-                &false.into(),
             )
             .unwrap();
 
@@ -565,21 +646,21 @@ fn test_struct_payload_index() {
 
         // Perform additional sort to break ties by score
         let mut plain_result_sorted_ties: Vec<ScoredPointTies> =
-            plain_result.iter().map(|x| x.clone().into()).collect_vec();
+            plain_result.iter().map(|x| x.into()).collect_vec();
         plain_result_sorted_ties.sort();
 
         let mut struct_result_sorted_ties: Vec<ScoredPointTies> =
-            struct_result.iter().map(|x| x.clone().into()).collect_vec();
+            struct_result.iter().map(|x| x.into()).collect_vec();
         struct_result_sorted_ties.sort();
 
         plain_result_sorted_ties
-                .into_iter()
-                .zip(struct_result_sorted_ties.into_iter())
-                .map(|(r1, r2)| (r1.scored_point, r2.scored_point))
-                .for_each(|(r1, r2)| {
-                    assert_eq!(r1.id, r2.id, "got different ScoredPoint {r1:?} and {r2:?} for\nquery vector {query_vector:?}\nquery filter {query_filter:?}\nplain result {plain_result:?}\nstruct result{struct_result:?}");
-                    assert!((r1.score - r2.score) < 0.0001)
-                });
+            .into_iter()
+            .zip(struct_result_sorted_ties.into_iter())
+            .map(|(r1, r2)| (r1.0, r2.0))
+            .for_each(|(r1, r2)| {
+                assert_eq!(r1.id, r2.id, "got different ScoredPoint {r1:?} and {r2:?} for\nquery vector {query_vector:?}\nquery filter {query_filter:?}\nplain result {plain_result:?}\nstruct result{struct_result:?}");
+                assert!((r1.score - r2.score) < 0.0001)
+            });
     }
 }
 
@@ -599,7 +680,7 @@ fn test_struct_payload_geo_boundingbox_index() {
     };
 
     let condition = Condition::Field(FieldCondition::new_geo_bounding_box(
-        "geo_key".to_string(),
+        JsonPath::new("geo_key"),
         geo_bbox,
     ));
 
@@ -622,7 +703,7 @@ fn test_struct_payload_geo_radius_index() {
     };
 
     let condition = Condition::Field(FieldCondition::new_geo_radius(
-        "geo_key".to_string(),
+        JsonPath::new("geo_key"),
         geo_radius,
     ));
 
@@ -663,7 +744,7 @@ fn test_struct_payload_geo_polygon_index() {
     };
 
     let condition = Condition::Field(FieldCondition::new_geo_polygon(
-        "geo_key".to_string(),
+        JsonPath::new("geo_key"),
         geo_polygon,
     ));
 
@@ -699,7 +780,6 @@ fn test_struct_payload_index_nested_fields() {
                 Some(&query_filter),
                 5,
                 None,
-                &false.into(),
             )
             .unwrap();
         let struct_result = struct_segment
@@ -714,7 +794,6 @@ fn test_struct_payload_index_nested_fields() {
                 Some(&query_filter),
                 5,
                 None,
-                &false.into(),
             )
             .unwrap();
 
@@ -732,12 +811,12 @@ fn test_struct_payload_index_nested_fields() {
 
         // warning: report flakiness at https://github.com/qdrant/qdrant/issues/534
         plain_result
-                .iter()
-                .zip(struct_result.iter())
-                .for_each(|(r1, r2)| {
-                    assert_eq!(r1.id, r2.id, "got different ScoredPoint {r1:?} and {r2:?} for\nquery vector {query_vector:?}\nquery filter {query_filter:?}\nplain result {plain_result:?}\nstruct result{struct_result:?}");
-                    assert!((r1.score - r2.score) < 0.0001)
-                });
+            .iter()
+            .zip(struct_result.iter())
+            .for_each(|(r1, r2)| {
+                assert_eq!(r1.id, r2.id, "got different ScoredPoint {r1:?} and {r2:?} for\nquery vector {query_vector:?}\nquery filter {query_filter:?}\nplain result {plain_result:?}\nstruct result{struct_result:?}");
+                assert!((r1.score - r2.score) < 0.0001)
+            });
     }
 }
 
@@ -770,32 +849,34 @@ fn test_update_payload_index_type() {
     let mut index =
         StructPayloadIndex::open(wrapped_payload_storage, id_tracker, dir.path(), true).unwrap();
 
+    let field = JsonPath::new("field");
+
     // set field to Integer type
-    index.set_indexed("field", Integer.into()).unwrap();
+    index.set_indexed(&field, Integer).unwrap();
     assert_eq!(
-        *index.indexed_fields().get("field").unwrap(),
+        *index.indexed_fields().get(&field).unwrap(),
         FieldType(Integer)
     );
-    let field_index = index.field_indexes.get("field").unwrap();
+    let field_index = index.field_indexes.get(&field).unwrap();
     assert_eq!(field_index[0].count_indexed_points(), point_num);
     assert_eq!(field_index[1].count_indexed_points(), point_num);
 
     // update field to Keyword type
-    index.set_indexed("field", Keyword.into()).unwrap();
+    index.set_indexed(&field, Keyword).unwrap();
     assert_eq!(
-        *index.indexed_fields().get("field").unwrap(),
+        *index.indexed_fields().get(&field).unwrap(),
         FieldType(Keyword)
     );
-    let field_index = index.field_indexes.get("field").unwrap();
+    let field_index = index.field_indexes.get(&field).unwrap();
     assert_eq!(field_index[0].count_indexed_points(), 0); // only one field index for Keyword
 
     // set field to Integer type (again)
-    index.set_indexed("field", Integer.into()).unwrap();
+    index.set_indexed(&field, Integer).unwrap();
     assert_eq!(
-        *index.indexed_fields().get("field").unwrap(),
+        *index.indexed_fields().get(&field).unwrap(),
         FieldType(Integer)
     );
-    let field_index = index.field_indexes.get("field").unwrap();
+    let field_index = index.field_indexes.get(&field).unwrap();
     assert_eq!(field_index[0].count_indexed_points(), point_num);
     assert_eq!(field_index[1].count_indexed_points(), point_num);
 }
@@ -807,12 +888,11 @@ fn test_any_matcher_cardinality_estimation() {
 
     let (struct_segment, _) = build_test_segments(dir1.path(), dir2.path());
 
+    let keywords: IndexSet<String, FnvBuildHasher> =
+        ["value1", "value2"].iter().map(|i| i.to_string()).collect();
     let any_match = FieldCondition::new_match(
-        STR_KEY,
-        Match::new_any(AnyVariants::Keywords(vec![
-            "value1".to_string(),
-            "value2".to_string(),
-        ])),
+        JsonPath::new(STR_KEY),
+        Match::new_any(AnyVariants::Keywords(keywords)),
     );
 
     let filter = Filter::new_must(Condition::Field(any_match.clone()));

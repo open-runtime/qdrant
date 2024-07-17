@@ -9,8 +9,9 @@ use collection::operations::types::{
     SparseVectorParams, SparseVectorsConfig, VectorsConfig, VectorsConfigDiff,
 };
 use collection::shards::replica_set::ReplicaState;
+use collection::shards::resharding::ReshardKey;
 use collection::shards::shard::{PeerId, ShardId, ShardsPlacement};
-use collection::shards::transfer::{ShardTransfer, ShardTransferKey};
+use collection::shards::transfer::{ShardTransfer, ShardTransferKey, ShardTransferRestart};
 use collection::shards::{replica_set, CollectionId};
 use schemars::JsonSchema;
 use segment::types::{PayloadFieldSchema, PayloadKeyType, QuantizationConfig, ShardKey};
@@ -256,14 +257,6 @@ impl UpdateCollectionOperation {
         }
     }
 
-    // Returns `true` if there are replica changes associated with this operation
-    pub fn have_replica_changes(&self) -> bool {
-        self.shard_replica_changes
-            .as_ref()
-            .map(|changes| !changes.is_empty())
-            .unwrap_or(false)
-    }
-
     pub fn take_shard_replica_changes(&mut self) -> Option<Vec<replica_set::Change>> {
         self.shard_replica_changes.take()
     }
@@ -291,15 +284,35 @@ pub struct ChangeAliasesOperation {
 #[serde(rename_all = "snake_case")]
 pub struct DeleteCollectionOperation(pub String);
 
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize)]
+pub enum ReshardingOperation {
+    Start(ReshardKey),
+    CommitRead(ReshardKey),
+    CommitWrite(ReshardKey),
+    Finish(ReshardKey),
+    Abort(ReshardKey),
+}
+
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
 pub enum ShardTransferOperations {
     Start(ShardTransfer),
+    /// Restart an existing transfer with a new configuration
+    ///
+    /// If the given transfer is ongoing, it is aborted and restarted with the new configuration.
+    Restart(ShardTransferRestart),
     Finish(ShardTransfer),
+    /// Deprecated since Qdrant 1.9.0, used in Qdrant 1.7.0 and 1.8.0
+    ///
     /// Used in `ShardTransferMethod::Snapshot`
     ///
     /// Called when the snapshot has successfully been recovered on the remote, brings the transfer
     /// to the next stage.
     SnapshotRecovered(ShardTransferKey),
+    /// Used in `ShardTransferMethod::Snapshot` and `ShardTransferMethod::WalDelta`
+    ///
+    /// Called when the first stage of the transfer has been successfully finished, brings the
+    /// transfer to the next stage.
+    RecoveryToPartial(ShardTransferKey),
     Abort {
         transfer: ShardTransferKey,
         reason: String,
@@ -357,6 +370,7 @@ pub enum CollectionMetaOperations {
     UpdateCollection(UpdateCollectionOperation),
     DeleteCollection(DeleteCollectionOperation),
     ChangeAliases(ChangeAliasesOperation),
+    Resharding(CollectionId, ReshardingOperation),
     TransferShard(CollectionId, ShardTransferOperations),
     SetShardReplicaState(SetShardReplicaState),
     CreateShardKey(CreateShardKey),

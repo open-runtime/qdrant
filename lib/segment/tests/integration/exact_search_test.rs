@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
+use common::cpu::CpuPermit;
 use common::types::PointOffsetType;
 use itertools::Itertools;
 use rand::{thread_rng, Rng};
@@ -8,8 +10,10 @@ use segment::data_types::vectors::{only_default_vector, DEFAULT_VECTOR_NAME};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::{random_int_payload, random_vector};
 use segment::index::hnsw_index::graph_links::GraphLinksRam;
-use segment::index::hnsw_index::hnsw::HNSWIndex;
+use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
+use segment::index::hnsw_index::num_rayon_threads;
 use segment::index::{PayloadIndex, VectorIndex};
+use segment::json_path::JsonPath;
 use segment::segment_constructor::build_segment;
 use segment::types::{
     Condition, Distance, FieldCondition, Filter, HnswConfig, Indexes, Payload, PayloadSchemaType,
@@ -46,6 +50,8 @@ fn exact_search_test() {
                 storage_type: VectorStorageType::Memory,
                 index: Indexes::Plain {},
                 quantization_config: None,
+                multivector_config: None,
+                datatype: None,
             },
         )]),
         sparse_vector_data: Default::default(),
@@ -82,29 +88,13 @@ fn exact_search_test() {
         payload_m: None,
     };
 
-    let mut hnsw_index = HNSWIndex::<GraphLinksRam>::open(
-        hnsw_dir.path(),
-        segment.id_tracker.clone(),
-        segment.vector_data[DEFAULT_VECTOR_NAME]
-            .vector_storage
-            .clone(),
-        segment.vector_data[DEFAULT_VECTOR_NAME]
-            .quantized_vectors
-            .clone(),
-        payload_index_ptr.clone(),
-        hnsw_config,
-    )
-    .unwrap();
-
-    hnsw_index.build_index(&stopped).unwrap();
-
     payload_index_ptr
         .borrow_mut()
-        .set_indexed(int_key, PayloadSchemaType::Integer.into())
+        .set_indexed(&JsonPath::new(int_key), PayloadSchemaType::Integer)
         .unwrap();
     let borrowed_payload_index = payload_index_ptr.borrow();
     let blocks = borrowed_payload_index
-        .payload_blocks(int_key, indexing_threshold)
+        .payload_blocks(&JsonPath::new(int_key), indexing_threshold)
         .collect_vec();
     for block in blocks.iter() {
         assert!(
@@ -136,7 +126,23 @@ fn exact_search_test() {
         "not all points are covered by payload blocks"
     );
 
-    hnsw_index.build_index(&stopped).unwrap();
+    let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
+    let permit = Arc::new(CpuPermit::dummy(permit_cpu_count as u32));
+    let hnsw_index = HNSWIndex::<GraphLinksRam>::open(HnswIndexOpenArgs {
+        path: hnsw_dir.path(),
+        id_tracker: segment.id_tracker.clone(),
+        vector_storage: segment.vector_data[DEFAULT_VECTOR_NAME]
+            .vector_storage
+            .clone(),
+        quantized_vectors: segment.vector_data[DEFAULT_VECTOR_NAME]
+            .quantized_vectors
+            .clone(),
+        payload_index: payload_index_ptr.clone(),
+        hnsw_config,
+        permit: Some(permit),
+        stopped: &stopped,
+    })
+    .unwrap();
 
     let top = 3;
     let attempts = 50;
@@ -153,13 +159,13 @@ fn exact_search_test() {
                     exact: true,
                     ..Default::default()
                 }),
-                &false.into(),
+                &Default::default(),
             )
             .unwrap();
         let plain_result = segment.vector_data[DEFAULT_VECTOR_NAME]
             .vector_index
             .borrow()
-            .search(&[&query], None, top, None, &false.into())
+            .search(&[&query], None, top, None, &Default::default())
             .unwrap();
 
         assert_eq!(
@@ -172,7 +178,7 @@ fn exact_search_test() {
         let right_range = left_range + range_size;
 
         let filter = Filter::new_must(Condition::Field(FieldCondition::new_range(
-            int_key.to_owned(),
+            JsonPath::new(int_key),
             Range {
                 lt: None,
                 gt: None,
@@ -192,13 +198,13 @@ fn exact_search_test() {
                     exact: true,
                     ..Default::default()
                 }),
-                &false.into(),
+                &Default::default(),
             )
             .unwrap();
         let plain_result = segment.vector_data[DEFAULT_VECTOR_NAME]
             .vector_index
             .borrow()
-            .search(&[&query], filter_query, top, None, &false.into())
+            .search(&[&query], filter_query, top, None, &Default::default())
             .unwrap();
 
         assert_eq!(

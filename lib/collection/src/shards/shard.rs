@@ -2,8 +2,11 @@ use core::marker::{Send, Sync};
 use std::future::{self, Future};
 use std::path::Path;
 
+use common::types::TelemetryDetail;
+
+use super::local_shard::clock_map::RecoveryPoint;
 use super::update_tracker::UpdateTracker;
-use crate::operations::types::CollectionResult;
+use crate::operations::types::{CollectionError, CollectionResult};
 use crate::shards::dummy_shard::DummyShard;
 use crate::shards::forward_proxy_shard::ForwardProxyShard;
 use crate::shards::local_shard::LocalShard;
@@ -31,8 +34,6 @@ pub type ShardsPlacement = Vec<ShardReplicasPlacement>;
 /// Shard
 ///
 /// Contains a part of the collection's points
-///
-#[allow(clippy::large_enum_variant)]
 pub enum Shard {
     Local(LocalShard),
     Proxy(ProxyShard),
@@ -62,12 +63,12 @@ impl Shard {
         }
     }
 
-    pub fn get_telemetry_data(&self) -> LocalShardTelemetry {
+    pub fn get_telemetry_data(&self, detail: TelemetryDetail) -> LocalShardTelemetry {
         let mut telemetry = match self {
-            Shard::Local(local_shard) => local_shard.get_telemetry_data(),
-            Shard::Proxy(proxy_shard) => proxy_shard.get_telemetry_data(),
-            Shard::ForwardProxy(proxy_shard) => proxy_shard.get_telemetry_data(),
-            Shard::QueueProxy(proxy_shard) => proxy_shard.get_telemetry_data(),
+            Shard::Local(local_shard) => local_shard.get_telemetry_data(detail),
+            Shard::Proxy(proxy_shard) => proxy_shard.get_telemetry_data(detail),
+            Shard::ForwardProxy(proxy_shard) => proxy_shard.get_telemetry_data(detail),
+            Shard::QueueProxy(proxy_shard) => proxy_shard.get_telemetry_data(detail),
             Shard::Dummy(dummy_shard) => dummy_shard.get_telemetry_data(),
         };
         telemetry.variant_name = Some(self.variant_name().to_string());
@@ -145,5 +146,67 @@ impl Shard {
         };
 
         Some(update_tracker)
+    }
+
+    pub async fn shard_recovery_point(&self) -> CollectionResult<RecoveryPoint> {
+        match self {
+            Self::Local(local_shard) => Ok(local_shard.recovery_point().await),
+            Self::ForwardProxy(proxy_shard) => Ok(proxy_shard.wrapped_shard.recovery_point().await),
+
+            Self::Proxy(_) | Self::QueueProxy(_) | Self::Dummy(_) => {
+                Err(CollectionError::service_error(format!(
+                    "Recovery point not supported on {}",
+                    self.variant_name(),
+                )))
+            }
+        }
+    }
+
+    pub async fn update_cutoff(&self, cutoff: &RecoveryPoint) -> CollectionResult<()> {
+        match self {
+            Self::Local(local_shard) => local_shard.update_cutoff(cutoff).await,
+
+            Self::Proxy(_) | Self::ForwardProxy(_) | Self::QueueProxy(_) | Self::Dummy(_) => {
+                return Err(CollectionError::service_error(format!(
+                    "Setting cutoff point not supported on {}",
+                    self.variant_name(),
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn resolve_wal_delta(
+        &self,
+        recovery_point: RecoveryPoint,
+    ) -> CollectionResult<Option<u64>> {
+        let wal = match self {
+            Self::Local(local_shard) => &local_shard.wal,
+
+            Self::Proxy(_) | Self::ForwardProxy(_) | Self::QueueProxy(_) | Self::Dummy(_) => {
+                return Err(CollectionError::service_error(format!(
+                    "Cannot resolve WAL delta on {}",
+                    self.variant_name(),
+                )));
+            }
+        };
+
+        // Resolve WAL delta and report
+        match wal.resolve_wal_delta(recovery_point).await {
+            Ok(Some(version)) => {
+                let size = wal.wal.lock().last_index().saturating_sub(version);
+                log::debug!("Resolved WAL delta from {version}, which counts {size} records");
+                Ok(Some(version))
+            }
+
+            Ok(None) => {
+                log::debug!("Resolved WAL delta that is empty");
+                Ok(None)
+            }
+
+            Err(err) => Err(CollectionError::service_error(format!(
+                "Failed to resolve WAL delta on local shard: {err}"
+            ))),
+        }
     }
 }

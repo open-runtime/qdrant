@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use crate::common::mmap_type::MmapType;
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::common::Flusher;
-use crate::data_types::vectors::VectorElementType;
 use crate::vector_storage::chunked_utils::{chunk_name, create_chunk, read_mmaps, MmapChunk};
 
 #[cfg(debug_assertions)]
@@ -27,21 +26,22 @@ pub struct Status {
     pub len: usize,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ChunkedMmapConfig {
     chunk_size_bytes: usize,
     chunk_size_vectors: usize,
     dim: usize,
 }
 
-pub struct ChunkedMmapVectors {
+#[derive(Debug)]
+pub struct ChunkedMmapVectors<T: Sized + 'static> {
     config: ChunkedMmapConfig,
     status: MmapType<Status>,
-    chunks: Vec<MmapChunk>,
+    chunks: Vec<MmapChunk<T>>,
     directory: PathBuf,
 }
 
-impl ChunkedMmapVectors {
+impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
     fn config_file(directory: &Path) -> PathBuf {
         directory.join(CONFIG_FILE_NAME)
     }
@@ -69,7 +69,7 @@ impl ChunkedMmapVectors {
         let config_file = Self::config_file(directory);
         if !config_file.exists() {
             let chunk_size_bytes = DEFAULT_CHUNK_SIZE;
-            let vector_size_bytes = dim * std::mem::size_of::<VectorElementType>();
+            let vector_size_bytes = dim * std::mem::size_of::<T>();
             let chunk_size_vectors = chunk_size_bytes / vector_size_bytes;
             let corrected_chunk_size_bytes = chunk_size_vectors * vector_size_bytes;
 
@@ -79,8 +79,9 @@ impl ChunkedMmapVectors {
                 dim,
             };
             let mut file = OpenOptions::new()
-                .create(true)
                 .write(true)
+                .create(true)
+                .truncate(true)
                 .open(&config_file)?;
             serde_json::to_writer(&mut file, &config)?;
             file.flush()?;
@@ -130,6 +131,10 @@ impl ChunkedMmapVectors {
         chunk_vector_idx * self.config.dim
     }
 
+    pub fn get_chunk_size_in_bytes(&self) -> usize {
+        self.config.chunk_size_bytes
+    }
+
     pub fn len(&self) -> usize {
         self.status.len
     }
@@ -149,14 +154,39 @@ impl ChunkedMmapVectors {
         Ok(())
     }
 
-    pub fn insert(
+    pub fn insert<TKey>(&mut self, key: TKey, vector: &[T]) -> OperationResult<()>
+    where
+        TKey: num_traits::cast::AsPrimitive<usize>,
+    {
+        self.insert_many(key, vector, 1)
+    }
+
+    #[inline]
+    pub fn insert_many<TKey>(
         &mut self,
-        key: PointOffsetType,
-        vector: &[VectorElementType],
-    ) -> OperationResult<()> {
-        let key = key as usize;
-        let chunk_idx = self.get_chunk_index(key);
-        let chunk_offset = self.get_chunk_offset(key);
+        start_key: TKey,
+        vectors: &[T],
+        count: usize,
+    ) -> OperationResult<()>
+    where
+        TKey: num_traits::cast::AsPrimitive<usize>,
+    {
+        assert_eq!(
+            vectors.len(),
+            count * self.config.dim,
+            "Vector size mismatch"
+        );
+
+        let start_key = start_key.as_();
+        let chunk_idx = self.get_chunk_index(start_key);
+        let chunk_offset = self.get_chunk_offset(start_key);
+
+        // check if the vectors fit in the chunk
+        if chunk_offset + vectors.len() > self.config.dim * self.config.chunk_size_vectors {
+            return Err(OperationError::service_error(format!(
+                "Vectors do not fit in the chunk. Chunk idx {chunk_idx}, chunk offset {chunk_offset}, vectors count {count}",
+            )));
+        }
 
         // Ensure capacity
         while chunk_idx >= self.chunks.len() {
@@ -165,9 +195,9 @@ impl ChunkedMmapVectors {
 
         let chunk = &mut self.chunks[chunk_idx];
 
-        chunk[chunk_offset..chunk_offset + vector.len()].copy_from_slice(vector);
+        chunk[chunk_offset..chunk_offset + vectors.len()].copy_from_slice(vectors);
 
-        let new_len = max(self.status.len, key + 1);
+        let new_len = max(self.status.len, start_key + count);
 
         if new_len > self.status.len {
             self.status.len = new_len;
@@ -175,21 +205,49 @@ impl ChunkedMmapVectors {
         Ok(())
     }
 
-    pub fn push(&mut self, vector: &[VectorElementType]) -> OperationResult<PointOffsetType> {
+    // returns how many vectors can be inserted starting from key
+    pub fn get_remaining_chunk_keys<TKey>(&mut self, start_key: TKey) -> usize
+    where
+        TKey: num_traits::cast::AsPrimitive<usize>,
+    {
+        let start_key = start_key.as_();
+        let chunk_vector_idx = self.get_chunk_offset(start_key) / self.config.dim;
+        self.config.chunk_size_vectors - chunk_vector_idx
+    }
+
+    pub fn push(&mut self, vector: &[T]) -> OperationResult<PointOffsetType> {
         let new_id = self.status.len as PointOffsetType;
         self.insert(new_id, vector)?;
         Ok(new_id)
     }
 
-    pub fn get<TKey>(&self, key: TKey) -> &[VectorElementType]
+    pub fn get<TKey>(&self, key: TKey) -> Option<&[T]>
     where
         TKey: num_traits::cast::AsPrimitive<usize>,
     {
-        let key: usize = key.as_();
-        let chunk_idx = self.get_chunk_index(key);
-        let chunk_offset = self.get_chunk_offset(key);
+        self.get_many(key, 1)
+    }
+
+    // returns count flattened vectors starting from key. if chunk boundary is crossed, returns None
+    #[inline]
+    pub fn get_many<TKey>(&self, start_key: TKey, count: usize) -> Option<&[T]>
+    where
+        TKey: num_traits::cast::AsPrimitive<usize>,
+    {
+        let start_key: usize = start_key.as_();
+        let chunk_idx = self.get_chunk_index(start_key);
+        if chunk_idx >= self.chunks.len() {
+            return None;
+        }
+
+        let chunk_offset = self.get_chunk_offset(start_key);
+        let chunk_end = chunk_offset + count * self.config.dim;
         let chunk = &self.chunks[chunk_idx];
-        &chunk[chunk_offset..chunk_offset + self.config.dim]
+        if chunk_end > chunk.len() {
+            None
+        } else {
+            Some(&chunk[chunk_offset..chunk_end])
+        }
     }
 
     pub fn flusher(&self) -> Flusher {
@@ -224,6 +282,7 @@ mod tests {
     use tempfile::Builder;
 
     use super::*;
+    use crate::data_types::vectors::VectorElementType;
     use crate::fixtures::index_fixtures::random_vector;
 
     #[test]
@@ -238,7 +297,7 @@ mod tests {
             .collect();
 
         {
-            let mut chunked_mmap: ChunkedMmapVectors =
+            let mut chunked_mmap: ChunkedMmapVectors<VectorElementType> =
                 ChunkedMmapVectors::open(dir.path(), dim).unwrap();
 
             for vec in &vectors {
@@ -264,7 +323,7 @@ mod tests {
         }
 
         {
-            let chunked_mmap: ChunkedMmapVectors =
+            let chunked_mmap: ChunkedMmapVectors<VectorElementType> =
                 ChunkedMmapVectors::open(dir.path(), dim).unwrap();
 
             assert!(
@@ -275,7 +334,7 @@ mod tests {
 
             for (i, vec) in vectors.iter().enumerate() {
                 assert_eq!(
-                    chunked_mmap.get(i),
+                    chunked_mmap.get(i).unwrap(),
                     vec,
                     "Vectors at index {} are not equal",
                     i

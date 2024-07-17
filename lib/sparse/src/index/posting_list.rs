@@ -3,40 +3,19 @@ use std::cmp::max;
 use common::types::PointOffsetType;
 use ordered_float::OrderedFloat;
 
+use super::posting_list_common::{
+    PostingElement, PostingElementEx, PostingListIter, DEFAULT_MAX_NEXT_WEIGHT,
+};
 use crate::common::types::DimWeight;
-
-#[derive(Debug, Copy, Clone, PartialEq)]
-pub struct PostingElement {
-    /// Record ID
-    pub record_id: PointOffsetType,
-    /// Weight of the record in the dimension
-    pub weight: DimWeight,
-    /// Max weight of the next elements in the posting list.
-    pub max_next_weight: DimWeight,
-}
-
-const DEFAULT_MAX_NEXT_WEIGHT: DimWeight = f32::NEG_INFINITY;
-
-impl PostingElement {
-    /// Initialize negative infinity as max_next_weight.
-    /// Needs to be updated at insertion time.
-    pub(crate) fn new(record_id: PointOffsetType, weight: DimWeight) -> PostingElement {
-        PostingElement {
-            record_id,
-            weight,
-            max_next_weight: DEFAULT_MAX_NEXT_WEIGHT,
-        }
-    }
-}
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct PostingList {
     /// List of the posting elements ordered by id
-    pub elements: Vec<PostingElement>,
+    pub elements: Vec<PostingElementEx>,
 }
 
 impl PostingList {
-    /// used for testing
+    #[cfg(test)]
     pub fn from(records: Vec<(PointOffsetType, DimWeight)>) -> PostingList {
         let mut posting_list = PostingBuilder::new();
         for (id, weight) in records {
@@ -48,7 +27,24 @@ impl PostingList {
     /// Creates a new posting list with a single element.
     pub fn new_one(record_id: PointOffsetType, weight: DimWeight) -> PostingList {
         PostingList {
-            elements: vec![PostingElement::new(record_id, weight)],
+            elements: vec![PostingElementEx::new(record_id, weight)],
+        }
+    }
+
+    pub fn delete(&mut self, record_id: PointOffsetType) {
+        let index = self
+            .elements
+            .binary_search_by_key(&record_id, |e| e.record_id);
+        if let Ok(found_index) = index {
+            self.elements.remove(found_index);
+            if let Some(last) = self.elements.last_mut() {
+                last.max_next_weight = DEFAULT_MAX_NEXT_WEIGHT;
+            }
+            if found_index < self.elements.len() {
+                self.propagate_max_next_weight_to_the_left(found_index);
+            } else if !self.elements.is_empty() {
+                self.propagate_max_next_weight_to_the_left(self.elements.len() - 1);
+            }
         }
     }
 
@@ -56,7 +52,7 @@ impl PostingList {
     ///
     /// Worst case is adding a new element at the end of the list with a very large weight.
     /// This forces to propagate it as potential max_next_weight to all the previous elements.
-    pub fn upsert(&mut self, posting_element: PostingElement) {
+    pub fn upsert(&mut self, posting_element: PostingElementEx) {
         // find insertion point in sorted posting list (most expensive operation for large posting list)
         let index = self
             .elements
@@ -109,19 +105,17 @@ impl PostingList {
         for element in self.elements[..up_to_index].iter_mut().rev() {
             // update max_next_weight for element
             element.max_next_weight = max_next_weight;
-            if element.weight >= max_next_weight {
-                // no need to propagate further because the current element is larger
-                break;
-            } else {
-                // update max_next_weight based on current element
-                max_next_weight = max_next_weight.max(element.weight);
-            }
+            max_next_weight = max_next_weight.max(element.weight);
         }
+    }
+
+    pub fn iter(&self) -> PostingListIterator {
+        PostingListIterator::new(&self.elements)
     }
 }
 
 pub struct PostingBuilder {
-    elements: Vec<PostingElement>,
+    elements: Vec<PostingElementEx>,
 }
 
 impl Default for PostingBuilder {
@@ -137,10 +131,12 @@ impl PostingBuilder {
         }
     }
 
+    /// Add a new record to the posting list.
     pub fn add(&mut self, record_id: PointOffsetType, weight: DimWeight) {
-        self.elements.push(PostingElement::new(record_id, weight));
+        self.elements.push(PostingElementEx::new(record_id, weight));
     }
 
+    /// Consume the builder and return the posting list.
     pub fn build(mut self) -> PostingList {
         // Sort by id
         self.elements.sort_unstable_by_key(|e| e.record_id);
@@ -157,7 +153,7 @@ impl PostingBuilder {
             }
         }
 
-        // Calculate max_next_weight
+        // Calculate the `max_next_weight` for all elements starting from the end
         let mut max_next_weight = f32::NEG_INFINITY;
         for element in self.elements.iter_mut().rev() {
             element.max_next_weight = max_next_weight;
@@ -171,35 +167,91 @@ impl PostingBuilder {
 }
 
 /// Iterator over posting list elements offering skipping abilities to avoid full iteration.
+#[derive(Debug, Clone)]
 pub struct PostingListIterator<'a> {
-    pub elements: &'a [PostingElement],
+    pub elements: &'a [PostingElementEx],
     pub current_index: usize,
 }
 
-impl<'a> Iterator for PostingListIterator<'a> {
-    type Item = &'a PostingElement;
+impl<'a> PostingListIter for PostingListIterator<'a> {
+    #[inline]
+    fn peek(&mut self) -> Option<PostingElementEx> {
+        self.elements.get(self.current_index).cloned()
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current_index < self.elements.len() {
-            let element = &self.elements[self.current_index];
-            self.current_index += 1;
-            Some(element)
-        } else {
-            None
+    #[inline]
+    fn last_id(&self) -> Option<PointOffsetType> {
+        self.elements.last().map(|e| e.record_id)
+    }
+
+    #[inline]
+    fn skip_to(&mut self, record_id: PointOffsetType) -> Option<PostingElementEx> {
+        self.skip_to(record_id)
+    }
+
+    #[inline]
+    fn skip_to_end(&mut self) {
+        self.skip_to_end();
+    }
+
+    #[inline]
+    fn len_to_end(&self) -> usize {
+        self.len_to_end()
+    }
+
+    #[inline]
+    fn current_index(&self) -> usize {
+        self.current_index
+    }
+
+    fn for_each_till_id<Ctx: ?Sized>(
+        &mut self,
+        id: PointOffsetType,
+        ctx: &mut Ctx,
+        mut f: impl FnMut(&mut Ctx, PointOffsetType, DimWeight),
+    ) {
+        let mut current_index = self.current_index;
+        for element in &self.elements[current_index..] {
+            if element.record_id > id {
+                break;
+            }
+            f(ctx, element.record_id, element.weight);
+            current_index += 1;
         }
+        self.current_index = current_index;
+    }
+
+    fn reliable_max_next_weight() -> bool {
+        true
+    }
+
+    fn into_std_iter(self) -> impl Iterator<Item = PostingElement> {
+        self.elements.iter().cloned().map(PostingElement::from)
     }
 }
 
 impl<'a> PostingListIterator<'a> {
-    pub fn new(elements: &'a [PostingElement]) -> PostingListIterator<'a> {
+    pub fn new(elements: &'a [PostingElementEx]) -> PostingListIterator<'a> {
         PostingListIterator {
             elements,
             current_index: 0,
         }
     }
 
+    /// Advances the iterator to the next element.
+    pub fn advance(&mut self) {
+        if self.current_index < self.elements.len() {
+            self.current_index += 1;
+        }
+    }
+
+    /// Advances the iterator by `count` elements.
+    pub fn advance_by(&mut self, count: usize) {
+        self.current_index = (self.current_index + count).min(self.elements.len());
+    }
+
     /// Returns the next element without advancing the iterator.
-    pub fn peek(&self) -> Option<&PostingElement> {
+    pub fn peek(&self) -> Option<&PostingElementEx> {
         self.elements.get(self.current_index)
     }
 
@@ -214,7 +266,7 @@ impl<'a> PostingListIterator<'a> {
     /// If the iterator is already at the end, None is returned.
     /// If the iterator skipped to the end, None is returned and current index is set to the length of the list.
     /// Uses binary search.
-    pub fn skip_to(&mut self, id: PointOffsetType) -> Option<&PostingElement> {
+    pub fn skip_to(&mut self, id: PointOffsetType) -> Option<PostingElementEx> {
         // Check if we are already at the end
         if self.current_index >= self.elements.len() {
             return None;
@@ -227,7 +279,7 @@ impl<'a> PostingListIterator<'a> {
         match next_element {
             Ok(found_offset) => {
                 self.current_index += found_offset;
-                Some(&self.elements[self.current_index])
+                Some(self.elements[self.current_index].clone())
             }
             Err(insert_index) => {
                 self.current_index += insert_index;
@@ -237,7 +289,7 @@ impl<'a> PostingListIterator<'a> {
     }
 
     /// Skips to the end of the posting list and returns None.
-    pub fn skip_to_end(&mut self) -> Option<&PostingElement> {
+    pub fn skip_to_end(&mut self) -> Option<&PostingElementEx> {
         self.current_index = self.elements.len();
         None
     }
@@ -245,7 +297,10 @@ impl<'a> PostingListIterator<'a> {
 
 #[cfg(test)]
 mod tests {
+    use itertools::Itertools;
+
     use super::*;
+    use crate::index::posting_list_common::DEFAULT_MAX_NEXT_WEIGHT;
 
     #[test]
     fn test_posting_operations() {
@@ -265,10 +320,9 @@ mod tests {
         let mut iter = PostingListIterator::new(&posting_list.elements);
 
         assert_eq!(iter.peek().unwrap().record_id, 1);
-
-        assert_eq!(iter.next().unwrap().record_id, 1);
+        iter.advance();
         assert_eq!(iter.peek().unwrap().record_id, 2);
-        assert_eq!(iter.next().unwrap().record_id, 2);
+        iter.advance();
         assert_eq!(iter.peek().unwrap().record_id, 3);
 
         assert_eq!(iter.skip_to(7).unwrap().record_id, 7);
@@ -310,7 +364,7 @@ mod tests {
         );
 
         // insert mew last element
-        posting_list.upsert(PostingElement::new(4, 4.0));
+        posting_list.upsert(PostingElementEx::new(4, 4.0));
         assert_eq!(posting_list.elements[3].record_id, 4);
         assert_eq!(posting_list.elements[3].weight, 4.0);
         assert_eq!(
@@ -356,7 +410,7 @@ mod tests {
         );
 
         // insert mew last element
-        posting_list.upsert(PostingElement::new(4, 4.0));
+        posting_list.upsert(PostingElementEx::new(4, 4.0));
 
         // `4` is shifted to the right
         assert_eq!(posting_list.elements[4].record_id, 5);
@@ -402,7 +456,7 @@ mod tests {
         );
 
         // increase weight of existing element
-        posting_list.upsert(PostingElement::new(2, 4.0));
+        posting_list.upsert(PostingElementEx::new(2, 4.0));
 
         assert_eq!(posting_list.elements[0].record_id, 1);
         assert_eq!(posting_list.elements[0].weight, 1.0);
@@ -418,5 +472,82 @@ mod tests {
             posting_list.elements[2].max_next_weight,
             DEFAULT_MAX_NEXT_WEIGHT
         );
+    }
+
+    #[test]
+    fn test_random_delete() {
+        use rand::seq::SliceRandom;
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        for _ in 0..1000 {
+            let mut ids = Vec::new();
+            let mut cur_id = 0;
+            for _ in 0..32 {
+                cur_id += rng.gen_range(1..10);
+                ids.push(cur_id);
+            }
+            ids.shuffle(&mut rng);
+            let random_id = ids[rng.gen_range(0..ids.len())];
+
+            let mut builder1 = PostingBuilder::new();
+            let mut builder2 = PostingBuilder::new();
+            for id in ids {
+                let val = rng.gen_range(0..100) as f32 / 10.0;
+                builder1.add(id, val);
+                if id != random_id {
+                    builder2.add(id, val);
+                }
+            }
+
+            let mut posting_list1 = builder1.build();
+            posting_list1.delete(random_id);
+            let posting_list2 = builder2.build();
+
+            // Ok
+            assert_eq!(
+                posting_list1
+                    .elements
+                    .iter()
+                    .map(|e| e.record_id)
+                    .collect_vec(),
+                posting_list2
+                    .elements
+                    .iter()
+                    .map(|e| e.record_id)
+                    .collect_vec(),
+            );
+            assert_eq!(
+                posting_list1
+                    .elements
+                    .iter()
+                    .map(|e| e.weight)
+                    .collect_vec(),
+                posting_list2
+                    .elements
+                    .iter()
+                    .map(|e| e.weight)
+                    .collect_vec(),
+            );
+
+            // Fail
+            assert_eq!(
+                posting_list1
+                    .elements
+                    .iter()
+                    .map(|e| e.max_next_weight)
+                    .collect_vec(),
+                posting_list2
+                    .elements
+                    .iter()
+                    .map(|e| e.max_next_weight)
+                    .collect_vec(),
+            );
+
+            // Ok (at least they won't break pruning logic)
+            assert!(
+                std::iter::zip(&posting_list1.elements, &posting_list2.elements,)
+                    .all(|(e1, e2)| e1.max_next_weight >= e2.max_next_weight),
+            );
+        }
     }
 }

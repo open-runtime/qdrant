@@ -1,19 +1,22 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use api::grpc::conversions::proto_to_payloads;
+use api::grpc::conversions::{json_path_from_proto, proto_to_payloads};
 use api::grpc::qdrant::payload_index_params::IndexParams;
 use api::grpc::qdrant::points_update_operation::{ClearPayload, Operation, PointStructList};
 use api::grpc::qdrant::{
     points_update_operation, BatchResult, ClearPayloadPoints, CoreSearchPoints, CountPoints,
     CountResponse, CreateFieldIndexCollection, DeleteFieldIndexCollection, DeletePayloadPoints,
     DeletePointVectors, DeletePoints, DiscoverBatchResponse, DiscoverPoints, DiscoverResponse,
-    FieldType, GetPoints, GetResponse, PayloadIndexParams, PointsOperationResponse, PointsSelector,
+    FieldType, GetPoints, GetResponse, PayloadIndexParams, PointsOperationResponseInternal,
+    PointsSelector, QueryBatchResponse, QueryPoints, QueryResponse,
     ReadConsistency as ReadConsistencyGrpc, RecommendBatchResponse, RecommendGroupsResponse,
     RecommendPointGroups, RecommendPoints, RecommendResponse, ScrollPoints, ScrollResponse,
     SearchBatchResponse, SearchGroupsResponse, SearchPointGroups, SearchPoints, SearchResponse,
     SetPayloadPoints, SyncPoints, UpdateBatchPoints, UpdateBatchResponse, UpdatePointVectors,
     UpsertPoints,
 };
+use api::rest::{OrderByInterface, ShardKeySelector};
 use collection::operations::consistency_params::ReadConsistency;
 use collection::operations::conversions::{
     try_discover_request_from_grpc, try_points_selector_from_grpc, write_ordering_from_proto,
@@ -22,28 +25,34 @@ use collection::operations::payload_ops::DeletePayload;
 use collection::operations::point_ops::{
     self, PointInsertOperations, PointOperations, PointSyncOperation, PointsList,
 };
-use collection::operations::shard_key_selector::ShardKeySelector;
+use collection::operations::query_enum::QueryEnum;
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::types::{
     default_exact_count, CoreSearchRequest, CoreSearchRequestBatch, PointRequestInternal,
-    QueryEnum, RecommendExample, ScrollRequestInternal,
+    RecommendExample, Record, ScrollRequestInternal,
 };
+use collection::operations::universal_query::collection_query::CollectionQueryRequest;
 use collection::operations::vector_ops::{DeleteVectors, PointVectors, UpdateVectors};
-use collection::operations::CollectionUpdateOperations;
+use collection::operations::{ClockTag, CollectionUpdateOperations, OperationWithClockTag};
 use collection::shards::shard::ShardId;
+use itertools::Itertools;
+use segment::data_types::order_by::OrderBy;
+use segment::data_types::vectors::VectorStructInternal;
 use segment::types::{
     ExtendedPointId, Filter, PayloadFieldSchema, PayloadSchemaParams, PayloadSchemaType,
 };
 use storage::content_manager::conversions::error_to_status;
 use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
+use storage::rbac::Access;
 use tonic::{Response, Status};
 
 use crate::common::points::{
     do_clear_payload, do_core_search_points, do_count_points, do_create_index,
     do_create_index_internal, do_delete_index, do_delete_index_internal, do_delete_payload,
-    do_delete_points, do_delete_vectors, do_get_points, do_overwrite_payload, do_scroll_points,
-    do_search_batch_points, do_set_payload, do_update_vectors, do_upsert_points, CreateFieldIndex,
+    do_delete_points, do_delete_vectors, do_get_points, do_overwrite_payload,
+    do_query_batch_points, do_query_points, do_scroll_points, do_search_batch_points,
+    do_set_payload, do_update_vectors, do_upsert_points, CreateFieldIndex,
 };
 
 fn extract_points_selector(
@@ -61,11 +70,11 @@ fn extract_points_selector(
     Ok((points, filter))
 }
 
-pub fn points_operation_response(
+pub fn points_operation_response_internal(
     timing: Instant,
     update_result: collection::operations::types::UpdateResult,
-) -> PointsOperationResponse {
-    PointsOperationResponse {
+) -> PointsOperationResponseInternal {
+    PointsOperationResponseInternal {
         result: Some(update_result.into()),
         time: timing.elapsed().as_secs_f64(),
     }
@@ -90,10 +99,12 @@ pub(crate) fn convert_shard_selector_for_read(
 }
 
 pub async fn upsert(
-    toc: &TableOfContent,
+    toc: Arc<TableOfContent>,
     upsert_points: UpsertPoints,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
-) -> Result<Response<PointsOperationResponse>, Status> {
+    access: Access,
+) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let UpsertPoints {
         collection_name,
         wait,
@@ -112,24 +123,28 @@ pub async fn upsert(
     let timing = Instant::now();
     let result = do_upsert_points(
         toc,
-        &collection_name,
+        collection_name,
         operation,
+        clock_tag,
         shard_selection,
         wait.unwrap_or(false),
         write_ordering_from_proto(ordering)?,
+        access,
     )
     .await
     .map_err(error_to_status)?;
 
-    let response = points_operation_response(timing, result);
+    let response = points_operation_response_internal(timing, result);
     Ok(Response::new(response))
 }
 
 pub async fn sync(
-    toc: &TableOfContent,
+    toc: Arc<TableOfContent>,
     sync_points: SyncPoints,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
-) -> Result<Response<PointsOperationResponse>, Status> {
+    access: Access,
+) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let SyncPoints {
         collection_name,
         wait,
@@ -164,23 +179,26 @@ pub async fn sync(
     let result = toc
         .update(
             &collection_name,
-            collection_operation,
+            OperationWithClockTag::new(collection_operation, clock_tag),
             wait.unwrap_or(false),
             write_ordering_from_proto(ordering)?,
             shard_selector,
+            access,
         )
         .await
         .map_err(error_to_status)?;
 
-    let response = points_operation_response(timing, result);
+    let response = points_operation_response_internal(timing, result);
     Ok(Response::new(response))
 }
 
 pub async fn delete(
-    toc: &TableOfContent,
+    toc: Arc<TableOfContent>,
     delete_points: DeletePoints,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
-) -> Result<Response<PointsOperationResponse>, Status> {
+    access: Access,
+) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let DeletePoints {
         collection_name,
         wait,
@@ -197,24 +215,28 @@ pub async fn delete(
     let timing = Instant::now();
     let result = do_delete_points(
         toc,
-        &collection_name,
+        collection_name,
         points_selector,
+        clock_tag,
         shard_selection,
         wait.unwrap_or(false),
         write_ordering_from_proto(ordering)?,
+        access,
     )
     .await
     .map_err(error_to_status)?;
 
-    let response = points_operation_response(timing, result);
+    let response = points_operation_response_internal(timing, result);
     Ok(Response::new(response))
 }
 
 pub async fn update_vectors(
-    toc: &TableOfContent,
+    toc: Arc<TableOfContent>,
     update_point_vectors: UpdatePointVectors,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
-) -> Result<Response<PointsOperationResponse>, Status> {
+    access: Access,
+) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let UpdatePointVectors {
         collection_name,
         wait,
@@ -230,11 +252,14 @@ pub async fn update_vectors(
             Some(id) => id.try_into()?,
             None => return Err(Status::invalid_argument("id is expected")),
         };
-        let vector = match point.vectors {
+        let vector: VectorStructInternal = match point.vectors {
             Some(vectors) => vectors.try_into()?,
             None => return Err(Status::invalid_argument("vectors is expected")),
         };
-        op_points.push(PointVectors { id, vector });
+        op_points.push(PointVectors {
+            id,
+            vector: api::rest::VectorStruct::from(vector),
+        });
     }
 
     let operation = UpdateVectors {
@@ -245,24 +270,28 @@ pub async fn update_vectors(
     let timing = Instant::now();
     let result = do_update_vectors(
         toc,
-        &collection_name,
+        collection_name,
         operation,
+        clock_tag,
         shard_selection,
         wait.unwrap_or(false),
         write_ordering_from_proto(ordering)?,
+        access,
     )
     .await
     .map_err(error_to_status)?;
 
-    let response = points_operation_response(timing, result);
+    let response = points_operation_response_internal(timing, result);
     Ok(Response::new(response))
 }
 
 pub async fn delete_vectors(
-    toc: &TableOfContent,
+    toc: Arc<TableOfContent>,
     delete_point_vectors: DeletePointVectors,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
-) -> Result<Response<PointsOperationResponse>, Status> {
+    access: Access,
+) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let DeletePointVectors {
         collection_name,
         wait,
@@ -288,24 +317,28 @@ pub async fn delete_vectors(
     let timing = Instant::now();
     let result = do_delete_vectors(
         toc,
-        &collection_name,
+        collection_name,
         operation,
+        clock_tag,
         shard_selection,
         wait.unwrap_or(false),
         write_ordering_from_proto(ordering)?,
+        access,
     )
     .await
     .map_err(error_to_status)?;
 
-    let response = points_operation_response(timing, result);
+    let response = points_operation_response_internal(timing, result);
     Ok(Response::new(response))
 }
 
 pub async fn set_payload(
-    toc: &TableOfContent,
+    toc: Arc<TableOfContent>,
     set_payload_points: SetPayloadPoints,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
-) -> Result<Response<PointsOperationResponse>, Status> {
+    access: Access,
+) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let SetPayloadPoints {
         collection_name,
         wait,
@@ -313,7 +346,9 @@ pub async fn set_payload(
         points_selector,
         ordering,
         shard_key_selector,
+        key,
     } = set_payload_points;
+    let key = key.map(|k| json_path_from_proto(&k)).transpose()?;
 
     let (points, filter) = extract_points_selector(points_selector)?;
     let operation = collection::operations::payload_ops::SetPayload {
@@ -321,29 +356,34 @@ pub async fn set_payload(
         points,
         filter,
         shard_key: shard_key_selector.map(ShardKeySelector::from),
+        key,
     };
 
     let timing = Instant::now();
     let result = do_set_payload(
         toc,
-        &collection_name,
+        collection_name,
         operation,
+        clock_tag,
         shard_selection,
         wait.unwrap_or(false),
         write_ordering_from_proto(ordering)?,
+        access,
     )
     .await
     .map_err(error_to_status)?;
 
-    let response = points_operation_response(timing, result);
+    let response = points_operation_response_internal(timing, result);
     Ok(Response::new(response))
 }
 
 pub async fn overwrite_payload(
-    toc: &TableOfContent,
+    toc: Arc<TableOfContent>,
     set_payload_points: SetPayloadPoints,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
-) -> Result<Response<PointsOperationResponse>, Status> {
+    access: Access,
+) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let SetPayloadPoints {
         collection_name,
         wait,
@@ -351,6 +391,7 @@ pub async fn overwrite_payload(
         points_selector,
         ordering,
         shard_key_selector,
+        ..
     } = set_payload_points;
 
     let (points, filter) = extract_points_selector(points_selector)?;
@@ -359,29 +400,35 @@ pub async fn overwrite_payload(
         points,
         filter,
         shard_key: shard_key_selector.map(ShardKeySelector::from),
+        // overwrite operation don't support indicate path of property
+        key: None,
     };
 
     let timing = Instant::now();
     let result = do_overwrite_payload(
         toc,
-        &collection_name,
+        collection_name,
         operation,
+        clock_tag,
         shard_selection,
         wait.unwrap_or(false),
         write_ordering_from_proto(ordering)?,
+        access,
     )
     .await
     .map_err(error_to_status)?;
 
-    let response = points_operation_response(timing, result);
+    let response = points_operation_response_internal(timing, result);
     Ok(Response::new(response))
 }
 
 pub async fn delete_payload(
-    toc: &TableOfContent,
+    toc: Arc<TableOfContent>,
     delete_payload_points: DeletePayloadPoints,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
-) -> Result<Response<PointsOperationResponse>, Status> {
+    access: Access,
+) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let DeletePayloadPoints {
         collection_name,
         wait,
@@ -390,6 +437,7 @@ pub async fn delete_payload(
         ordering,
         shard_key_selector,
     } = delete_payload_points;
+    let keys = keys.iter().map(|k| json_path_from_proto(k)).try_collect()?;
 
     let (points, filter) = extract_points_selector(points_selector)?;
     let operation = DeletePayload {
@@ -402,24 +450,28 @@ pub async fn delete_payload(
     let timing = Instant::now();
     let result = do_delete_payload(
         toc,
-        &collection_name,
+        collection_name,
         operation,
+        clock_tag,
         shard_selection,
         wait.unwrap_or(false),
         write_ordering_from_proto(ordering)?,
+        access,
     )
     .await
     .map_err(error_to_status)?;
 
-    let response = points_operation_response(timing, result);
+    let response = points_operation_response_internal(timing, result);
     Ok(Response::new(response))
 }
 
 pub async fn clear_payload(
-    toc: &TableOfContent,
+    toc: Arc<TableOfContent>,
     clear_payload_points: ClearPayloadPoints,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
-) -> Result<Response<PointsOperationResponse>, Status> {
+    access: Access,
+) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let ClearPayloadPoints {
         collection_name,
         wait,
@@ -436,23 +488,27 @@ pub async fn clear_payload(
     let timing = Instant::now();
     let result = do_clear_payload(
         toc,
-        &collection_name,
+        collection_name,
         points_selector,
+        clock_tag,
         shard_selection,
         wait.unwrap_or(false),
         write_ordering_from_proto(ordering)?,
+        access,
     )
     .await
     .map_err(error_to_status)?;
 
-    let response = points_operation_response(timing, result);
+    let response = points_operation_response_internal(timing, result);
     Ok(Response::new(response))
 }
 
 pub async fn update_batch(
-    toc: &TableOfContent,
+    toc: Arc<TableOfContent>,
     update_batch_points: UpdateBatchPoints,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
+    access: Access,
 ) -> Result<Response<UpdateBatchResponse>, Status> {
     let UpdateBatchPoints {
         collection_name,
@@ -475,7 +531,7 @@ pub async fn update_batch(
                 shard_key_selector,
             }) => {
                 upsert(
-                    toc,
+                    toc.clone(),
                     UpsertPoints {
                         collection_name,
                         points,
@@ -483,13 +539,15 @@ pub async fn update_batch(
                         ordering,
                         shard_key_selector,
                     },
+                    clock_tag,
                     shard_selection,
+                    access.clone(),
                 )
                 .await
             }
             points_update_operation::Operation::DeleteDeprecated(points) => {
                 delete(
-                    toc,
+                    toc.clone(),
                     DeletePoints {
                         collection_name,
                         wait,
@@ -497,7 +555,9 @@ pub async fn update_batch(
                         ordering,
                         shard_key_selector: None,
                     },
+                    clock_tag,
                     shard_selection,
+                    access.clone(),
                 )
                 .await
             }
@@ -506,10 +566,11 @@ pub async fn update_batch(
                     payload,
                     points_selector,
                     shard_key_selector,
+                    key,
                 },
             ) => {
                 set_payload(
-                    toc,
+                    toc.clone(),
                     SetPayloadPoints {
                         collection_name,
                         wait,
@@ -517,20 +578,24 @@ pub async fn update_batch(
                         points_selector,
                         ordering,
                         shard_key_selector,
+                        key,
                     },
+                    clock_tag,
                     shard_selection,
+                    access.clone(),
                 )
                 .await
             }
             points_update_operation::Operation::OverwritePayload(
-                points_update_operation::SetPayload {
+                points_update_operation::OverwritePayload {
                     payload,
                     points_selector,
                     shard_key_selector,
+                    ..
                 },
             ) => {
                 overwrite_payload(
-                    toc,
+                    toc.clone(),
                     SetPayloadPoints {
                         collection_name,
                         wait,
@@ -538,8 +603,12 @@ pub async fn update_batch(
                         points_selector,
                         ordering,
                         shard_key_selector,
+                        // overwrite operation don't support it
+                        key: None,
                     },
+                    clock_tag,
                     shard_selection,
+                    access.clone(),
                 )
                 .await
             }
@@ -551,7 +620,7 @@ pub async fn update_batch(
                 },
             ) => {
                 delete_payload(
-                    toc,
+                    toc.clone(),
                     DeletePayloadPoints {
                         collection_name,
                         wait,
@@ -560,7 +629,9 @@ pub async fn update_batch(
                         ordering,
                         shard_key_selector,
                     },
+                    clock_tag,
                     shard_selection,
+                    access.clone(),
                 )
                 .await
             }
@@ -569,7 +640,7 @@ pub async fn update_batch(
                 shard_key_selector,
             }) => {
                 clear_payload(
-                    toc,
+                    toc.clone(),
                     ClearPayloadPoints {
                         collection_name,
                         wait,
@@ -577,7 +648,9 @@ pub async fn update_batch(
                         ordering,
                         shard_key_selector,
                     },
+                    clock_tag,
                     shard_selection,
+                    access.clone(),
                 )
                 .await
             }
@@ -588,7 +661,7 @@ pub async fn update_batch(
                 },
             ) => {
                 update_vectors(
-                    toc,
+                    toc.clone(),
                     UpdatePointVectors {
                         collection_name,
                         wait,
@@ -596,7 +669,9 @@ pub async fn update_batch(
                         ordering,
                         shard_key_selector,
                     },
+                    clock_tag,
                     shard_selection,
+                    access.clone(),
                 )
                 .await
             }
@@ -608,7 +683,7 @@ pub async fn update_batch(
                 },
             ) => {
                 delete_vectors(
-                    toc,
+                    toc.clone(),
                     DeletePointVectors {
                         collection_name,
                         wait,
@@ -617,13 +692,15 @@ pub async fn update_batch(
                         ordering,
                         shard_key_selector,
                     },
+                    clock_tag,
                     shard_selection,
+                    access.clone(),
                 )
                 .await
             }
             Operation::ClearPayloadDeprecated(selector) => {
                 clear_payload(
-                    toc,
+                    toc.clone(),
                     ClearPayloadPoints {
                         collection_name,
                         wait,
@@ -631,7 +708,9 @@ pub async fn update_batch(
                         ordering,
                         shard_key_selector: None,
                     },
+                    clock_tag,
                     shard_selection,
+                    access.clone(),
                 )
                 .await
             }
@@ -640,7 +719,7 @@ pub async fn update_batch(
                 shard_key_selector,
             }) => {
                 delete(
-                    toc,
+                    toc.clone(),
                     DeletePoints {
                         collection_name,
                         wait,
@@ -648,7 +727,9 @@ pub async fn update_batch(
                         ordering,
                         shard_key_selector,
                     },
+                    clock_tag,
                     shard_selection,
+                    access.clone(),
                 )
                 .await
             }
@@ -658,7 +739,7 @@ pub async fn update_batch(
     Ok(Response::new(UpdateBatchResponse {
         result: results
             .into_iter()
-            .map(|response| response.into_inner().result.unwrap())
+            .map(|response| response.into_inner().result.unwrap().into())
             .collect(),
         time: timing.elapsed().as_secs_f64(),
     }))
@@ -673,21 +754,25 @@ fn convert_field_type(
         .ok_or_else(|| Status::invalid_argument("cannot convert field_type"))?;
 
     let field_schema = match (field_type_parsed, field_index_params) {
+        // Parameterized text type
         (
-            Some(v),
+            Some(FieldType::Text),
             Some(PayloadIndexParams {
                 index_params: Some(IndexParams::TextIndexParams(text_index_params)),
             }),
-        ) => match v {
-            FieldType::Text => Some(PayloadFieldSchema::FieldParams(PayloadSchemaParams::Text(
-                text_index_params.try_into()?,
-            ))),
-            _ => {
-                return Err(Status::invalid_argument(
-                    "field_type and field_index_params do not match",
-                ))
-            }
-        },
+        ) => Some(PayloadFieldSchema::FieldParams(PayloadSchemaParams::Text(
+            text_index_params.try_into()?,
+        ))),
+        // Parameterized integer type
+        (
+            Some(FieldType::Integer),
+            Some(PayloadIndexParams {
+                index_params: Some(IndexParams::IntegerIndexParams(integer_params)),
+            }),
+        ) => Some(PayloadFieldSchema::FieldParams(
+            PayloadSchemaParams::Integer(integer_params.try_into()?),
+        )),
+        // Regular field types
         (Some(v), None | Some(PayloadIndexParams { index_params: None })) => match v {
             FieldType::Keyword => Some(PayloadSchemaType::Keyword.into()),
             FieldType::Integer => Some(PayloadSchemaType::Integer.into()),
@@ -695,7 +780,19 @@ fn convert_field_type(
             FieldType::Geo => Some(PayloadSchemaType::Geo.into()),
             FieldType::Text => Some(PayloadSchemaType::Text.into()),
             FieldType::Bool => Some(PayloadSchemaType::Bool.into()),
+            FieldType::Datetime => Some(PayloadSchemaType::Datetime.into()),
         },
+        // Parameterized index with mismatching types
+        (
+            Some(v),
+            Some(PayloadIndexParams {
+                index_params: Some(_),
+            }),
+        ) => {
+            return Err(Status::invalid_argument(format!(
+                "field_type ({v:?}) and field_index_params do not match"
+            )))
+        }
         (None, Some(_)) => return Err(Status::invalid_argument("field type is missing")),
         (None, None) => None,
     };
@@ -704,10 +801,12 @@ fn convert_field_type(
 }
 
 pub async fn create_field_index(
-    toc: &Dispatcher,
+    dispatcher: Arc<Dispatcher>,
     create_field_index_collection: CreateFieldIndexCollection,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
-) -> Result<Response<PointsOperationResponse>, Status> {
+    access: Access,
+) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let CreateFieldIndexCollection {
         collection_name,
         wait,
@@ -717,6 +816,7 @@ pub async fn create_field_index(
         ordering,
     } = create_field_index_collection;
 
+    let field_name = json_path_from_proto(&field_name)?;
     let field_schema = convert_field_type(field_type, field_index_params)?;
 
     let operation = CreateFieldIndex {
@@ -726,25 +826,28 @@ pub async fn create_field_index(
 
     let timing = Instant::now();
     let result = do_create_index(
-        toc,
-        &collection_name,
+        dispatcher,
+        collection_name,
         operation,
+        clock_tag,
         shard_selection,
         wait.unwrap_or(false),
         write_ordering_from_proto(ordering)?,
+        access,
     )
     .await
     .map_err(error_to_status)?;
 
-    let response = points_operation_response(timing, result);
+    let response = points_operation_response_internal(timing, result);
     Ok(Response::new(response))
 }
 
 pub async fn create_field_index_internal(
-    toc: &TableOfContent,
+    toc: Arc<TableOfContent>,
     create_field_index_collection: CreateFieldIndexCollection,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
-) -> Result<Response<PointsOperationResponse>, Status> {
+) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let CreateFieldIndexCollection {
         collection_name,
         wait,
@@ -754,14 +857,16 @@ pub async fn create_field_index_internal(
         ordering,
     } = create_field_index_collection;
 
+    let field_name = json_path_from_proto(&field_name)?;
     let field_schema = convert_field_type(field_type, field_index_params)?;
 
     let timing = Instant::now();
     let result = do_create_index_internal(
         toc,
-        &collection_name,
+        collection_name,
         field_name,
         field_schema,
+        clock_tag,
         shard_selection,
         wait.unwrap_or(false),
         write_ordering_from_proto(ordering)?,
@@ -769,15 +874,17 @@ pub async fn create_field_index_internal(
     .await
     .map_err(error_to_status)?;
 
-    let response = points_operation_response(timing, result);
+    let response = points_operation_response_internal(timing, result);
     Ok(Response::new(response))
 }
 
 pub async fn delete_field_index(
-    toc: &Dispatcher,
+    dispatcher: Arc<Dispatcher>,
     delete_field_index_collection: DeleteFieldIndexCollection,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
-) -> Result<Response<PointsOperationResponse>, Status> {
+    access: Access,
+) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let DeleteFieldIndexCollection {
         collection_name,
         wait,
@@ -785,27 +892,32 @@ pub async fn delete_field_index(
         ordering,
     } = delete_field_index_collection;
 
+    let field_name = json_path_from_proto(&field_name)?;
+
     let timing = Instant::now();
     let result = do_delete_index(
-        toc,
-        &collection_name,
+        dispatcher,
+        collection_name,
         field_name,
+        clock_tag,
         shard_selection,
         wait.unwrap_or(false),
         write_ordering_from_proto(ordering)?,
+        access,
     )
     .await
     .map_err(error_to_status)?;
 
-    let response = points_operation_response(timing, result);
+    let response = points_operation_response_internal(timing, result);
     Ok(Response::new(response))
 }
 
 pub async fn delete_field_index_internal(
-    toc: &TableOfContent,
+    toc: Arc<TableOfContent>,
     delete_field_index_collection: DeleteFieldIndexCollection,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
-) -> Result<Response<PointsOperationResponse>, Status> {
+) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let DeleteFieldIndexCollection {
         collection_name,
         wait,
@@ -813,11 +925,14 @@ pub async fn delete_field_index_internal(
         ordering,
     } = delete_field_index_collection;
 
+    let field_name = json_path_from_proto(&field_name)?;
+
     let timing = Instant::now();
     let result = do_delete_index_internal(
         toc,
-        &collection_name,
+        collection_name,
         field_name,
+        clock_tag,
         shard_selection,
         wait.unwrap_or(false),
         write_ordering_from_proto(ordering)?,
@@ -825,7 +940,7 @@ pub async fn delete_field_index_internal(
     .await
     .map_err(error_to_status)?;
 
-    let response = points_operation_response(timing, result);
+    let response = points_operation_response_internal(timing, result);
     Ok(Response::new(response))
 }
 
@@ -833,6 +948,7 @@ pub async fn search(
     toc: &TableOfContent,
     search_points: SearchPoints,
     shard_selection: Option<ShardId>,
+    access: Access,
 ) -> Result<Response<SearchResponse>, Status> {
     let SearchPoints {
         collection_name,
@@ -880,6 +996,7 @@ pub async fn search(
         search_request,
         read_consistency,
         shard_selector,
+        access,
         timeout.map(Duration::from_secs),
     )
     .await
@@ -901,16 +1018,23 @@ pub async fn core_search_batch(
     collection_name: String,
     requests: Vec<(CoreSearchRequest, ShardSelectorInternal)>,
     read_consistency: Option<ReadConsistencyGrpc>,
+    access: Access,
     timeout: Option<Duration>,
 ) -> Result<Response<SearchBatchResponse>, Status> {
     let read_consistency = ReadConsistency::try_from_optional(read_consistency)?;
 
     let timing = Instant::now();
 
-    let scored_points =
-        do_search_batch_points(toc, &collection_name, requests, read_consistency, timeout)
-            .await
-            .map_err(error_to_status)?;
+    let scored_points = do_search_batch_points(
+        toc,
+        &collection_name,
+        requests,
+        read_consistency,
+        access,
+        timeout,
+    )
+    .await
+    .map_err(error_to_status)?;
 
     let response = SearchBatchResponse {
         result: scored_points
@@ -931,6 +1055,7 @@ pub async fn core_search_list(
     search_points: Vec<CoreSearchPoints>,
     read_consistency: Option<ReadConsistencyGrpc>,
     shard_selection: Option<ShardId>,
+    access: Access,
     timeout: Option<Duration>,
 ) -> Result<Response<SearchBatchResponse>, Status> {
     let searches: Result<Vec<_>, Status> =
@@ -960,6 +1085,7 @@ pub async fn core_search_list(
             request,
             read_consistency,
             shard_selection,
+            access,
             timeout,
         )
         .await
@@ -982,6 +1108,7 @@ pub async fn search_groups(
     toc: &TableOfContent,
     search_point_groups: SearchPointGroups,
     shard_selection: Option<ShardId>,
+    access: Access,
 ) -> Result<Response<SearchGroupsResponse>, Status> {
     let search_groups_request = search_point_groups.clone().try_into()?;
 
@@ -1004,6 +1131,7 @@ pub async fn search_groups(
         search_groups_request,
         read_consistency,
         shard_selector,
+        access,
         timeout.map(Duration::from_secs),
     )
     .await
@@ -1020,6 +1148,7 @@ pub async fn search_groups(
 pub async fn recommend(
     toc: &TableOfContent,
     recommend_points: RecommendPoints,
+    access: Access,
 ) -> Result<Response<RecommendResponse>, Status> {
     // TODO(luis): check if we can make this into a From impl
     let RecommendPoints {
@@ -1049,7 +1178,10 @@ pub async fn recommend(
         .into_iter()
         .map(TryInto::try_into)
         .collect::<Result<Vec<RecommendExample>, Status>>()?;
-    let positive_vectors = positive_vectors.into_iter().map(Into::into).collect();
+    let positive_vectors = positive_vectors
+        .into_iter()
+        .map(TryInto::try_into)
+        .collect::<Result<_, _>>()?;
     let positive = [positive_ids, positive_vectors].concat();
 
     let negative_ids = negative
@@ -1092,6 +1224,7 @@ pub async fn recommend(
             request,
             read_consistency,
             shard_selector,
+            access,
             timeout,
         )
         .await
@@ -1113,6 +1246,7 @@ pub async fn recommend_batch(
     collection_name: String,
     recommend_points: Vec<RecommendPoints>,
     read_consistency: Option<ReadConsistencyGrpc>,
+    access: Access,
     timeout: Option<Duration>,
 ) -> Result<Response<RecommendBatchResponse>, Status> {
     let mut requests = Vec::with_capacity(recommend_points.len());
@@ -1129,7 +1263,13 @@ pub async fn recommend_batch(
 
     let timing = Instant::now();
     let scored_points = toc
-        .recommend_batch(&collection_name, requests, read_consistency, timeout)
+        .recommend_batch(
+            &collection_name,
+            requests,
+            read_consistency,
+            access,
+            timeout,
+        )
         .await
         .map_err(error_to_status)?;
 
@@ -1149,6 +1289,7 @@ pub async fn recommend_batch(
 pub async fn recommend_groups(
     toc: &TableOfContent,
     recommend_point_groups: RecommendPointGroups,
+    access: Access,
 ) -> Result<Response<RecommendGroupsResponse>, Status> {
     let recommend_groups_request = recommend_point_groups.clone().try_into()?;
 
@@ -1171,6 +1312,7 @@ pub async fn recommend_groups(
         recommend_groups_request,
         read_consistency,
         shard_selector,
+        access,
         timeout.map(Duration::from_secs),
     )
     .await
@@ -1187,6 +1329,7 @@ pub async fn recommend_groups(
 pub async fn discover(
     toc: &TableOfContent,
     discover_points: DiscoverPoints,
+    access: Access,
 ) -> Result<Response<DiscoverResponse>, Status> {
     let (request, collection_name, read_consistency, timeout, shard_key_selector) =
         try_discover_request_from_grpc(discover_points)?;
@@ -1201,6 +1344,7 @@ pub async fn discover(
             request,
             read_consistency,
             shard_selector,
+            access,
             timeout,
         )
         .await
@@ -1222,6 +1366,7 @@ pub async fn discover_batch(
     collection_name: String,
     discover_points: Vec<DiscoverPoints>,
     read_consistency: Option<ReadConsistencyGrpc>,
+    access: Access,
     timeout: Option<Duration>,
 ) -> Result<Response<DiscoverBatchResponse>, Status> {
     let mut requests = Vec::with_capacity(discover_points.len());
@@ -1237,7 +1382,13 @@ pub async fn discover_batch(
 
     let timing = Instant::now();
     let scored_points = toc
-        .discover_batch(&collection_name, requests, read_consistency, timeout)
+        .discover_batch(
+            &collection_name,
+            requests,
+            read_consistency,
+            access,
+            timeout,
+        )
         .await
         .map_err(error_to_status)?;
 
@@ -1257,6 +1408,7 @@ pub async fn scroll(
     toc: &TableOfContent,
     scroll_points: ScrollPoints,
     shard_selection: Option<ShardId>,
+    access: Access,
 ) -> Result<Response<ScrollResponse>, Status> {
     let ScrollPoints {
         collection_name,
@@ -1267,6 +1419,7 @@ pub async fn scroll(
         with_vectors,
         read_consistency,
         shard_key_selector,
+        order_by,
     } = scroll_points;
 
     let scroll_request = ScrollRequestInternal {
@@ -1277,6 +1430,10 @@ pub async fn scroll(
         with_vector: with_vectors
             .map(|selector| selector.into())
             .unwrap_or_default(),
+        order_by: order_by
+            .map(OrderBy::try_from)
+            .transpose()?
+            .map(OrderByInterface::Struct),
     };
 
     let read_consistency = ReadConsistency::try_from_optional(read_consistency)?;
@@ -1290,6 +1447,7 @@ pub async fn scroll(
         scroll_request,
         read_consistency,
         shard_selector,
+        access,
     )
     .await
     .map_err(error_to_status)?;
@@ -1299,7 +1457,8 @@ pub async fn scroll(
         result: scrolled_points
             .points
             .into_iter()
-            .map(|point| point.into())
+            .map(Record::from)
+            .map(api::grpc::qdrant::RetrievedPoint::from)
             .collect(),
         time: timing.elapsed().as_secs_f64(),
     };
@@ -1311,6 +1470,7 @@ pub async fn count(
     toc: &TableOfContent,
     count_points: CountPoints,
     shard_selection: Option<ShardId>,
+    access: Access,
 ) -> Result<Response<CountResponse>, Status> {
     let CountPoints {
         collection_name,
@@ -1336,6 +1496,7 @@ pub async fn count(
         count_request,
         read_consistency,
         shard_selector,
+        access,
     )
     .await
     .map_err(error_to_status)?;
@@ -1352,6 +1513,7 @@ pub async fn get(
     toc: &TableOfContent,
     get_points: GetPoints,
     shard_selection: Option<ShardId>,
+    access: Access,
 ) -> Result<Response<GetResponse>, Status> {
     let GetPoints {
         collection_name,
@@ -1385,12 +1547,94 @@ pub async fn get(
         point_request,
         read_consistency,
         shard_selector,
+        access,
     )
     .await
     .map_err(error_to_status)?;
 
     let response = GetResponse {
         result: records.into_iter().map(|point| point.into()).collect(),
+        time: timing.elapsed().as_secs_f64(),
+    };
+
+    Ok(Response::new(response))
+}
+
+pub async fn query(
+    toc: &TableOfContent,
+    query_points: QueryPoints,
+    shard_selection: Option<ShardId>,
+    access: Access,
+) -> Result<Response<QueryResponse>, Status> {
+    let shard_key_selector = query_points.shard_key_selector.clone();
+    let shard_selector = convert_shard_selector_for_read(shard_selection, shard_key_selector);
+    let read_consistency = query_points
+        .read_consistency
+        .clone()
+        .map(TryFrom::try_from)
+        .transpose()?;
+    let timeout = query_points.timeout.map(Duration::from_secs);
+    let collection_name = query_points.collection_name.clone();
+    let request = CollectionQueryRequest::try_from(query_points)?;
+    let timing = Instant::now();
+    let scored_points = do_query_points(
+        toc,
+        &collection_name,
+        request,
+        read_consistency,
+        shard_selector,
+        access,
+        timeout,
+    )
+    .await
+    .map_err(error_to_status)?;
+
+    let response = QueryResponse {
+        result: scored_points
+            .into_iter()
+            .map(|point| point.into())
+            .collect(),
+        time: timing.elapsed().as_secs_f64(),
+    };
+
+    Ok(Response::new(response))
+}
+
+pub async fn query_batch(
+    toc: &TableOfContent,
+    collection_name: String,
+    points: Vec<QueryPoints>,
+    read_consistency: Option<ReadConsistencyGrpc>,
+    access: Access,
+    timeout: Option<Duration>,
+) -> Result<Response<QueryBatchResponse>, Status> {
+    let read_consistency = ReadConsistency::try_from_optional(read_consistency)?;
+    let mut requests = Vec::with_capacity(points.len());
+    for query_points in points {
+        let shard_key_selector = query_points.shard_key_selector.clone();
+        let shard_selector = convert_shard_selector_for_read(None, shard_key_selector);
+        let request = CollectionQueryRequest::try_from(query_points)?;
+        requests.push((request, shard_selector));
+    }
+    let timing = Instant::now();
+    let scored_points = do_query_batch_points(
+        toc,
+        &collection_name,
+        requests,
+        read_consistency,
+        access,
+        timeout,
+    )
+    .await
+    .map_err(error_to_status)?;
+
+    let response = QueryBatchResponse {
+        result: scored_points
+            .into_iter()
+            .map(|points| BatchResult {
+                result: points.into_iter().map(|p| p.into()).collect(),
+            })
+            .collect(),
         time: timing.elapsed().as_secs_f64(),
     };
 

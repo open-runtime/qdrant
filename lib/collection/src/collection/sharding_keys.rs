@@ -5,7 +5,9 @@ use segment::types::ShardKey;
 use crate::collection::Collection;
 use crate::config::ShardingMethod;
 use crate::operations::types::CollectionError;
-use crate::operations::{CollectionUpdateOperations, CreateIndex, FieldIndexOperations};
+use crate::operations::{
+    CollectionUpdateOperations, CreateIndex, FieldIndexOperations, OperationWithClockTag,
+};
 use crate::shards::replica_set::{ReplicaState, ShardReplicaSet};
 use crate::shards::shard::{PeerId, ShardId, ShardsPlacement};
 
@@ -14,6 +16,7 @@ impl Collection {
         &self,
         shard_id: ShardId,
         replicas: &[PeerId],
+        init_state: Option<ReplicaState>,
     ) -> Result<ShardReplicaSet, CollectionError> {
         let is_local = replicas.contains(&self.this_peer_id);
 
@@ -22,6 +25,8 @@ impl Collection {
             .copied()
             .filter(|peer_id| *peer_id != self.this_peer_id)
             .collect();
+
+        let effective_optimizers_config = self.effective_optimizers_config().await?;
 
         ShardReplicaSet::build(
             shard_id,
@@ -33,15 +38,21 @@ impl Collection {
             self.abort_shard_transfer_cb.clone(),
             &self.path,
             self.collection_config.clone(),
+            effective_optimizers_config,
             self.shared_storage_config.clone(),
+            self.payload_index_schema.clone(),
             self.channel_service.clone(),
             self.update_runtime.clone(),
             self.search_runtime.clone(),
-            Some(ReplicaState::Active),
+            self.optimizer_cpu_budget.clone(),
+            init_state.or(Some(ReplicaState::Active)),
         )
         .await
     }
 
+    /// # Cancel safety
+    ///
+    /// This method is *not* cancel safe.
     pub async fn create_shard_key(
         &self,
         shard_key: ShardKey,
@@ -94,7 +105,7 @@ impl Collection {
             let shard_id = max_shard_id + idx as ShardId + 1;
 
             let replica_set = self
-                .create_replica_set(shard_id, shard_replicas_placement)
+                .create_replica_set(shard_id, shard_replicas_placement, None)
                 .await?;
 
             for (field_name, field_schema) in payload_schema.iter() {
@@ -105,7 +116,9 @@ impl Collection {
                     }),
                 );
 
-                replica_set.update_local(create_index_op, true).await?;
+                replica_set
+                    .update_local(OperationWithClockTag::from(create_index_op), true) // TODO: Assign clock tag!? 🤔
+                    .await?;
             }
 
             self.shards_holder.write().await.add_shard(

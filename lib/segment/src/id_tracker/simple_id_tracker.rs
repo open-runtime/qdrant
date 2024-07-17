@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::common::operation_error::OperationResult;
 use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
+use crate::common::rocksdb_buffered_update_wrapper::DatabaseColumnScheduledUpdateWrapper;
 use crate::common::rocksdb_wrapper::{DatabaseColumnWrapper, DB_MAPPING_CF, DB_VERSIONS_CF};
 use crate::common::Flusher;
 use crate::id_tracker::IdTracker;
@@ -56,6 +57,7 @@ fn external_to_stored_id(point_id: &PointIdType) -> StoredPointId {
     point_id.into()
 }
 
+#[derive(Debug)]
 pub struct SimpleIdTracker {
     deleted: BitVec,
     internal_to_external: Vec<PointIdType>,
@@ -63,7 +65,7 @@ pub struct SimpleIdTracker {
     external_to_internal_num: BTreeMap<u64, PointOffsetType>,
     external_to_internal_uuid: BTreeMap<Uuid, PointOffsetType>,
     mapping_db_wrapper: DatabaseColumnScheduledDeleteWrapper,
-    versions_db_wrapper: DatabaseColumnScheduledDeleteWrapper,
+    versions_db_wrapper: DatabaseColumnScheduledUpdateWrapper,
 }
 
 impl SimpleIdTracker {
@@ -76,51 +78,58 @@ impl SimpleIdTracker {
         let mapping_db_wrapper = DatabaseColumnScheduledDeleteWrapper::new(
             DatabaseColumnWrapper::new(store.clone(), DB_MAPPING_CF),
         );
-        for (key, val) in mapping_db_wrapper.lock_db().iter()? {
-            let external_id = Self::restore_key(&key);
-            let internal_id: PointOffsetType =
-                bincode::deserialize::<PointOffsetType>(&val).unwrap();
-            if internal_id as usize >= internal_to_external.len() {
-                internal_to_external.resize(internal_id as usize + 1, PointIdType::NumId(u64::MAX));
-            }
-            if internal_id as usize >= deleted.len() {
-                deleted.resize(internal_id as usize + 1, true);
-            }
 
-            let replaced_id = internal_to_external[internal_id as usize];
-            internal_to_external[internal_id as usize] = external_id;
-            if !deleted[internal_id as usize] {
-                // Fixing corrupted mapping - this id should be recovered from WAL
-                // This should not happen in normal operation, but it can happen if
-                // the database is corrupted.
-                log::warn!(
-                    "removing duplicated external id {} in internal id {}",
-                    external_id,
-                    replaced_id
-                );
-                match replaced_id {
+        {
+            let db_lock = mapping_db_wrapper.lock_db();
+            let pending_deletes = mapping_db_wrapper.pending_deletes();
+
+            for (key, value) in db_lock.iter_pending_deletes(pending_deletes)? {
+                let external_id = Self::restore_key(&key);
+                let internal_id: PointOffsetType =
+                    bincode::deserialize::<PointOffsetType>(&value).unwrap();
+                if internal_id as usize >= internal_to_external.len() {
+                    internal_to_external
+                        .resize(internal_id as usize + 1, PointIdType::NumId(u64::MAX));
+                }
+                if internal_id as usize >= deleted.len() {
+                    deleted.resize(internal_id as usize + 1, true);
+                }
+
+                let replaced_id = internal_to_external[internal_id as usize];
+                internal_to_external[internal_id as usize] = external_id;
+                if !deleted[internal_id as usize] {
+                    // Fixing corrupted mapping - this id should be recovered from WAL
+                    // This should not happen in normal operation, but it can happen if
+                    // the database is corrupted.
+                    log::warn!(
+                        "removing duplicated external id {} in internal id {}",
+                        external_id,
+                        replaced_id
+                    );
+                    match replaced_id {
+                        PointIdType::NumId(idx) => {
+                            external_to_internal_num.remove(&idx);
+                        }
+                        PointIdType::Uuid(uuid) => {
+                            external_to_internal_uuid.remove(&uuid);
+                        }
+                    }
+                }
+                deleted.set(internal_id as usize, false);
+
+                match external_id {
                     PointIdType::NumId(idx) => {
-                        external_to_internal_num.remove(&idx);
+                        external_to_internal_num.insert(idx, internal_id);
                     }
                     PointIdType::Uuid(uuid) => {
-                        external_to_internal_uuid.remove(&uuid);
+                        external_to_internal_uuid.insert(uuid, internal_id);
                     }
-                }
-            }
-            deleted.set(internal_id as usize, false);
-
-            match external_id {
-                PointIdType::NumId(idx) => {
-                    external_to_internal_num.insert(idx, internal_id);
-                }
-                PointIdType::Uuid(uuid) => {
-                    external_to_internal_uuid.insert(uuid, internal_id);
                 }
             }
         }
 
         let mut internal_to_version: Vec<SeqNumberType> = Default::default();
-        let versions_db_wrapper = DatabaseColumnScheduledDeleteWrapper::new(
+        let versions_db_wrapper = DatabaseColumnScheduledUpdateWrapper::new(
             DatabaseColumnWrapper::new(store, DB_VERSIONS_CF),
         );
         for (key, val) in versions_db_wrapper.lock_db().iter()? {
@@ -382,6 +391,27 @@ impl IdTracker for SimpleIdTracker {
 
     fn deleted_point_bitslice(&self) -> &BitSlice {
         &self.deleted
+    }
+
+    fn cleanup_versions(&mut self) -> OperationResult<()> {
+        let mut to_remove = Vec::new();
+        for internal_id in self.iter_internal() {
+            if self.internal_version(internal_id).is_none() {
+                if let Some(external_id) = self.external_id(internal_id) {
+                    to_remove.push(external_id);
+                } else {
+                    debug_assert!(false, "internal id {} has no external id", internal_id);
+                }
+            }
+        }
+        for external_id in to_remove {
+            self.drop(external_id)?;
+            #[cfg(debug_assertions)] // Only for dev builds
+            {
+                log::debug!("dropped version for point {} without version", external_id);
+            }
+        }
+        Ok(())
     }
 }
 

@@ -1,8 +1,10 @@
+use std::borrow::Cow;
 use std::marker::PhantomData;
 
 use common::types::{PointOffsetType, ScoreType};
 
-use crate::data_types::vectors::{DenseVector, VectorElementType};
+use crate::data_types::primitive::PrimitiveVectorElement;
+use crate::data_types::vectors::{DenseVector, TypedDenseVector};
 use crate::spaces::metric::Metric;
 use crate::vector_storage::query::{Query, TransformInto};
 use crate::vector_storage::query_scorer::QueryScorer;
@@ -10,37 +12,57 @@ use crate::vector_storage::DenseVectorStorage;
 
 pub struct CustomQueryScorer<
     'a,
-    TMetric: Metric,
-    TVectorStorage: DenseVectorStorage,
-    TQuery: Query<DenseVector>,
+    TElement: PrimitiveVectorElement,
+    TMetric: Metric<TElement>,
+    TVectorStorage: DenseVectorStorage<TElement>,
+    TInputQuery: Query<DenseVector>,
+    TStoredQuery: Query<TypedDenseVector<TElement>>,
 > {
     vector_storage: &'a TVectorStorage,
-    query: TQuery,
+    query: TStoredQuery,
     metric: PhantomData<TMetric>,
+    _input_query: PhantomData<TInputQuery>,
+    _element: PhantomData<TElement>,
 }
 
 impl<
         'a,
-        TMetric: Metric,
-        TVectorStorage: DenseVectorStorage,
-        TQuery: Query<DenseVector> + TransformInto<TQuery>,
-    > CustomQueryScorer<'a, TMetric, TVectorStorage, TQuery>
+        TElement: PrimitiveVectorElement,
+        TMetric: Metric<TElement>,
+        TVectorStorage: DenseVectorStorage<TElement>,
+        TInputQuery: Query<DenseVector> + TransformInto<TStoredQuery, DenseVector, TypedDenseVector<TElement>>,
+        TStoredQuery: Query<TypedDenseVector<TElement>>,
+    > CustomQueryScorer<'a, TElement, TMetric, TVectorStorage, TInputQuery, TStoredQuery>
 {
-    pub fn new(query: TQuery, vector_storage: &'a TVectorStorage) -> Self {
+    pub fn new(query: TInputQuery, vector_storage: &'a TVectorStorage) -> Self {
         let query = query
-            .transform(|vector| Ok(TMetric::preprocess(vector)))
+            .transform(|vector| {
+                let preprocessed_vector = TMetric::preprocess(vector);
+                Ok(TypedDenseVector::from(TElement::slice_from_float_cow(
+                    Cow::from(preprocessed_vector),
+                )))
+            })
             .unwrap();
 
         Self {
             query,
             vector_storage,
             metric: PhantomData,
+            _input_query: PhantomData,
+            _element: PhantomData,
         }
     }
 }
 
-impl<'a, TMetric: Metric, TVectorStorage: DenseVectorStorage, TQuery: Query<DenseVector>>
-    QueryScorer<[VectorElementType]> for CustomQueryScorer<'a, TMetric, TVectorStorage, TQuery>
+impl<
+        'a,
+        TElement: PrimitiveVectorElement,
+        TMetric: Metric<TElement>,
+        TVectorStorage: DenseVectorStorage<TElement>,
+        TInputQuery: Query<DenseVector>,
+        TStoredQuery: Query<TypedDenseVector<TElement>>,
+    > QueryScorer<[TElement]>
+    for CustomQueryScorer<'a, TElement, TMetric, TVectorStorage, TInputQuery, TStoredQuery>
 {
     #[inline]
     fn score_stored(&self, idx: PointOffsetType) -> ScoreType {
@@ -49,7 +71,7 @@ impl<'a, TMetric: Metric, TVectorStorage: DenseVectorStorage, TQuery: Query<Dens
     }
 
     #[inline]
-    fn score(&self, against: &[VectorElementType]) -> ScoreType {
+    fn score(&self, against: &[TElement]) -> ScoreType {
         self.query
             .score_by(|example| TMetric::similarity(example, against))
     }

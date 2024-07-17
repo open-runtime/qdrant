@@ -1,18 +1,25 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::types::{DetailsLevel, TelemetryDetail};
 use segment::common::anonymize::Anonymize;
+use storage::rbac::Access;
 use tokio::sync::Mutex;
 
-use crate::common::telemetry::TelemetryCollector;
+use super::telemetry::TelemetryCollector;
 
-const DETAIL_LEVEL: usize = 5;
+const DETAIL: TelemetryDetail = TelemetryDetail {
+    level: DetailsLevel::Level2,
+    histograms: false,
+};
 const REPORTING_INTERVAL: Duration = Duration::from_secs(60 * 60); // One hour
 
 pub struct TelemetryReporter {
     telemetry_url: String,
     telemetry: Arc<Mutex<TelemetryCollector>>,
 }
+
+const FULL_ACCESS: Access = Access::full("Telemetry reporter");
 
 impl TelemetryReporter {
     fn new(telemetry: Arc<Mutex<TelemetryCollector>>) -> Self {
@@ -33,7 +40,7 @@ impl TelemetryReporter {
             .telemetry
             .lock()
             .await
-            .prepare_data(DETAIL_LEVEL)
+            .prepare_data(&FULL_ACCESS, DETAIL)
             .await
             .anonymize();
         let client = reqwest::Client::new();

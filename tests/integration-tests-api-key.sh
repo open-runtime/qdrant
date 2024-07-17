@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # This runs the auth integration tests in isolation
 
 set -eux
@@ -15,9 +15,6 @@ export QDRANT__SERVICE__READ_ONLY_API_KEY="my-ro-secret"
 
 #Capture PID of the process
 PID=$!
-
-# Sleep to make sure the process has started (workaround for empty pidof)
-sleep 5
 
 function clear_after_tests()
 {
@@ -41,4 +38,3 @@ docker run --rm \
        -e QDRANT_HOST=host.docker.internal \
        --add-host host.docker.internal:host-gateway \
        $IMAGE_NAME sh -c "pytest /tests"
-

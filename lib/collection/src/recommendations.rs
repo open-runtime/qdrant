@@ -1,15 +1,17 @@
 use std::future::Future;
+use std::iter::Peekable;
 use std::time::Duration;
 
+use api::rest::RecommendStrategy;
 use itertools::Itertools;
 use segment::data_types::vectors::{
-    DenseVector, NamedQuery, NamedVectorStruct, Vector, VectorElementType, VectorRef,
-    DEFAULT_VECTOR_NAME,
+    DenseVector, NamedQuery, NamedVectorStruct, TypedMultiDenseVector, Vector, VectorElementType,
+    VectorRef, DEFAULT_VECTOR_NAME,
 };
 use segment::types::{
     Condition, ExtendedPointId, Filter, HasIdCondition, PointIdType, ScoredPoint,
 };
-use segment::vector_storage::query::reco_query::RecoQuery;
+use segment::vector_storage::query::RecoQuery;
 use sparse::common::sparse_vector::SparseVector;
 use tokio::sync::RwLockReadGuard;
 
@@ -21,17 +23,20 @@ use crate::common::fetch_vectors::{
 };
 use crate::common::retrieve_request_trait::RetrieveRequest;
 use crate::operations::consistency_params::ReadConsistency;
+use crate::operations::query_enum::QueryEnum;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::types::{
-    CollectionError, CollectionResult, CoreSearchRequest, CoreSearchRequestBatch, QueryEnum,
-    RecommendRequestInternal, RecommendStrategy, UsingVector,
+    CollectionError, CollectionResult, CoreSearchRequest, CoreSearchRequestBatch,
+    RecommendRequestInternal, UsingVector,
 };
 
-fn avg_vectors<'a>(vectors: impl Iterator<Item = VectorRef<'a>>) -> CollectionResult<Vector> {
+fn avg_vectors<'a>(vectors: impl IntoIterator<Item = VectorRef<'a>>) -> CollectionResult<Vector> {
     let mut avg_dense = DenseVector::default();
     let mut avg_sparse = SparseVector::default();
+    let mut avg_multi: Option<TypedMultiDenseVector<VectorElementType>> = None;
     let mut dense_count = 0;
     let mut sparse_count = 0;
+    let mut multi_count = 0;
     for vector in vectors {
         match vector {
             VectorRef::Dense(vector) => {
@@ -48,30 +53,48 @@ fn avg_vectors<'a>(vectors: impl Iterator<Item = VectorRef<'a>>) -> CollectionRe
                 sparse_count += 1;
                 avg_sparse = vector.combine_aggregate(&avg_sparse, |v1, v2| v1 + v2);
             }
+            VectorRef::MultiDense(vector) => {
+                multi_count += 1;
+                avg_multi = Some(avg_multi.map_or_else(
+                    || vector.to_owned(),
+                    |mut avg_multi| {
+                        avg_multi
+                            .flattened_vectors
+                            .extend_from_slice(vector.flattened_vectors);
+                        avg_multi
+                    },
+                ));
+            }
         }
     }
 
-    match (dense_count, sparse_count) {
+    match (dense_count, sparse_count, multi_count) {
         // TODO(sparse): what if vectors iterator is empty? We added CollectionError::BadRequest,
         // but it's not clear if it's the best solution.
         // Currently it's hard to return an zeroed vector, because we don't know its type: dense or sparse.
-        (0, 0) => Err(CollectionError::bad_input(
+        (0, 0, 0) => Err(CollectionError::bad_input(
             "Positive vectors should not be empty with `average` strategy".to_owned(),
         )),
-        (_, 0) => {
+        (_, 0, 0) => {
             for item in &mut avg_dense {
                 *item /= dense_count as VectorElementType;
             }
-            Ok(avg_dense.into())
+            Ok(Vector::from(avg_dense))
         }
-        (0, _) => {
+        (0, _, 0) => {
             for item in &mut avg_sparse.values {
                 *item /= sparse_count as VectorElementType;
             }
-            Ok(avg_sparse.into())
+            Ok(Vector::from(avg_sparse))
         }
-        (_, _) => Err(CollectionError::bad_input(
-            "Can't average dense and sparse vectors together".to_owned(),
+        (0, 0, _) => match avg_multi {
+            Some(avg_multi) => Ok(Vector::from(avg_multi)),
+            None => Err(CollectionError::bad_input(
+                "Positive vectors should not be empty with `average` strategy".to_owned(),
+            )),
+        },
+        (_, _, _) => Err(CollectionError::bad_input(
+            "Can't average vectors with different types".to_owned(),
         )),
     }
 }
@@ -89,10 +112,31 @@ fn merge_positive_and_negative_avg(positive: Vector, negative: Vector) -> Collec
         (Vector::Sparse(positive), Vector::Sparse(negative)) => Ok(positive
             .combine_aggregate(&negative, |pos, neg| pos + pos - neg)
             .into()),
+        (Vector::MultiDense(mut positive), Vector::MultiDense(negative)) => {
+            // merge positive and negative vectors as concatenated vectors with negative vectors negated
+            positive.flattened_vectors.extend(negative.flattened_vectors.into_iter().map(|x| -x));
+            Ok(Vector::MultiDense(positive))
+        },
         _ => Err(CollectionError::bad_input(
-            "Positive and negative vectors should be of the same type, either all dense or all sparse".to_owned(),
+            "Positive and negative vectors should be of the same type, either all dense or all sparse or all multi".to_owned(),
         )),
     }
+}
+
+pub fn avg_vector_for_recommendation<'a>(
+    positive: impl IntoIterator<Item = VectorRef<'a>>,
+    mut negative: Peekable<impl Iterator<Item = VectorRef<'a>>>,
+) -> CollectionResult<Vector> {
+    let avg_positive = avg_vectors(positive)?;
+
+    let search_vector = if negative.peek().is_none() {
+        avg_positive
+    } else {
+        let avg_negative = avg_vectors(negative)?;
+        merge_positive_and_negative_avg(avg_positive, avg_negative)?
+    };
+
+    Ok(search_vector)
 }
 
 pub async fn recommend_by<'a, F, Fut>(
@@ -124,6 +168,7 @@ where
 }
 
 pub fn recommend_into_core_search(
+    collection_name: &str,
     request: RecommendRequestInternal,
     all_vectors_records_map: &ReferencedVectors,
 ) -> CollectionResult<CoreSearchRequest> {
@@ -147,13 +192,21 @@ pub fn recommend_into_core_search(
         }
     }
 
+    // do not exclude vector ids from different lookup collection
+    let reference_vectors_ids_to_exclude = match lookup_collection_name {
+        Some(lookup_collection_name) if lookup_collection_name != collection_name => vec![],
+        _ => reference_vectors_ids,
+    };
+
     match request.strategy.unwrap_or_default() {
-        RecommendStrategy::AverageVector => {
-            recommend_by_avg_vector(request, reference_vectors_ids, all_vectors_records_map)
-        }
+        RecommendStrategy::AverageVector => recommend_by_avg_vector(
+            request,
+            reference_vectors_ids_to_exclude,
+            all_vectors_records_map,
+        ),
         RecommendStrategy::BestScore => Ok(recommend_by_best_score(
             request,
-            reference_vectors_ids,
+            reference_vectors_ids_to_exclude,
             all_vectors_records_map,
         )),
     }
@@ -231,9 +284,11 @@ where
         request_batch,
         |(_req, shard)| shard,
         |(req, _), acc| {
-            recommend_into_core_search(req, &all_vectors_records_map).map(|core_req| {
-                acc.push(core_req);
-            })
+            recommend_into_core_search(&collection.id, req, &all_vectors_records_map).map(
+                |core_req| {
+                    acc.push(core_req);
+                },
+            )
         },
         |shard_selector, core_searches, requests| {
             if core_searches.is_empty() {
@@ -262,10 +317,10 @@ where
 
 fn recommend_by_avg_vector(
     request: RecommendRequestInternal,
-    reference_vectors_ids: Vec<ExtendedPointId>,
+    reference_vectors_ids_to_exclude: Vec<ExtendedPointId>,
     all_vectors_records_map: &ReferencedVectors,
 ) -> CollectionResult<CoreSearchRequest> {
-    let lookup_vector_name = request.get_search_vector_name();
+    let lookup_vector_name = request.get_lookup_vector_name();
 
     let RecommendRequestInternal {
         filter,
@@ -303,15 +358,8 @@ fn recommend_by_avg_vector(
         Some(UsingVector::Name(name)) => name,
     };
 
-    let avg_positive = avg_vectors(positive_vectors)?;
-    let negative = negative_vectors.collect_vec();
-
-    let search_vector = if negative.is_empty() {
-        avg_positive
-    } else {
-        let avg_negative = avg_vectors(negative.into_iter())?;
-        merge_positive_and_negative_avg(avg_positive, avg_negative)?
-    };
+    let search_vector =
+        avg_vector_for_recommendation(positive_vectors, negative_vectors.peekable())?;
 
     Ok(CoreSearchRequest {
         query: QueryEnum::Nearest(NamedVectorStruct::new_from_vector(
@@ -320,9 +368,11 @@ fn recommend_by_avg_vector(
         )),
         filter: Some(Filter {
             should: None,
+            min_should: None,
             must: filter.clone().map(|filter| vec![Condition::Filter(filter)]),
+            // Exclude vector ids from the same collection given as lookup params
             must_not: Some(vec![Condition::HasId(HasIdCondition {
-                has_id: reference_vectors_ids.iter().cloned().collect(),
+                has_id: reference_vectors_ids_to_exclude.into_iter().collect(),
             })]),
         }),
         with_payload,
@@ -336,10 +386,10 @@ fn recommend_by_avg_vector(
 
 fn recommend_by_best_score(
     request: RecommendRequestInternal,
-    reference_vectors_ids: Vec<PointIdType>,
+    reference_vectors_ids_to_exclude: Vec<PointIdType>,
     all_vectors_records_map: &ReferencedVectors,
 ) -> CoreSearchRequest {
-    let lookup_vector_name = request.get_search_vector_name();
+    let lookup_vector_name = request.get_lookup_vector_name();
 
     let RecommendRequestInternal {
         positive,
@@ -383,9 +433,10 @@ fn recommend_by_best_score(
         query,
         filter: Some(Filter {
             should: None,
+            min_should: None,
             must: filter.map(|filter| vec![Condition::Filter(filter)]),
             must_not: Some(vec![Condition::HasId(HasIdCondition {
-                has_id: reference_vectors_ids.into_iter().collect(),
+                has_id: reference_vectors_ids_to_exclude.into_iter().collect(),
             })]),
         }),
         params,
@@ -399,7 +450,7 @@ fn recommend_by_best_score(
 
 #[cfg(test)]
 mod tests {
-    use segment::data_types::vectors::Vector;
+    use segment::data_types::vectors::{Vector, VectorRef};
     use sparse::common::sparse_vector::SparseVector;
 
     use super::avg_vectors;
@@ -412,7 +463,7 @@ mod tests {
             vec![1.0, 2.0, 3.0].into(),
         ];
         assert_eq!(
-            avg_vectors(vectors.iter().map(|v| v.to_vec_ref())).unwrap(),
+            avg_vectors(vectors.iter().map(VectorRef::from)).unwrap(),
             vec![1.0, 2.0, 3.0].into(),
         );
 
@@ -425,7 +476,7 @@ mod tests {
                 .into(),
         ];
         assert_eq!(
-            avg_vectors(vectors.iter().map(|v| v.to_vec_ref())).unwrap(),
+            avg_vectors(vectors.iter().map(VectorRef::from)).unwrap(),
             SparseVector::new(vec![0, 1, 2], vec![0.0, 0.55, 1.1])
                 .unwrap()
                 .into(),
@@ -437,6 +488,6 @@ mod tests {
                 .unwrap()
                 .into(),
         ];
-        assert!(avg_vectors(vectors.iter().map(|v| v.to_vec_ref())).is_err());
+        assert!(avg_vectors(vectors.iter().map(VectorRef::from)).is_err());
     }
 }

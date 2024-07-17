@@ -4,14 +4,24 @@ use std::time::{Duration, Instant};
 use api::grpc::qdrant::collections_internal_server::CollectionsInternal;
 use api::grpc::qdrant::{
     CollectionOperationResponse, GetCollectionInfoRequestInternal, GetCollectionInfoResponse,
-    InitiateShardTransferRequest, WaitForShardStateRequest,
+    GetShardRecoveryPointRequest, GetShardRecoveryPointResponse, InitiateShardTransferRequest,
+    UpdateShardCutoffPointRequest, WaitForShardStateRequest,
 };
 use storage::content_manager::conversions::error_to_status;
 use storage::content_manager::toc::TableOfContent;
+use storage::rbac::{Access, AccessRequirements, CollectionPass};
 use tonic::{Request, Response, Status};
 
 use super::validate_and_log;
 use crate::tonic::api::collections_common::get;
+
+const FULL_ACCESS: Access = Access::full("Internal API");
+
+fn full_access_pass(collection_name: &str) -> Result<CollectionPass<'_>, Status> {
+    FULL_ACCESS
+        .check_collection_access(collection_name, AccessRequirements::new())
+        .map_err(error_to_status)
+}
 
 pub struct CollectionsInternalService {
     toc: Arc<TableOfContent>,
@@ -41,6 +51,7 @@ impl CollectionsInternal for CollectionsInternalService {
         get(
             self.toc.as_ref(),
             get_collection_info_request,
+            FULL_ACCESS.clone(),
             Some(shard_id),
         )
         .await
@@ -91,7 +102,7 @@ impl CollectionsInternal for CollectionsInternalService {
 
         let collection_read = self
             .toc
-            .get_collection(&collection_name)
+            .get_collection(&full_access_pass(&collection_name)?)
             .await
             .map_err(|err| {
                 Status::not_found(format!(
@@ -106,6 +117,87 @@ impl CollectionsInternal for CollectionsInternalService {
             .map_err(|err| {
                 Status::aborted(format!(
                     "Failed to wait for shard {shard_id} to get into {state:?} state: {err}"
+                ))
+            })?;
+
+        let response = CollectionOperationResponse {
+            result: true,
+            time: timing.elapsed().as_secs_f64(),
+        };
+        Ok(Response::new(response))
+    }
+
+    async fn get_shard_recovery_point(
+        &self,
+        request: Request<GetShardRecoveryPointRequest>,
+    ) -> Result<Response<GetShardRecoveryPointResponse>, Status> {
+        validate_and_log(request.get_ref());
+
+        let timing = Instant::now();
+        let GetShardRecoveryPointRequest {
+            collection_name,
+            shard_id,
+        } = request.into_inner();
+
+        let collection_read = self
+            .toc
+            .get_collection(&full_access_pass(&collection_name)?)
+            .await
+            .map_err(|err| {
+                Status::not_found(format!(
+                    "Collection {collection_name} could not be found: {err}"
+                ))
+            })?;
+
+        // Get shard recovery point
+        let recovery_point = collection_read
+            .shard_recovery_point(shard_id)
+            .await
+            .map_err(|err| {
+                Status::internal(format!(
+                    "Failed to get recovery point for shard {shard_id}: {err}"
+                ))
+            })?;
+
+        let response = GetShardRecoveryPointResponse {
+            recovery_point: Some(recovery_point.into()),
+            time: timing.elapsed().as_secs_f64(),
+        };
+        Ok(Response::new(response))
+    }
+
+    async fn update_shard_cutoff_point(
+        &self,
+        request: Request<UpdateShardCutoffPointRequest>,
+    ) -> Result<Response<CollectionOperationResponse>, Status> {
+        validate_and_log(request.get_ref());
+
+        let timing = Instant::now();
+        let UpdateShardCutoffPointRequest {
+            collection_name,
+            shard_id,
+            cutoff,
+        } = request.into_inner();
+
+        let cutoff = cutoff.ok_or_else(|| Status::invalid_argument("Missing cutoff point"))?;
+
+        let collection_read = self
+            .toc
+            .get_collection(&full_access_pass(&collection_name)?)
+            .await
+            .map_err(|err| {
+                Status::not_found(format!(
+                    "Collection {collection_name} could not be found: {err}"
+                ))
+            })?;
+
+        // Set the shard cutoff point
+        collection_read
+            .update_shard_cutoff_point(shard_id, &cutoff.try_into()?)
+            .await
+            .map_err(|err| {
+                Status::internal(format!(
+                    "Failed to set shard cutoff point for shard {shard_id}: {err}"
                 ))
             })?;
 

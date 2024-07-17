@@ -1,14 +1,29 @@
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr as _;
 use std::time::Instant;
 
 use chrono::{NaiveDateTime, Timelike};
-use segment::data_types::text_index::TextIndexType;
-use segment::data_types::vectors::VectorElementType;
-use segment::types::default_quantization_ignore_value;
+use itertools::Itertools;
+use segment::data_types::index::{
+    BoolIndexType, DatetimeIndexType, FloatIndexType, GeoIndexType, IntegerIndexType,
+    KeywordIndexType, TextIndexType,
+};
+use segment::data_types::vectors as segment_vectors;
+use segment::json_path::JsonPath;
+use segment::types::{default_quantization_ignore_value, DateTimePayloadType, FloatPayloadType};
+use segment::vector_storage::query as segment_query;
+use sparse::common::sparse_vector::validate_sparse_vector_impl;
 use tonic::Status;
 use uuid::Uuid;
 
-use super::qdrant::{BinaryQuantization, CompressionRatio, GeoLineString, GroupId, SparseIndices};
+use super::qdrant::raw_query::RawContextPair;
+use super::qdrant::{
+    raw_query, start_from, BinaryQuantization, BoolIndexParams, CompressionRatio,
+    DatetimeIndexParams, DatetimeRange, Direction, FieldType, FloatIndexParams, GeoIndexParams,
+    GeoLineString, GroupId, KeywordIndexParams, LookupLocation, MultiVectorComparator,
+    MultiVectorConfig, OrderBy, OrderValue, Range, RawVector, RecommendStrategy, SearchPointGroups,
+    SearchPoints, ShardKeySelector, SparseIndices, StartFrom, WithLookup,
+};
 use crate::grpc::models::{CollectionsResponse, VersionInfo};
 use crate::grpc::qdrant::condition::ConditionOneOf;
 use crate::grpc::qdrant::payload_index_params::IndexParams;
@@ -19,15 +34,18 @@ use crate::grpc::qdrant::vectors::VectorsOptions;
 use crate::grpc::qdrant::with_payload_selector::SelectorOptions;
 use crate::grpc::qdrant::{
     shard_key, with_vectors_selector, CollectionDescription, CollectionOperationResponse,
-    Condition, Distance, FieldCondition, Filter, GeoBoundingBox, GeoPoint, GeoPolygon, GeoRadius,
-    HasIdCondition, HealthCheckReply, HnswConfigDiff, IsEmptyCondition, IsNullCondition,
-    ListCollectionsResponse, ListValue, Match, NamedVectors, NestedCondition,
-    PayloadExcludeSelector, PayloadIncludeSelector, PayloadIndexParams, PayloadSchemaInfo,
-    PayloadSchemaType, PointId, ProductQuantization, QuantizationConfig, QuantizationSearchParams,
-    QuantizationType, Range, RepeatedIntegers, RepeatedStrings, ScalarQuantization, ScoredPoint,
-    SearchParams, ShardKey, Struct, TextIndexParams, TokenizerType, Value, ValuesCount, Vector,
+    Condition, DenseVector, Distance, FieldCondition, Filter, GeoBoundingBox, GeoPoint, GeoPolygon,
+    GeoRadius, HasIdCondition, HealthCheckReply, HnswConfigDiff, IntegerIndexParams,
+    IsEmptyCondition, IsNullCondition, ListCollectionsResponse, ListValue, Match, MinShould,
+    MultiDenseVector, NamedVectors, NestedCondition, PayloadExcludeSelector,
+    PayloadIncludeSelector, PayloadIndexParams, PayloadSchemaInfo, PayloadSchemaType, PointId,
+    PointsOperationResponse, PointsOperationResponseInternal, ProductQuantization,
+    QuantizationConfig, QuantizationSearchParams, QuantizationType, RepeatedIntegers,
+    RepeatedStrings, ScalarQuantization, ScoredPoint, SearchParams, ShardKey, SparseVector, Struct,
+    TextIndexParams, TokenizerType, UpdateResult, UpdateResultInternal, Value, ValuesCount, Vector,
     Vectors, VectorsSelector, WithPayloadSelector, WithVectorsSelector,
 };
+use crate::rest::schema as rest;
 
 pub fn payload_to_proto(payload: segment::types::Payload) -> HashMap<String, Value> {
     payload
@@ -67,6 +85,10 @@ fn json_to_proto(json_value: serde_json::Value) -> Value {
             }
         }
     }
+}
+
+pub fn json_path_from_proto(a: &str) -> Result<JsonPath, Status> {
+    JsonPath::try_from(a).map_err(|_| Status::invalid_argument("Invalid json path"))
 }
 
 pub fn proto_to_payloads(proto: HashMap<String, Value>) -> Result<segment::types::Payload, Status> {
@@ -147,12 +169,28 @@ pub fn convert_shard_key_from_grpc_opt(
         },
     }
 }
+impl From<ShardKeySelector> for rest::ShardKeySelector {
+    fn from(value: ShardKeySelector) -> Self {
+        let shard_keys: Vec<_> = value
+            .shard_keys
+            .into_iter()
+            .filter_map(convert_shard_key_from_grpc)
+            .collect();
+
+        if shard_keys.len() == 1 {
+            rest::ShardKeySelector::ShardKey(shard_keys.into_iter().next().unwrap())
+        } else {
+            rest::ShardKeySelector::ShardKeys(shard_keys)
+        }
+    }
+}
 
 impl From<VersionInfo> for HealthCheckReply {
     fn from(info: VersionInfo) -> Self {
         HealthCheckReply {
             title: info.title,
             version: info.version,
+            commit: info.commit,
         }
     }
 }
@@ -172,21 +210,54 @@ impl From<(Instant, CollectionsResponse)> for ListCollectionsResponse {
     }
 }
 
-impl From<segment::data_types::text_index::TokenizerType> for TokenizerType {
-    fn from(tokenizer_type: segment::data_types::text_index::TokenizerType) -> Self {
+impl From<segment::data_types::index::TokenizerType> for TokenizerType {
+    fn from(tokenizer_type: segment::data_types::index::TokenizerType) -> Self {
         match tokenizer_type {
-            segment::data_types::text_index::TokenizerType::Prefix => TokenizerType::Prefix,
-            segment::data_types::text_index::TokenizerType::Whitespace => TokenizerType::Whitespace,
-            segment::data_types::text_index::TokenizerType::Multilingual => {
-                TokenizerType::Multilingual
-            }
-            segment::data_types::text_index::TokenizerType::Word => TokenizerType::Word,
+            segment::data_types::index::TokenizerType::Prefix => TokenizerType::Prefix,
+            segment::data_types::index::TokenizerType::Whitespace => TokenizerType::Whitespace,
+            segment::data_types::index::TokenizerType::Multilingual => TokenizerType::Multilingual,
+            segment::data_types::index::TokenizerType::Word => TokenizerType::Word,
         }
     }
 }
 
-impl From<segment::data_types::text_index::TextIndexParams> for PayloadIndexParams {
-    fn from(params: segment::data_types::text_index::TextIndexParams) -> Self {
+impl From<segment::data_types::index::KeywordIndexParams> for PayloadIndexParams {
+    fn from(_params: segment::data_types::index::KeywordIndexParams) -> Self {
+        PayloadIndexParams {
+            index_params: Some(IndexParams::KeywordIndexParams(KeywordIndexParams {})),
+        }
+    }
+}
+
+impl From<segment::data_types::index::IntegerIndexParams> for PayloadIndexParams {
+    fn from(params: segment::data_types::index::IntegerIndexParams) -> Self {
+        PayloadIndexParams {
+            index_params: Some(IndexParams::IntegerIndexParams(IntegerIndexParams {
+                lookup: params.lookup,
+                range: params.range,
+            })),
+        }
+    }
+}
+
+impl From<segment::data_types::index::FloatIndexParams> for PayloadIndexParams {
+    fn from(_params: segment::data_types::index::FloatIndexParams) -> Self {
+        PayloadIndexParams {
+            index_params: Some(IndexParams::FloatIndexParams(FloatIndexParams {})),
+        }
+    }
+}
+
+impl From<segment::data_types::index::GeoIndexParams> for PayloadIndexParams {
+    fn from(_params: segment::data_types::index::GeoIndexParams) -> Self {
+        PayloadIndexParams {
+            index_params: Some(IndexParams::GeoIndexParams(GeoIndexParams {})),
+        }
+    }
+}
+
+impl From<segment::data_types::index::TextIndexParams> for PayloadIndexParams {
+    fn from(params: segment::data_types::index::TextIndexParams) -> Self {
         let tokenizer = TokenizerType::from(params.tokenizer);
         PayloadIndexParams {
             index_params: Some(IndexParams::TextIndexParams(TextIndexParams {
@@ -199,49 +270,131 @@ impl From<segment::data_types::text_index::TextIndexParams> for PayloadIndexPara
     }
 }
 
+impl From<segment::data_types::index::BoolIndexParams> for PayloadIndexParams {
+    fn from(_params: segment::data_types::index::BoolIndexParams) -> Self {
+        PayloadIndexParams {
+            index_params: Some(IndexParams::BoolIndexParams(BoolIndexParams {})),
+        }
+    }
+}
+
+impl From<segment::data_types::index::DatetimeIndexParams> for PayloadIndexParams {
+    fn from(_params: segment::data_types::index::DatetimeIndexParams) -> Self {
+        PayloadIndexParams {
+            index_params: Some(IndexParams::DatetimeIndexParams(DatetimeIndexParams {})),
+        }
+    }
+}
+
 impl From<segment::types::PayloadIndexInfo> for PayloadSchemaInfo {
     fn from(schema: segment::types::PayloadIndexInfo) -> Self {
         PayloadSchemaInfo {
-            data_type: match schema.data_type {
-                segment::types::PayloadSchemaType::Keyword => PayloadSchemaType::Keyword,
-                segment::types::PayloadSchemaType::Integer => PayloadSchemaType::Integer,
-                segment::types::PayloadSchemaType::Float => PayloadSchemaType::Float,
-                segment::types::PayloadSchemaType::Geo => PayloadSchemaType::Geo,
-                segment::types::PayloadSchemaType::Text => PayloadSchemaType::Text,
-                segment::types::PayloadSchemaType::Bool => PayloadSchemaType::Bool,
-            }
-            .into(),
-            params: schema.params.map(|params| match params {
-                segment::types::PayloadSchemaParams::Text(text_index_params) => {
-                    text_index_params.into()
-                }
-            }),
+            data_type: PayloadSchemaType::from(schema.data_type) as i32,
+            params: schema.params.map(|p| p.into()),
             points: Some(schema.points as u64),
         }
     }
 }
 
-impl TryFrom<TokenizerType> for segment::data_types::text_index::TokenizerType {
-    type Error = Status;
-    fn try_from(tokenizer_type: TokenizerType) -> Result<Self, Self::Error> {
-        match tokenizer_type {
-            TokenizerType::Unknown => Err(Status::invalid_argument("unknown tokenizer type")),
-            TokenizerType::Prefix => Ok(segment::data_types::text_index::TokenizerType::Prefix),
-            TokenizerType::Multilingual => {
-                Ok(segment::data_types::text_index::TokenizerType::Multilingual)
-            }
-            TokenizerType::Whitespace => {
-                Ok(segment::data_types::text_index::TokenizerType::Whitespace)
-            }
-            TokenizerType::Word => Ok(segment::data_types::text_index::TokenizerType::Word),
+impl From<segment::types::PayloadSchemaType> for PayloadSchemaType {
+    fn from(schema_type: segment::types::PayloadSchemaType) -> Self {
+        match schema_type {
+            segment::types::PayloadSchemaType::Keyword => PayloadSchemaType::Keyword,
+            segment::types::PayloadSchemaType::Integer => PayloadSchemaType::Integer,
+            segment::types::PayloadSchemaType::Float => PayloadSchemaType::Float,
+            segment::types::PayloadSchemaType::Geo => PayloadSchemaType::Geo,
+            segment::types::PayloadSchemaType::Text => PayloadSchemaType::Text,
+            segment::types::PayloadSchemaType::Bool => PayloadSchemaType::Bool,
+            segment::types::PayloadSchemaType::Datetime => PayloadSchemaType::Datetime,
         }
     }
 }
 
-impl TryFrom<TextIndexParams> for segment::data_types::text_index::TextIndexParams {
+impl From<segment::types::PayloadSchemaType> for FieldType {
+    fn from(schema_type: segment::types::PayloadSchemaType) -> Self {
+        match schema_type {
+            segment::types::PayloadSchemaType::Keyword => FieldType::Keyword,
+            segment::types::PayloadSchemaType::Integer => FieldType::Integer,
+            segment::types::PayloadSchemaType::Float => FieldType::Float,
+            segment::types::PayloadSchemaType::Geo => FieldType::Geo,
+            segment::types::PayloadSchemaType::Text => FieldType::Text,
+            segment::types::PayloadSchemaType::Bool => FieldType::Bool,
+            segment::types::PayloadSchemaType::Datetime => FieldType::Datetime,
+        }
+    }
+}
+
+impl TryFrom<TokenizerType> for segment::data_types::index::TokenizerType {
+    type Error = Status;
+    fn try_from(tokenizer_type: TokenizerType) -> Result<Self, Self::Error> {
+        match tokenizer_type {
+            TokenizerType::Unknown => Err(Status::invalid_argument("unknown tokenizer type")),
+            TokenizerType::Prefix => Ok(segment::data_types::index::TokenizerType::Prefix),
+            TokenizerType::Multilingual => {
+                Ok(segment::data_types::index::TokenizerType::Multilingual)
+            }
+            TokenizerType::Whitespace => Ok(segment::data_types::index::TokenizerType::Whitespace),
+            TokenizerType::Word => Ok(segment::data_types::index::TokenizerType::Word),
+        }
+    }
+}
+
+impl From<segment::types::PayloadSchemaParams> for PayloadIndexParams {
+    fn from(params: segment::types::PayloadSchemaParams) -> Self {
+        match params {
+            segment::types::PayloadSchemaParams::Keyword(p) => p.into(),
+            segment::types::PayloadSchemaParams::Integer(p) => p.into(),
+            segment::types::PayloadSchemaParams::Float(p) => p.into(),
+            segment::types::PayloadSchemaParams::Geo(p) => p.into(),
+            segment::types::PayloadSchemaParams::Text(p) => p.into(),
+            segment::types::PayloadSchemaParams::Bool(p) => p.into(),
+            segment::types::PayloadSchemaParams::Datetime(p) => p.into(),
+        }
+    }
+}
+
+impl TryFrom<KeywordIndexParams> for segment::data_types::index::KeywordIndexParams {
+    type Error = Status;
+    fn try_from(_params: KeywordIndexParams) -> Result<Self, Self::Error> {
+        Ok(segment::data_types::index::KeywordIndexParams {
+            r#type: KeywordIndexType::Keyword,
+        })
+    }
+}
+
+impl TryFrom<IntegerIndexParams> for segment::data_types::index::IntegerIndexParams {
+    type Error = Status;
+    fn try_from(params: IntegerIndexParams) -> Result<Self, Self::Error> {
+        Ok(segment::data_types::index::IntegerIndexParams {
+            r#type: IntegerIndexType::Integer,
+            lookup: params.lookup,
+            range: params.range,
+        })
+    }
+}
+
+impl TryFrom<FloatIndexParams> for segment::data_types::index::FloatIndexParams {
+    type Error = Status;
+    fn try_from(_params: FloatIndexParams) -> Result<Self, Self::Error> {
+        Ok(segment::data_types::index::FloatIndexParams {
+            r#type: FloatIndexType::Float,
+        })
+    }
+}
+
+impl TryFrom<GeoIndexParams> for segment::data_types::index::GeoIndexParams {
+    type Error = Status;
+    fn try_from(_params: GeoIndexParams) -> Result<Self, Self::Error> {
+        Ok(segment::data_types::index::GeoIndexParams {
+            r#type: GeoIndexType::Geo,
+        })
+    }
+}
+
+impl TryFrom<TextIndexParams> for segment::data_types::index::TextIndexParams {
     type Error = Status;
     fn try_from(params: TextIndexParams) -> Result<Self, Self::Error> {
-        Ok(segment::data_types::text_index::TextIndexParams {
+        Ok(segment::data_types::index::TextIndexParams {
             r#type: TextIndexType::Text,
             tokenizer: TokenizerType::from_i32(params.tokenizer)
                 .map(|x| x.try_into())
@@ -253,15 +406,21 @@ impl TryFrom<TextIndexParams> for segment::data_types::text_index::TextIndexPara
     }
 }
 
-impl TryFrom<PayloadIndexParams> for segment::data_types::text_index::TextIndexParams {
+impl TryFrom<BoolIndexParams> for segment::data_types::index::BoolIndexParams {
     type Error = Status;
-    fn try_from(params: PayloadIndexParams) -> Result<Self, Self::Error> {
-        match params.index_params {
-            None => Ok(Default::default()),
-            Some(IndexParams::TextIndexParams(text_index_params)) => {
-                Ok(text_index_params.try_into()?)
-            }
-        }
+    fn try_from(_params: BoolIndexParams) -> Result<Self, Self::Error> {
+        Ok(segment::data_types::index::BoolIndexParams {
+            r#type: BoolIndexType::Bool,
+        })
+    }
+}
+
+impl TryFrom<DatetimeIndexParams> for segment::data_types::index::DatetimeIndexParams {
+    type Error = Status;
+    fn try_from(_params: DatetimeIndexParams) -> Result<Self, Self::Error> {
+        Ok(segment::data_types::index::DatetimeIndexParams {
+            r#type: DatetimeIndexType::Datetime,
+        })
     }
 }
 
@@ -269,11 +428,29 @@ impl TryFrom<IndexParams> for segment::types::PayloadSchemaParams {
     type Error = Status;
 
     fn try_from(value: IndexParams) -> Result<Self, Self::Error> {
-        match value {
-            IndexParams::TextIndexParams(text_index_params) => Ok(
-                segment::types::PayloadSchemaParams::Text(text_index_params.try_into()?),
-            ),
-        }
+        Ok(match value {
+            IndexParams::KeywordIndexParams(p) => {
+                segment::types::PayloadSchemaParams::Keyword(p.try_into()?)
+            }
+            IndexParams::IntegerIndexParams(p) => {
+                segment::types::PayloadSchemaParams::Integer(p.try_into()?)
+            }
+            IndexParams::FloatIndexParams(p) => {
+                segment::types::PayloadSchemaParams::Float(p.try_into()?)
+            }
+            IndexParams::GeoIndexParams(p) => {
+                segment::types::PayloadSchemaParams::Geo(p.try_into()?)
+            }
+            IndexParams::TextIndexParams(p) => {
+                segment::types::PayloadSchemaParams::Text(p.try_into()?)
+            }
+            IndexParams::BoolIndexParams(p) => {
+                segment::types::PayloadSchemaParams::Bool(p.try_into()?)
+            }
+            IndexParams::DatetimeIndexParams(p) => {
+                segment::types::PayloadSchemaParams::Datetime(p.try_into()?)
+            }
+        })
     }
 }
 
@@ -285,7 +462,7 @@ impl TryFrom<PayloadSchemaInfo> for segment::types::PayloadIndexInfo {
             None => {
                 return Err(Status::invalid_argument(
                     "Malformed payload schema".to_string(),
-                ))
+                ));
             }
             Some(data_type) => match data_type {
                 PayloadSchemaType::Keyword => segment::types::PayloadSchemaType::Keyword,
@@ -294,10 +471,11 @@ impl TryFrom<PayloadSchemaInfo> for segment::types::PayloadIndexInfo {
                 PayloadSchemaType::Geo => segment::types::PayloadSchemaType::Geo,
                 PayloadSchemaType::Text => segment::types::PayloadSchemaType::Text,
                 PayloadSchemaType::Bool => segment::types::PayloadSchemaType::Bool,
+                PayloadSchemaType::Datetime => segment::types::PayloadSchemaType::Datetime,
                 PayloadSchemaType::UnknownType => {
                     return Err(Status::invalid_argument(
                         "Malformed payload schema".to_string(),
-                    ))
+                    ));
                 }
             },
         };
@@ -343,12 +521,20 @@ impl TryFrom<WithPayloadSelector> for segment::types::WithPayloadInterface {
         match value.selector_options {
             Some(options) => Ok(match options {
                 SelectorOptions::Enable(flag) => segment::types::WithPayloadInterface::Bool(flag),
-                SelectorOptions::Exclude(s) => {
-                    segment::types::PayloadSelectorExclude::new(s.fields).into()
-                }
-                SelectorOptions::Include(s) => {
-                    segment::types::PayloadSelectorInclude::new(s.fields).into()
-                }
+                SelectorOptions::Exclude(s) => segment::types::PayloadSelectorExclude::new(
+                    s.fields
+                        .iter()
+                        .map(|i| json_path_from_proto(i))
+                        .collect::<Result<_, _>>()?,
+                )
+                .into(),
+                SelectorOptions::Include(s) => segment::types::PayloadSelectorInclude::new(
+                    s.fields
+                        .iter()
+                        .map(|i| json_path_from_proto(i))
+                        .collect::<Result<_, _>>()?,
+                )
+                .into(),
             }),
             _ => Err(Status::invalid_argument("No PayloadSelector".to_string())),
         }
@@ -360,14 +546,20 @@ impl From<segment::types::WithPayloadInterface> for WithPayloadSelector {
         let selector_options = match value {
             segment::types::WithPayloadInterface::Bool(flag) => SelectorOptions::Enable(flag),
             segment::types::WithPayloadInterface::Fields(fields) => {
-                SelectorOptions::Include(PayloadIncludeSelector { fields })
+                SelectorOptions::Include(PayloadIncludeSelector {
+                    fields: fields.iter().map(|f| f.to_string()).collect(),
+                })
             }
             segment::types::WithPayloadInterface::Selector(selector) => match selector {
                 segment::types::PayloadSelector::Include(s) => {
-                    SelectorOptions::Include(PayloadIncludeSelector { fields: s.include })
+                    SelectorOptions::Include(PayloadIncludeSelector {
+                        fields: s.include.iter().map(|f| f.to_string()).collect(),
+                    })
                 }
                 segment::types::PayloadSelector::Exclude(s) => {
-                    SelectorOptions::Exclude(PayloadExcludeSelector { fields: s.exclude })
+                    SelectorOptions::Exclude(PayloadExcludeSelector {
+                        fields: s.exclude.iter().map(|f| f.to_string()).collect(),
+                    })
                 }
             },
         };
@@ -430,39 +622,68 @@ impl From<segment::types::PointIdType> for PointId {
     }
 }
 
-impl From<segment::data_types::vectors::Vector> for Vector {
-    fn from(vector: segment::data_types::vectors::Vector) -> Self {
+impl From<segment_vectors::Vector> for Vector {
+    fn from(vector: segment_vectors::Vector) -> Self {
         match vector {
-            segment::data_types::vectors::Vector::Dense(vector) => Self {
+            segment_vectors::Vector::Dense(vector) => Self {
                 data: vector,
                 indices: None,
+                vectors_count: None,
             },
-            segment::data_types::vectors::Vector::Sparse(vector) => Self {
+            segment_vectors::Vector::Sparse(vector) => Self {
                 data: vector.values,
                 indices: Some(SparseIndices {
                     data: vector.indices,
                 }),
+                vectors_count: None,
             },
+            segment_vectors::Vector::MultiDense(vector) => {
+                let vector_count = vector.multi_vectors().count() as u32;
+                Self {
+                    data: vector.flattened_vectors,
+                    indices: None,
+                    vectors_count: Some(vector_count),
+                }
+            }
         }
     }
 }
 
-impl From<Vector> for segment::data_types::vectors::Vector {
-    fn from(vector: Vector) -> Self {
-        match vector.indices {
-            None => segment::data_types::vectors::Vector::Dense(vector.data),
-            Some(indices) => segment::data_types::vectors::Vector::Sparse(
-                sparse::common::sparse_vector::SparseVector {
-                    values: vector.data,
-                    indices: indices.data,
-                },
-            ),
+impl TryFrom<Vector> for segment_vectors::Vector {
+    type Error = Status;
+
+    fn try_from(vector: Vector) -> Result<Self, Self::Error> {
+        // sparse vector
+        if let Some(indices) = vector.indices {
+            return Ok(segment_vectors::Vector::Sparse(
+                sparse::common::sparse_vector::SparseVector::new(indices.data, vector.data)
+                    .map_err(|_| {
+                        Status::invalid_argument(
+                            "Sparse indices does not match sparse vector conditions",
+                        )
+                    })?,
+            ));
         }
+
+        // multi vector
+        if let Some(vector_count) = vector.vectors_count {
+            if vector_count == 0 {
+                return Err(Status::invalid_argument(
+                    "Vector count should be greater than 0",
+                ));
+            }
+            let dim = vector.data.len() / vector_count as usize;
+            let multi = segment_vectors::MultiDenseVectorInternal::new(vector.data, dim);
+            return Ok(segment_vectors::Vector::MultiDense(multi));
+        }
+
+        // dense vector
+        Ok(segment_vectors::Vector::Dense(vector.data))
     }
 }
 
-impl From<HashMap<String, segment::data_types::vectors::Vector>> for NamedVectors {
-    fn from(vectors: HashMap<String, segment::data_types::vectors::Vector>) -> Self {
+impl From<HashMap<String, segment_vectors::Vector>> for NamedVectors {
+    fn from(vectors: HashMap<String, segment_vectors::Vector>) -> Self {
         Self {
             vectors: vectors
                 .into_iter()
@@ -472,25 +693,69 @@ impl From<HashMap<String, segment::data_types::vectors::Vector>> for NamedVector
     }
 }
 
-impl From<segment::data_types::vectors::VectorStruct> for Vectors {
-    fn from(vector_struct: segment::data_types::vectors::VectorStruct) -> Self {
+impl From<segment_vectors::VectorStructInternal> for Vectors {
+    fn from(vector_struct: segment_vectors::VectorStructInternal) -> Self {
         match vector_struct {
-            segment::data_types::vectors::VectorStruct::Single(vector) => {
-                let vector: segment::data_types::vectors::Vector = vector.into();
+            segment_vectors::VectorStructInternal::Single(vector) => {
+                let vector = segment_vectors::Vector::from(vector);
                 Self {
-                    vectors_options: Some(VectorsOptions::Vector(vector.into())),
+                    vectors_options: Some(VectorsOptions::Vector(Vector::from(vector))),
                 }
             }
-            segment::data_types::vectors::VectorStruct::Multi(vectors) => Self {
+            segment_vectors::VectorStructInternal::MultiDense(vector) => {
+                let vector = segment_vectors::Vector::from(vector);
+                Self {
+                    vectors_options: Some(VectorsOptions::Vector(Vector::from(vector))),
+                }
+            }
+            segment_vectors::VectorStructInternal::Named(vectors) => Self {
                 vectors_options: Some(VectorsOptions::Vectors(NamedVectors {
                     vectors: HashMap::from_iter(
                         vectors
-                            .iter()
-                            .map(|(name, vector)| (name.clone(), vector.clone().into())),
+                            .into_iter()
+                            .map(|(name, vector)| (name, Vector::from(vector))),
                     ),
                 })),
             },
         }
+    }
+}
+
+impl From<segment::data_types::order_by::OrderValue> for OrderValue {
+    fn from(value: segment::data_types::order_by::OrderValue) -> Self {
+        use segment::data_types::order_by as segment;
+
+        use crate::grpc::qdrant::order_value::Variant;
+
+        let variant = match value {
+            segment::OrderValue::Float(value) => Variant::Float(value),
+            segment::OrderValue::Int(value) => Variant::Int(value),
+        };
+
+        Self {
+            variant: Some(variant),
+        }
+    }
+}
+
+impl TryFrom<OrderValue> for segment::data_types::order_by::OrderValue {
+    type Error = Status;
+
+    fn try_from(value: OrderValue) -> Result<Self, Self::Error> {
+        use segment::data_types::order_by as segment;
+
+        use crate::grpc::qdrant::order_value::Variant;
+
+        let variant = value.variant.ok_or_else(|| {
+            Status::invalid_argument("OrderedValue should have a variant".to_string())
+        })?;
+
+        let value = match variant {
+            Variant::Float(value) => segment::OrderValue::Float(value),
+            Variant::Int(value) => segment::OrderValue::Int(value),
+        };
+
+        Ok(value)
     }
 }
 
@@ -503,6 +768,7 @@ impl From<segment::types::ScoredPoint> for ScoredPoint {
             version: point.version,
             vectors: point.vector.map(|v| v.into()),
             shard_key: point.shard_key.map(convert_shard_key_to_grpc),
+            order_value: point.order_value.map(From::from),
         }
     }
 }
@@ -523,27 +789,58 @@ impl From<segment::data_types::groups::GroupId> for GroupId {
     }
 }
 
-impl From<NamedVectors> for HashMap<String, segment::data_types::vectors::Vector> {
-    fn from(vectors: NamedVectors) -> Self {
+impl TryFrom<NamedVectors> for HashMap<String, segment_vectors::Vector> {
+    type Error = Status;
+
+    fn try_from(vectors: NamedVectors) -> Result<Self, Self::Error> {
         vectors
             .vectors
             .into_iter()
-            .map(|(name, vector)| (name, segment::data_types::vectors::Vector::from(vector)))
-            .collect()
+            .map(
+                |(name, vector)| match segment_vectors::Vector::try_from(vector) {
+                    Ok(vector) => Ok((name, vector)),
+                    Err(err) => Err(err),
+                },
+            )
+            .collect::<Result<_, _>>()
     }
 }
 
-impl TryFrom<Vectors> for segment::data_types::vectors::VectorStruct {
+impl TryFrom<Vectors> for segment_vectors::VectorStructInternal {
     type Error = Status;
 
     fn try_from(vectors: Vectors) -> Result<Self, Self::Error> {
         match vectors.vectors_options {
             Some(vectors_options) => Ok(match vectors_options {
                 VectorsOptions::Vector(vector) => {
-                    segment::data_types::vectors::VectorStruct::Single(vector.data)
+                    let Vector {
+                        data,
+                        indices,
+                        vectors_count,
+                    } = vector;
+
+                    if indices.is_some() {
+                        return Err(Status::invalid_argument(
+                            "Sparse vector must be named".to_string(),
+                        ));
+                    }
+                    if let Some(vectors_count) = vectors_count {
+                        let dim = data.len() / vectors_count as usize;
+
+                        segment_vectors::VectorStructInternal::MultiDense(
+                            segment::data_types::vectors::MultiDenseVectorInternal::try_from_flatten(
+                                data,
+                                dim,
+                            ).map_err(|err| {
+                                Status::invalid_argument(format!("Unable to convert to multi-dense vector: {err}"))
+                            })?,
+                        )
+                    } else {
+                        segment_vectors::VectorStructInternal::Single(data)
+                    }
                 }
                 VectorsOptions::Vectors(vectors) => {
-                    segment::data_types::vectors::VectorStruct::Multi(vectors.into())
+                    segment_vectors::VectorStructInternal::Named(vectors.try_into()?)
                 }
             }),
             None => Err(Status::invalid_argument("No Provided")),
@@ -621,7 +918,7 @@ impl TryFrom<ScalarQuantization> for segment::types::ScalarQuantization {
                 r#type: match QuantizationType::from_i32(value.r#type) {
                     Some(QuantizationType::Int8) => segment::types::ScalarType::Int8,
                     Some(QuantizationType::UnknownQuantization) | None => {
-                        return Err(Status::invalid_argument("Unknown quantization type"))
+                        return Err(Status::invalid_argument("Unknown quantization type"));
                     }
                 },
                 quantile: value.quantile,
@@ -657,7 +954,7 @@ impl TryFrom<ProductQuantization> for segment::types::ProductQuantization {
                     None => {
                         return Err(Status::invalid_argument(
                             "Unknown compression ratio".to_string(),
-                        ))
+                        ));
                     }
                     Some(CompressionRatio::X4) => segment::types::CompressionRatio::X4,
                     Some(CompressionRatio::X8) => segment::types::CompressionRatio::X8,
@@ -735,6 +1032,42 @@ impl TryFrom<QuantizationConfig> for segment::types::QuantizationConfig {
     }
 }
 
+impl From<segment::types::MultiVectorConfig> for MultiVectorConfig {
+    fn from(value: segment::types::MultiVectorConfig) -> Self {
+        Self {
+            comparator: MultiVectorComparator::from(value.comparator) as i32,
+        }
+    }
+}
+
+impl From<segment::types::MultiVectorComparator> for MultiVectorComparator {
+    fn from(value: segment::types::MultiVectorComparator) -> Self {
+        match value {
+            segment::types::MultiVectorComparator::MaxSim => MultiVectorComparator::MaxSim,
+        }
+    }
+}
+
+impl TryFrom<MultiVectorConfig> for segment::types::MultiVectorConfig {
+    type Error = Status;
+
+    fn try_from(value: MultiVectorConfig) -> Result<Self, Self::Error> {
+        let comparator = MultiVectorComparator::from_i32(value.comparator)
+            .ok_or_else(|| Status::invalid_argument("Unknown multi vector comparator"))?;
+        Ok(segment::types::MultiVectorConfig {
+            comparator: segment::types::MultiVectorComparator::from(comparator),
+        })
+    }
+}
+
+impl From<MultiVectorComparator> for segment::types::MultiVectorComparator {
+    fn from(value: MultiVectorComparator) -> Self {
+        match value {
+            MultiVectorComparator::MaxSim => segment::types::MultiVectorComparator::MaxSim,
+        }
+    }
+}
+
 fn conditions_helper_from_grpc(
     conditions: Vec<Condition>,
 ) -> Result<Option<Vec<segment::types::Condition>>, tonic::Status> {
@@ -756,7 +1089,11 @@ fn conditions_helper_to_grpc(conditions: Option<Vec<segment::types::Condition>>)
             if conditions.is_empty() {
                 vec![]
             } else {
-                conditions.into_iter().map(|c| c.into()).collect()
+                conditions
+                    .into_iter()
+                    .filter(|c| !c.is_local_only()) // TODO(resharding)!?
+                    .map(|c| c.into())
+                    .collect()
             }
         }
     }
@@ -768,6 +1105,19 @@ impl TryFrom<Filter> for segment::types::Filter {
     fn try_from(value: Filter) -> Result<Self, Self::Error> {
         Ok(Self {
             should: conditions_helper_from_grpc(value.should)?,
+            min_should: {
+                match value.min_should {
+                    Some(MinShould {
+                        conditions,
+                        min_count,
+                    }) => Some(segment::types::MinShould {
+                        conditions: conditions_helper_from_grpc(conditions)
+                            .map(|conds| conds.unwrap_or_default())?,
+                        min_count: min_count as usize,
+                    }),
+                    None => None,
+                }
+            },
             must: conditions_helper_from_grpc(value.must)?,
             must_not: conditions_helper_from_grpc(value.must_not)?,
         })
@@ -778,6 +1128,20 @@ impl From<segment::types::Filter> for Filter {
     fn from(value: segment::types::Filter) -> Self {
         Self {
             should: conditions_helper_to_grpc(value.should),
+            min_should: {
+                if let Some(segment::types::MinShould {
+                    conditions,
+                    min_count,
+                }) = value.min_should
+                {
+                    Some(MinShould {
+                        conditions: conditions_helper_to_grpc(Some(conditions)),
+                        min_count: min_count as u64,
+                    })
+                } else {
+                    None
+                }
+            },
             must: conditions_helper_to_grpc(value.must),
             must_not: conditions_helper_to_grpc(value.must_not),
         }
@@ -800,10 +1164,10 @@ impl TryFrom<Condition> for segment::types::Condition {
                     Ok(segment::types::Condition::Filter(filter.try_into()?))
                 }
                 ConditionOneOf::IsEmpty(is_empty) => {
-                    Ok(segment::types::Condition::IsEmpty(is_empty.into()))
+                    Ok(segment::types::Condition::IsEmpty(is_empty.try_into()?))
                 }
                 ConditionOneOf::IsNull(is_null) => {
-                    Ok(segment::types::Condition::IsNull(is_null.into()))
+                    Ok(segment::types::Condition::IsNull(is_null.try_into()?))
                 }
                 ConditionOneOf::Nested(nested) => Ok(segment::types::Condition::Nested(
                     segment::types::NestedCondition::new(nested.try_into()?),
@@ -827,6 +1191,10 @@ impl From<segment::types::Condition> for Condition {
             segment::types::Condition::Nested(nested) => {
                 ConditionOneOf::Nested(nested.nested.into())
             }
+
+            segment::types::Condition::Resharding(_) => {
+                unimplemented!()
+            }
         };
 
         Self {
@@ -844,7 +1212,7 @@ impl TryFrom<NestedCondition> for segment::types::Nested {
                 "Nested condition must have a filter",
             )),
             Some(filter) => Ok(Self {
-                key: value.key,
+                key: json_path_from_proto(&value.key)?,
                 filter: filter.try_into()?,
             }),
         }
@@ -854,40 +1222,48 @@ impl TryFrom<NestedCondition> for segment::types::Nested {
 impl From<segment::types::Nested> for NestedCondition {
     fn from(value: segment::types::Nested) -> Self {
         Self {
-            key: value.key,
+            key: value.key.to_string(),
             filter: Some(value.filter.into()),
         }
     }
 }
 
-impl From<IsEmptyCondition> for segment::types::IsEmptyCondition {
-    fn from(value: IsEmptyCondition) -> Self {
-        segment::types::IsEmptyCondition {
-            is_empty: segment::types::PayloadField { key: value.key },
-        }
+impl TryFrom<IsEmptyCondition> for segment::types::IsEmptyCondition {
+    type Error = Status;
+
+    fn try_from(value: IsEmptyCondition) -> Result<Self, Status> {
+        Ok(segment::types::IsEmptyCondition {
+            is_empty: segment::types::PayloadField {
+                key: json_path_from_proto(&value.key)?,
+            },
+        })
     }
 }
 
 impl From<segment::types::IsEmptyCondition> for IsEmptyCondition {
     fn from(value: segment::types::IsEmptyCondition) -> Self {
         Self {
-            key: value.is_empty.key,
+            key: value.is_empty.key.to_string(),
         }
     }
 }
 
-impl From<IsNullCondition> for segment::types::IsNullCondition {
-    fn from(value: IsNullCondition) -> Self {
-        segment::types::IsNullCondition {
-            is_null: segment::types::PayloadField { key: value.key },
-        }
+impl TryFrom<IsNullCondition> for segment::types::IsNullCondition {
+    type Error = Status;
+
+    fn try_from(value: IsNullCondition) -> Result<Self, Status> {
+        Ok(segment::types::IsNullCondition {
+            is_null: segment::types::PayloadField {
+                key: json_path_from_proto(&value.key)?,
+            },
+        })
     }
 }
 
 impl From<segment::types::IsNullCondition> for IsNullCondition {
     fn from(value: segment::types::IsNullCondition) -> Self {
         Self {
-            key: value.is_null.key,
+            key: value.is_null.key.to_string(),
         }
     }
 }
@@ -924,16 +1300,23 @@ impl TryFrom<FieldCondition> for segment::types::FieldCondition {
             geo_radius,
             values_count,
             geo_polygon,
+            datetime_range,
         } = value;
 
         let geo_bounding_box =
             geo_bounding_box.map_or_else(|| Ok(None), |g| g.try_into().map(Some))?;
         let geo_radius = geo_radius.map_or_else(|| Ok(None), |g| g.try_into().map(Some))?;
         let geo_polygon = geo_polygon.map_or_else(|| Ok(None), |g| g.try_into().map(Some))?;
+
+        let range = range.map(Into::into);
+        let datetime_range = datetime_range
+            .map(segment::types::RangeInterface::try_from)
+            .transpose()?;
+
         Ok(Self {
-            key,
+            key: json_path_from_proto(&key)?,
             r#match: r#match.map_or_else(|| Ok(None), |m| m.try_into().map(Some))?,
-            range: range.map(Into::into),
+            range: range.or(datetime_range),
             geo_bounding_box,
             geo_radius,
             geo_polygon,
@@ -954,17 +1337,21 @@ impl From<segment::types::FieldCondition> for FieldCondition {
             values_count,
         } = value;
 
-        let geo_bounding_box = geo_bounding_box.map(Into::into);
-        let geo_radius = geo_radius.map(Into::into);
-        let geo_polygon = geo_polygon.map(Into::into);
+        let (range, datetime_range) = match range {
+            Some(segment::types::RangeInterface::Float(range)) => (Some(range.into()), None),
+            Some(segment::types::RangeInterface::DateTime(range)) => (None, Some(range.into())),
+            None => (None, None),
+        };
+
         Self {
-            key,
+            key: key.to_string(),
             r#match: r#match.map(Into::into),
-            range: range.map(Into::into),
-            geo_bounding_box,
-            geo_radius,
-            geo_polygon,
+            range,
+            geo_bounding_box: geo_bounding_box.map(Into::into),
+            geo_radius: geo_radius.map(Into::into),
+            geo_polygon: geo_polygon.map(Into::into),
             values_count: values_count.map(Into::into),
+            datetime_range,
         }
     }
 }
@@ -1077,7 +1464,7 @@ impl From<segment::types::GeoLineString> for GeoLineString {
     }
 }
 
-impl From<Range> for segment::types::Range {
+impl From<Range> for segment::types::Range<FloatPayloadType> {
     fn from(value: Range) -> Self {
         Self {
             lt: value.lt,
@@ -1088,13 +1475,43 @@ impl From<Range> for segment::types::Range {
     }
 }
 
-impl From<segment::types::Range> for Range {
-    fn from(value: segment::types::Range) -> Self {
+impl From<segment::types::Range<FloatPayloadType>> for Range {
+    fn from(value: segment::types::Range<FloatPayloadType>) -> Self {
         Self {
             lt: value.lt,
             gt: value.gt,
             gte: value.gte,
             lte: value.lte,
+        }
+    }
+}
+
+impl From<Range> for segment::types::RangeInterface {
+    fn from(value: Range) -> Self {
+        Self::Float(value.into())
+    }
+}
+
+impl TryFrom<DatetimeRange> for segment::types::RangeInterface {
+    type Error = Status;
+
+    fn try_from(value: DatetimeRange) -> Result<Self, Self::Error> {
+        Ok(Self::DateTime(segment::types::Range {
+            lt: value.lt.map(try_date_time_from_proto).transpose()?,
+            gt: value.gt.map(try_date_time_from_proto).transpose()?,
+            gte: value.gte.map(try_date_time_from_proto).transpose()?,
+            lte: value.lte.map(try_date_time_from_proto).transpose()?,
+        }))
+    }
+}
+
+impl From<segment::types::Range<DateTimePayloadType>> for DatetimeRange {
+    fn from(value: segment::types::Range<DateTimePayloadType>) -> Self {
+        Self {
+            lt: value.lt.map(date_time_to_proto),
+            gt: value.gt.map(date_time_to_proto),
+            gte: value.gte.map(date_time_to_proto),
+            lte: value.lte.map(date_time_to_proto),
         }
     }
 }
@@ -1158,23 +1575,112 @@ impl From<segment::types::Match> for Match {
             }
             segment::types::Match::Any(any) => match any.any {
                 segment::types::AnyVariants::Keywords(strings) => {
+                    let strings = strings.into_iter().collect();
                     MatchValue::Keywords(RepeatedStrings { strings })
                 }
                 segment::types::AnyVariants::Integers(integers) => {
+                    let integers = integers.into_iter().collect();
                     MatchValue::Integers(RepeatedIntegers { integers })
                 }
             },
             segment::types::Match::Except(except) => match except.except {
                 segment::types::AnyVariants::Keywords(strings) => {
+                    let strings = strings.into_iter().collect();
                     MatchValue::ExceptKeywords(RepeatedStrings { strings })
                 }
                 segment::types::AnyVariants::Integers(integers) => {
+                    let integers = integers.into_iter().collect();
                     MatchValue::ExceptIntegers(RepeatedIntegers { integers })
                 }
             },
         };
         Self {
             match_value: Some(match_value),
+        }
+    }
+}
+
+impl From<Direction> for segment::data_types::order_by::Direction {
+    fn from(value: Direction) -> Self {
+        match value {
+            Direction::Asc => segment::data_types::order_by::Direction::Asc,
+            Direction::Desc => segment::data_types::order_by::Direction::Desc,
+        }
+    }
+}
+
+impl From<segment::data_types::order_by::Direction> for Direction {
+    fn from(value: segment::data_types::order_by::Direction) -> Self {
+        match value {
+            segment::data_types::order_by::Direction::Asc => Direction::Asc,
+            segment::data_types::order_by::Direction::Desc => Direction::Desc,
+        }
+    }
+}
+impl TryFrom<OrderBy> for segment::data_types::order_by::OrderBy {
+    type Error = Status;
+
+    fn try_from(value: OrderBy) -> Result<Self, Self::Error> {
+        use segment::data_types::order_by::StartFrom;
+
+        use crate::grpc::qdrant::start_from::Value;
+
+        let direction = value
+            .direction
+            .and_then(Direction::from_i32)
+            .map(segment::data_types::order_by::Direction::from);
+
+        let start_from = value
+            .start_from
+            .and_then(|value| value.value)
+            .map(|v| -> Result<StartFrom, Status> {
+                match v {
+                    Value::Integer(int) => Ok(StartFrom::Integer(int)),
+                    Value::Float(float) => Ok(StartFrom::Float(float)),
+                    Value::Timestamp(timestamp) => {
+                        Ok(StartFrom::Datetime(try_date_time_from_proto(timestamp)?))
+                    }
+                    Value::Datetime(datetime_str) => Ok(StartFrom::Datetime(
+                        segment::types::DateTimeWrapper::from_str(&datetime_str).map_err(|e| {
+                            Status::invalid_argument(format!("Malformed datetime: {e}"))
+                        })?,
+                    )),
+                }
+            })
+            .transpose()?;
+
+        Ok(Self {
+            key: json_path_from_proto(&value.key)?,
+            direction,
+            start_from,
+        })
+    }
+}
+
+impl From<segment::data_types::order_by::OrderBy> for OrderBy {
+    fn from(value: segment::data_types::order_by::OrderBy) -> Self {
+        Self {
+            key: value.key.to_string(),
+            direction: value.direction.map(|d| Direction::from(d) as i32),
+            start_from: value.start_from.map(|start_from| start_from.into()),
+        }
+    }
+}
+
+impl From<segment::data_types::order_by::StartFrom> for StartFrom {
+    fn from(value: segment::data_types::order_by::StartFrom) -> Self {
+        Self {
+            value: Some(match value {
+                segment::data_types::order_by::StartFrom::Integer(int) => {
+                    start_from::Value::Integer(int)
+                }
+                segment::data_types::order_by::StartFrom::Float(float) => {
+                    start_from::Value::Float(float)
+                }
+                segment::data_types::order_by::StartFrom::Datetime(datetime) => {
+                    start_from::Value::Timestamp(date_time_to_proto(datetime))
+                }
+            }),
         }
     }
 }
@@ -1192,11 +1698,23 @@ impl From<HnswConfigDiff> for segment::types::HnswConfig {
     }
 }
 
-pub fn date_time_to_proto(date_time: NaiveDateTime) -> prost_types::Timestamp {
-    prost_types::Timestamp {
-        seconds: date_time.timestamp(), // number of non-leap seconds since the midnight on January 1, 1970.
+pub fn naive_date_time_to_proto(date_time: NaiveDateTime) -> prost_wkt_types::Timestamp {
+    prost_wkt_types::Timestamp {
+        seconds: date_time.and_utc().timestamp(), // number of non-leap seconds since the midnight on January 1, 1970.
         nanos: date_time.nanosecond() as i32,
     }
+}
+
+pub fn date_time_to_proto(date_time: DateTimePayloadType) -> prost_wkt_types::Timestamp {
+    naive_date_time_to_proto(date_time.0.naive_utc())
+}
+
+pub fn try_date_time_from_proto(
+    date_time: prost_wkt_types::Timestamp,
+) -> Result<DateTimePayloadType, Status> {
+    chrono::DateTime::from_timestamp(date_time.seconds, date_time.nanos.try_into().unwrap_or(0))
+        .map(|date_time| date_time.into())
+        .ok_or_else(|| Status::invalid_argument(format!("Unable to parse timestamp: {date_time}")))
 }
 
 impl TryFrom<Distance> for segment::types::Distance {
@@ -1207,7 +1725,7 @@ impl TryFrom<Distance> for segment::types::Distance {
             Distance::UnknownDistance => {
                 return Err(Status::invalid_argument(
                     "Malformed distance parameter: UnknownDistance",
-                ))
+                ));
             }
             Distance::Cosine => segment::types::Distance::Cosine,
             Distance::Euclid => segment::types::Distance::Euclid,
@@ -1228,19 +1746,18 @@ pub fn from_grpc_dist(dist: i32) -> Result<segment::types::Distance, Status> {
 
 pub fn into_named_vector_struct(
     vector_name: Option<String>,
-    vector: Vec<VectorElementType>,
+    vector: segment_vectors::DenseVector,
     indices: Option<SparseIndices>,
-) -> Result<segment::data_types::vectors::NamedVectorStruct, Status> {
-    use segment::data_types::vectors::{NamedSparseVector, NamedVector, NamedVectorStruct};
+) -> Result<segment_vectors::NamedVectorStruct, Status> {
+    use segment_vectors::{NamedSparseVector, NamedVector, NamedVectorStruct};
     use sparse::common::sparse_vector::SparseVector;
     Ok(match indices {
         Some(indices) => NamedVectorStruct::Sparse(NamedSparseVector {
             name: vector_name
                 .ok_or_else(|| Status::invalid_argument("Sparse vector must have a name"))?,
-            vector: SparseVector {
-                values: vector,
-                indices: indices.data,
-            },
+            vector: SparseVector::new(indices.data, vector).map_err(|_| {
+                Status::invalid_argument("Sparse indices does not match sparse vector conditions")
+            })?,
         }),
         None => {
             if let Some(vector_name) = vector_name {
@@ -1253,4 +1770,412 @@ pub fn into_named_vector_struct(
             }
         }
     })
+}
+
+impl From<PointsOperationResponseInternal> for PointsOperationResponse {
+    fn from(resp: PointsOperationResponseInternal) -> Self {
+        Self {
+            result: resp.result.map(Into::into),
+            time: resp.time,
+        }
+    }
+}
+
+// TODO: Make it explicit `from_operations_response` method instead of `impl From<PointsOperationResponse>`?
+impl From<PointsOperationResponse> for PointsOperationResponseInternal {
+    fn from(resp: PointsOperationResponse) -> Self {
+        Self {
+            result: resp.result.map(Into::into),
+            time: resp.time,
+        }
+    }
+}
+
+impl From<UpdateResultInternal> for UpdateResult {
+    fn from(res: UpdateResultInternal) -> Self {
+        Self {
+            operation_id: res.operation_id,
+            status: res.status,
+        }
+    }
+}
+
+// TODO: Make it explicit `from_update_result` method instead of `impl From<UpdateResult>`?
+impl From<UpdateResult> for UpdateResultInternal {
+    fn from(res: UpdateResult) -> Self {
+        Self {
+            operation_id: res.operation_id,
+            status: res.status,
+            clock_tag: None,
+        }
+    }
+}
+
+impl From<DenseVector> for segment_vectors::DenseVector {
+    fn from(value: DenseVector) -> Self {
+        value.data
+    }
+}
+
+impl From<segment_vectors::DenseVector> for DenseVector {
+    fn from(value: segment_vectors::DenseVector) -> Self {
+        Self { data: value }
+    }
+}
+
+impl From<sparse::common::sparse_vector::SparseVector> for SparseVector {
+    fn from(value: sparse::common::sparse_vector::SparseVector) -> Self {
+        let sparse::common::sparse_vector::SparseVector { indices, values } = value;
+
+        Self { indices, values }
+    }
+}
+
+impl From<SparseVector> for sparse::common::sparse_vector::SparseVector {
+    fn from(value: SparseVector) -> Self {
+        let SparseVector { indices, values } = value;
+
+        Self { indices, values }
+    }
+}
+
+impl From<segment_vectors::MultiDenseVectorInternal> for MultiDenseVector {
+    fn from(value: segment_vectors::MultiDenseVectorInternal) -> Self {
+        let vectors = value
+            .flattened_vectors
+            .into_iter()
+            .chunks(value.dim)
+            .into_iter()
+            .map(Iterator::collect::<Vec<_>>)
+            .map(DenseVector::from)
+            .collect();
+        Self { vectors }
+    }
+}
+
+impl From<MultiDenseVector> for segment_vectors::MultiDenseVectorInternal {
+    /// Uses the equivalent of [new_unchecked()](segment_vectors::MultiDenseVectorInternal::new_unchecked), but rewritten to avoid collecting twice
+    fn from(value: MultiDenseVector) -> Self {
+        let dim = value.vectors[0].data.len();
+        let inner_vector = value
+            .vectors
+            .into_iter()
+            .flat_map(segment_vectors::DenseVector::from)
+            .collect();
+        Self {
+            flattened_vectors: inner_vector,
+            dim,
+        }
+    }
+}
+
+impl From<segment_vectors::Vector> for RawVector {
+    fn from(value: segment_vectors::Vector) -> Self {
+        use segment_vectors::Vector;
+
+        use crate::grpc::qdrant::raw_vector::Variant;
+
+        let variant = match value {
+            Vector::Dense(vector) => Variant::Dense(DenseVector::from(vector)),
+            Vector::Sparse(vector) => Variant::Sparse(SparseVector::from(vector)),
+            Vector::MultiDense(vector) => Variant::MultiDense(MultiDenseVector::from(vector)),
+        };
+
+        Self {
+            variant: Some(variant),
+        }
+    }
+}
+
+impl TryFrom<RawVector> for segment_vectors::Vector {
+    type Error = Status;
+
+    fn try_from(value: RawVector) -> Result<Self, Self::Error> {
+        use crate::grpc::qdrant::raw_vector::Variant;
+
+        let variant = value
+            .variant
+            .ok_or_else(|| Status::invalid_argument("No vector variant provided"))?;
+
+        let vector = match variant {
+            Variant::Dense(dense) => {
+                segment_vectors::Vector::Dense(segment_vectors::DenseVector::from(dense))
+            }
+            Variant::Sparse(sparse) => segment_vectors::Vector::Sparse(
+                sparse::common::sparse_vector::SparseVector::from(sparse),
+            ),
+            Variant::MultiDense(multi_dense) => segment_vectors::Vector::MultiDense(
+                segment_vectors::MultiDenseVectorInternal::from(multi_dense),
+            ),
+        };
+
+        Ok(vector)
+    }
+}
+
+impl From<segment_vectors::NamedVectorStruct> for RawVector {
+    fn from(value: segment_vectors::NamedVectorStruct) -> Self {
+        Self::from(value.to_vector())
+    }
+}
+
+impl From<RecommendStrategy> for crate::rest::RecommendStrategy {
+    fn from(value: RecommendStrategy) -> Self {
+        match value {
+            RecommendStrategy::AverageVector => crate::rest::RecommendStrategy::AverageVector,
+            RecommendStrategy::BestScore => crate::rest::RecommendStrategy::BestScore,
+        }
+    }
+}
+
+impl TryFrom<i32> for crate::rest::RecommendStrategy {
+    type Error = Status;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        let strategy = RecommendStrategy::from_i32(value).ok_or_else(|| {
+            Status::invalid_argument(format!("Unknown recommend strategy: {}", value))
+        })?;
+        Ok(strategy.into())
+    }
+}
+
+impl From<segment_query::RecoQuery<segment_vectors::Vector>> for raw_query::Recommend {
+    fn from(value: segment_query::RecoQuery<segment_vectors::Vector>) -> Self {
+        Self {
+            positives: value.positives.into_iter().map(RawVector::from).collect(),
+            negatives: value.negatives.into_iter().map(RawVector::from).collect(),
+        }
+    }
+}
+
+impl TryFrom<raw_query::Recommend> for segment_query::RecoQuery<segment_vectors::Vector> {
+    type Error = Status;
+    fn try_from(value: raw_query::Recommend) -> Result<Self, Self::Error> {
+        Ok(Self {
+            positives: value
+                .positives
+                .into_iter()
+                .map(segment_vectors::Vector::try_from)
+                .try_collect()?,
+            negatives: value
+                .negatives
+                .into_iter()
+                .map(segment_vectors::Vector::try_from)
+                .try_collect()?,
+        })
+    }
+}
+
+impl From<segment_query::ContextPair<segment_vectors::Vector>> for raw_query::RawContextPair {
+    fn from(value: segment_query::ContextPair<segment_vectors::Vector>) -> Self {
+        Self {
+            positive: Some(RawVector::from(value.positive)),
+            negative: Some(RawVector::from(value.negative)),
+        }
+    }
+}
+
+impl TryFrom<raw_query::RawContextPair> for segment_query::ContextPair<segment_vectors::Vector> {
+    type Error = Status;
+    fn try_from(value: raw_query::RawContextPair) -> Result<Self, Self::Error> {
+        Ok(Self {
+            positive: value
+                .positive
+                .map(segment_vectors::Vector::try_from)
+                .transpose()?
+                .ok_or_else(|| {
+                    Status::invalid_argument("No positive part of context pair provided")
+                })?,
+            negative: value
+                .negative
+                .map(segment_vectors::Vector::try_from)
+                .transpose()?
+                .ok_or_else(|| {
+                    Status::invalid_argument("No negative part of context pair provided")
+                })?,
+        })
+    }
+}
+
+impl From<segment_query::ContextQuery<segment_vectors::Vector>> for raw_query::Context {
+    fn from(value: segment_query::ContextQuery<segment_vectors::Vector>) -> Self {
+        Self {
+            context: value.pairs.into_iter().map(RawContextPair::from).collect(),
+        }
+    }
+}
+
+impl TryFrom<raw_query::Context> for segment_query::ContextQuery<segment_vectors::Vector> {
+    type Error = Status;
+    fn try_from(value: raw_query::Context) -> Result<Self, Self::Error> {
+        Ok(Self {
+            pairs: value
+                .context
+                .into_iter()
+                .map(segment_query::ContextPair::try_from)
+                .try_collect()?,
+        })
+    }
+}
+
+impl From<segment_query::DiscoveryQuery<segment_vectors::Vector>> for raw_query::Discovery {
+    fn from(value: segment_query::DiscoveryQuery<segment_vectors::Vector>) -> Self {
+        Self {
+            target: Some(RawVector::from(value.target)),
+            context: value.pairs.into_iter().map(RawContextPair::from).collect(),
+        }
+    }
+}
+
+impl TryFrom<raw_query::Discovery> for segment_query::DiscoveryQuery<segment_vectors::Vector> {
+    type Error = Status;
+    fn try_from(value: raw_query::Discovery) -> Result<Self, Self::Error> {
+        Ok(Self {
+            target: value
+                .target
+                .map(segment_vectors::Vector::try_from)
+                .transpose()?
+                .ok_or_else(|| Status::invalid_argument("No target provided"))?,
+            pairs: value
+                .context
+                .into_iter()
+                .map(segment_query::ContextPair::try_from)
+                .try_collect()?,
+        })
+    }
+}
+
+impl TryFrom<SearchPoints> for rest::SearchRequestInternal {
+    type Error = Status;
+
+    fn try_from(value: SearchPoints) -> Result<Self, Self::Error> {
+        let named_struct = crate::grpc::conversions::into_named_vector_struct(
+            value.vector_name,
+            value.vector,
+            value.sparse_indices,
+        )?;
+        let vector = match named_struct {
+            segment_vectors::NamedVectorStruct::Default(v) => rest::NamedVectorStruct::Default(v),
+            segment_vectors::NamedVectorStruct::Dense(v) => rest::NamedVectorStruct::Dense(v),
+            segment_vectors::NamedVectorStruct::Sparse(v) => rest::NamedVectorStruct::Sparse(v),
+            segment_vectors::NamedVectorStruct::MultiDense(_) => {
+                return Err(Status::invalid_argument(
+                    "MultiDense vector is not supported in search request",
+                ))
+            }
+        };
+        Ok(Self {
+            vector,
+            filter: value.filter.map(|f| f.try_into()).transpose()?,
+            params: value.params.map(|p| p.into()),
+            limit: value.limit as usize,
+            offset: value.offset.map(|x| x as usize),
+            with_payload: value.with_payload.map(|wp| wp.try_into()).transpose()?,
+            with_vector: Some(
+                value
+                    .with_vectors
+                    .map(|with_vectors| with_vectors.into())
+                    .unwrap_or_default(),
+            ),
+            score_threshold: value.score_threshold,
+        })
+    }
+}
+
+impl TryFrom<SearchPointGroups> for rest::SearchGroupsRequestInternal {
+    type Error = Status;
+
+    fn try_from(value: SearchPointGroups) -> Result<Self, Self::Error> {
+        let search_points = SearchPoints {
+            vector: value.vector,
+            filter: value.filter,
+            params: value.params,
+            with_payload: value.with_payload,
+            with_vectors: value.with_vectors,
+            score_threshold: value.score_threshold,
+            vector_name: value.vector_name,
+            limit: 0,
+            offset: None,
+            collection_name: String::new(),
+            read_consistency: None,
+            timeout: None,
+            shard_key_selector: None,
+            sparse_indices: value.sparse_indices,
+        };
+
+        if let Some(sparse_indices) = &search_points.sparse_indices {
+            validate_sparse_vector_impl(&sparse_indices.data, &search_points.vector).map_err(
+                |_| {
+                    Status::invalid_argument(
+                        "Sparse indices does not match sparse vector conditions",
+                    )
+                },
+            )?;
+        }
+
+        let rest::SearchRequestInternal {
+            vector,
+            filter,
+            params,
+            limit: _,
+            offset: _,
+            with_payload,
+            with_vector,
+            score_threshold,
+        } = search_points.try_into()?;
+
+        Ok(Self {
+            vector,
+            filter,
+            params,
+            with_payload,
+            with_vector,
+            score_threshold,
+            group_request: rest::BaseGroupRequest {
+                group_by: json_path_from_proto(&value.group_by)?,
+                limit: value.limit,
+                group_size: value.group_size,
+                with_lookup: value
+                    .with_lookup
+                    .map(rest::WithLookupInterface::try_from)
+                    .transpose()?,
+            },
+        })
+    }
+}
+
+impl TryFrom<WithLookup> for rest::WithLookupInterface {
+    type Error = Status;
+
+    fn try_from(value: WithLookup) -> Result<Self, Self::Error> {
+        Ok(Self::WithLookup(value.try_into()?))
+    }
+}
+
+impl TryFrom<WithLookup> for rest::WithLookup {
+    type Error = Status;
+
+    fn try_from(value: WithLookup) -> Result<Self, Self::Error> {
+        let with_default_payload = || Some(segment::types::WithPayloadInterface::Bool(true));
+
+        Ok(Self {
+            collection_name: value.collection,
+            with_payload: value
+                .with_payload
+                .map(|wp| wp.try_into())
+                .transpose()?
+                .or_else(with_default_payload),
+            with_vectors: value.with_vectors.map(|wv| wv.into()),
+        })
+    }
+}
+
+impl From<LookupLocation> for rest::LookupLocation {
+    fn from(value: LookupLocation) -> Self {
+        Self {
+            collection: value.collection_name,
+            vector: value.vector_name,
+            shard_key: value.shard_key_selector.map(rest::ShardKeySelector::from),
+        }
+    }
 }

@@ -1,25 +1,26 @@
 use collection::shards::shard::PeerId;
+use common::types::{DetailsLevel, TelemetryDetail};
 use schemars::JsonSchema;
 use segment::common::anonymize::Anonymize;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use storage::dispatcher::Dispatcher;
 use storage::types::{ClusterStatus, ConsensusThreadStatus, StateRole};
 
 use crate::settings::Settings;
 
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Clone, Debug, JsonSchema)]
 pub struct P2pConfigTelemetry {
     connection_pool_size: usize,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Clone, Debug, JsonSchema)]
 pub struct ConsensusConfigTelemetry {
     max_message_queue_size: usize,
     tick_period_ms: u64,
     bootstrap_timeout_sec: u64,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Clone, Debug, JsonSchema)]
 pub struct ClusterConfigTelemetry {
     grpc_timeout_ms: u64,
     p2p: P2pConfigTelemetry,
@@ -42,7 +43,7 @@ impl From<&Settings> for ClusterConfigTelemetry {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Clone, Debug, JsonSchema)]
 pub struct ClusterStatusTelemetry {
     pub number_of_peers: usize,
     pub term: u64,
@@ -54,7 +55,7 @@ pub struct ClusterStatusTelemetry {
     pub consensus_thread_status: ConsensusThreadStatus,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Clone, Debug, JsonSchema)]
 pub struct ClusterTelemetry {
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,35 +65,30 @@ pub struct ClusterTelemetry {
 }
 
 impl ClusterTelemetry {
-    pub fn collect(level: usize, dispatcher: &Dispatcher, settings: &Settings) -> ClusterTelemetry {
-        let status = if level > 0 {
-            match dispatcher.cluster_status() {
-                ClusterStatus::Disabled => None,
-                ClusterStatus::Enabled(cluster_info) => Some(ClusterStatusTelemetry {
-                    number_of_peers: cluster_info.peers.len(),
-                    term: cluster_info.raft_info.term,
-                    commit: cluster_info.raft_info.commit,
-                    pending_operations: cluster_info.raft_info.pending_operations,
-                    role: cluster_info.raft_info.role,
-                    is_voter: cluster_info.raft_info.is_voter,
-                    peer_id: Some(cluster_info.peer_id),
-                    consensus_thread_status: cluster_info.consensus_thread_status,
-                }),
-            }
-        } else {
-            None
-        };
-
-        let config = if level > 1 {
-            Some(ClusterConfigTelemetry::from(settings))
-        } else {
-            None
-        };
-
+    pub fn collect(
+        detail: TelemetryDetail,
+        dispatcher: &Dispatcher,
+        settings: &Settings,
+    ) -> ClusterTelemetry {
         ClusterTelemetry {
             enabled: settings.cluster.enabled,
-            status,
-            config,
+            status: (detail.level >= DetailsLevel::Level1)
+                .then(|| match dispatcher.cluster_status() {
+                    ClusterStatus::Disabled => None,
+                    ClusterStatus::Enabled(cluster_info) => Some(ClusterStatusTelemetry {
+                        number_of_peers: cluster_info.peers.len(),
+                        term: cluster_info.raft_info.term,
+                        commit: cluster_info.raft_info.commit,
+                        pending_operations: cluster_info.raft_info.pending_operations,
+                        role: cluster_info.raft_info.role,
+                        is_voter: cluster_info.raft_info.is_voter,
+                        peer_id: Some(cluster_info.peer_id),
+                        consensus_thread_status: cluster_info.consensus_thread_status,
+                    }),
+                })
+                .flatten(),
+            config: (detail.level >= DetailsLevel::Level2)
+                .then(|| ClusterConfigTelemetry::from(settings)),
         }
     }
 }

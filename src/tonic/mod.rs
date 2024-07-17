@@ -1,5 +1,5 @@
 mod api;
-mod api_key;
+mod auth;
 mod logging;
 mod tonic_telemetry;
 
@@ -32,6 +32,7 @@ use ::api::grpc::QDRANT_DESCRIPTOR_SET;
 use storage::content_manager::consensus_manager::ConsensusStateRef;
 use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
+use storage::rbac::Access;
 use tokio::runtime::Handle;
 use tokio::signal;
 use tonic::codec::CompressionEncoding;
@@ -83,7 +84,6 @@ impl Health for HealthService {
     ) -> Result<Response<ProtocolHealthCheckResponse>, Status> {
         let mut last_check = self.last_check.lock().unwrap();
         *last_check = Instant::now();
-
         let response = ProtocolHealthCheckResponse {
             status: ServingStatus::Serving as i32,
         };
@@ -174,6 +174,7 @@ pub fn init(
     settings: Settings,
     grpc_port: u16,
     runtime: Handle,
+    toc: Arc<TableOfContent>,
 ) -> io::Result<()> {
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shutdown_flag_clone = shutdown_flag.clone();
@@ -182,11 +183,24 @@ pub fn init(
         let socket =
             SocketAddr::from((settings.service.host.parse::<IpAddr>().unwrap(), grpc_port));
 
+        // Initialize HealthService with the shared state
+        let health_service = HealthService {
+            last_check: Arc::new(Mutex::new(Instant::now())),
+        };
+
+        // Start the health check monitoring task
+        let health_check_clone = health_service.last_check.clone();
+        tokio::spawn(async move {
+            monitor_health_check(health_check_clone, shutdown_flag_clone).await;
+        });
+
         let qdrant_service = QdrantService::default();
         let health_service = HealthService::default();
         let collections_service = CollectionsService::new(dispatcher.clone());
         let points_service = PointsService::new(dispatcher.clone());
         let snapshot_service = SnapshotsService::new(dispatcher.clone());
+        let http_client = HttpClient::from_settings(&settings)?;
+        let shard_snapshots_service = ShardSnapshotsService::new(toc.clone(), http_client);
 
         // Only advertise the public services. By default, all services in QDRANT_DESCRIPTOR_SET
         // will be advertised, so explicitly list the services to be included.
@@ -197,6 +211,7 @@ pub fn init(
             .with_service_name("qdrant.Snapshots")
             .with_service_name("qdrant.Qdrant")
             .with_service_name("grpc.health.v1.Health")
+            .with_service_name("qdrant.ShardSnapshots")
             .build()
             .unwrap();
 
@@ -223,20 +238,15 @@ pub fn init(
                 telemetry_collector,
             ))
             .option_layer({
-                AuthKeys::try_create(&settings.service).map(api_key::ApiKeyMiddlewareLayer::new)
+                AuthKeys::try_create(
+                    &settings.service,
+                    dispatcher
+                        .toc(&Access::full("For tonic auth middleware"))
+                        .clone(),
+                )
+                .map(auth::AuthLayer::new)
             })
             .into_inner();
-
-        // Initialize HealthService with the shared state
-        let health_service = HealthService {
-            last_check: Arc::new(Mutex::new(Instant::now())),
-        };
-
-        // Start the health check monitoring task
-        let health_check_clone = health_service.last_check.clone();
-        tokio::spawn(async move {
-            monitor_health_check(health_check_clone, shutdown_flag_clone).await;
-        });
 
         server
             .layer(middleware_layer)
@@ -267,6 +277,12 @@ pub fn init(
             )
             .add_service(
                 HealthServer::new(health_service)
+                    .send_compressed(CompressionEncoding::Gzip)
+                    .accept_compressed(CompressionEncoding::Gzip)
+                    .max_decoding_message_size(usize::MAX),
+            )
+            .add_service(
+                ShardSnapshotsServer::new(shard_snapshots_service)
                     .send_compressed(CompressionEncoding::Gzip)
                     .accept_compressed(CompressionEncoding::Gzip)
                     .max_decoding_message_size(usize::MAX),

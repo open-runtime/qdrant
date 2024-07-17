@@ -1,19 +1,30 @@
 use std::ops::Deref as _;
+use std::sync::Arc;
 
+use parking_lot::Mutex;
 use segment::types::PointIdType;
 
 use super::ShardReplicaSet;
+use crate::hash_ring::HashRing;
 use crate::operations::types::{CollectionError, CollectionResult};
 use crate::shards::forward_proxy_shard::ForwardProxyShard;
+use crate::shards::local_shard::clock_map::RecoveryPoint;
 use crate::shards::queue_proxy_shard::QueueProxyShard;
 use crate::shards::remote_shard::RemoteShard;
 use crate::shards::shard::Shard;
+use crate::shards::transfer::transfer_tasks_pool::TransferTaskProgress;
 
 impl ShardReplicaSet {
+    /// Convert `Local` shard into `ForwardProxy`.
+    ///
     /// # Cancel safety
     ///
     /// This method is cancel safe.
-    pub async fn proxify_local(&self, remote_shard: RemoteShard) -> CollectionResult<()> {
+    pub async fn proxify_local(
+        &self,
+        remote_shard: RemoteShard,
+        resharding_hash_ring: Option<HashRing>,
+    ) -> CollectionResult<()> {
         let mut local = self.local.write().await;
 
         match local.deref() {
@@ -68,16 +79,36 @@ impl ShardReplicaSet {
             _ => unreachable!(),
         };
 
-        let proxy_shard = ForwardProxyShard::new(local_shard, remote_shard);
+        let proxy_shard = ForwardProxyShard::new(
+            self.shard_id,
+            local_shard,
+            remote_shard,
+            resharding_hash_ring,
+        );
         let _ = local.insert(Shard::ForwardProxy(proxy_shard));
 
         Ok(())
     }
 
+    /// Queue proxy our local shard, pointing to the remote shard.
+    ///
+    /// A `from_version` may be provided to start queueing the WAL from a specific version. The
+    /// point may be in the past, but can never be outside the range of what we currently have in
+    /// WAL. If `None` is provided, it'll queue from the latest available WAL version at this time.
+    ///
+    /// For snapshot transfer we queue from the latest version, so we can send all new updates once
+    /// the remote shard has been recovered. For WAL delta transfer we queue from a specific
+    /// version based on our recovery point.
+    ///
     /// # Cancel safety
     ///
     /// This method is cancel safe.
-    pub async fn queue_proxify_local(&self, remote_shard: RemoteShard) -> CollectionResult<()> {
+    pub async fn queue_proxify_local(
+        &self,
+        remote_shard: RemoteShard,
+        from_version: Option<u64>,
+        progress: Arc<Mutex<TransferTaskProgress>>,
+    ) -> CollectionResult<()> {
         let mut local = self.local.write().await;
 
         match local.deref() {
@@ -129,11 +160,11 @@ impl ShardReplicaSet {
             _ => unreachable!(),
         };
 
-        let max_ack_version = local_shard
+        let wal_keep_from = local_shard
             .update_handler
             .lock()
             .await
-            .max_ack_version
+            .wal_keep_from
             .clone();
 
         // Proxify local shard
@@ -145,10 +176,36 @@ impl ShardReplicaSet {
             _ => unreachable!(),
         };
 
-        let proxy_shard = QueueProxyShard::new(local_shard, remote_shard, max_ack_version);
-        let _ = local.insert(Shard::QueueProxy(proxy_shard));
+        // Try to queue proxify with or without version
+        let proxy_shard = match from_version {
+            None => Ok(QueueProxyShard::new(
+                local_shard,
+                remote_shard,
+                wal_keep_from,
+                progress,
+            )),
+            Some(from_version) => QueueProxyShard::new_from_version(
+                local_shard,
+                remote_shard,
+                wal_keep_from,
+                from_version,
+                progress,
+            ),
+        };
 
-        Ok(())
+        // Insert queue proxy shard on success or revert to local shard on failure
+        match proxy_shard {
+            // All good, insert queue proxy shard
+            Ok(proxy_shard) => {
+                let _ = local.insert(Shard::QueueProxy(proxy_shard));
+                Ok(())
+            }
+            Err((local_shard, err)) => {
+                log::warn!("Failed to queue proxify shard, reverting to local shard: {err}");
+                let _ = local.insert(Shard::Local(local_shard));
+                Err(err)
+            }
+        }
     }
 
     /// Un-proxify local shard wrapped as `ForwardProxy` or `QueueProxy`.
@@ -284,6 +341,8 @@ impl ShardReplicaSet {
         &self,
         offset: Option<PointIdType>,
         batch_size: usize,
+        hashring_filter: Option<&HashRing>,
+        merge_points: bool,
     ) -> CollectionResult<Option<PointIdType>> {
         let local = self.local.read().await;
 
@@ -295,7 +354,13 @@ impl ShardReplicaSet {
         };
 
         proxy
-            .transfer_batch(offset, batch_size, &self.search_runtime)
+            .transfer_batch(
+                offset,
+                batch_size,
+                hashring_filter,
+                merge_points,
+                &self.search_runtime,
+            )
             .await
     }
 
@@ -320,6 +385,37 @@ impl ShardReplicaSet {
         );
 
         proxy.transfer_indexes().await
+    }
+
+    /// Send all queue proxy updates to remote
+    ///
+    /// This method allows to transfer queued updates at any point, before the shard is
+    /// unproxified for example. This allows for proper error handling at the time this method is
+    /// called. Because the shard is transformed into a forward proxy after this operation it will
+    /// not error again when the shard is eventually unproxified again.
+    ///
+    /// Does nothing if the local shard is not a queue proxy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if transferring all updates to the remote failed.
+    ///
+    /// # Cancel safety
+    ///
+    /// This function is cancel safe.
+    ///
+    /// If cancelled - transforming the queue proxy into a forward proxy may not actually complete.
+    /// None, some or all queued operations may be transmitted to the remote.
+    pub async fn queue_proxy_flush(&self) -> CollectionResult<()> {
+        let local = self.local.read().await;
+
+        let Some(Shard::QueueProxy(proxy)) = local.deref() else {
+            return Ok(());
+        };
+
+        proxy.transfer_all_missed_updates().await?;
+
+        Ok(())
     }
 
     /// Send all queue proxy updates to remote and transform into forward proxy
@@ -352,15 +448,7 @@ impl ShardReplicaSet {
     /// None, some or all queued operations may be transmitted to the remote.
     pub async fn queue_proxy_into_forward_proxy(&self) -> CollectionResult<()> {
         // First pass: transfer all missed updates with shared read lock
-        {
-            let local = self.local.read().await;
-
-            let Some(Shard::QueueProxy(proxy)) = local.deref() else {
-                return Ok(());
-            };
-
-            proxy.transfer_all_missed_updates().await?;
-        }
+        self.queue_proxy_flush().await?;
 
         // Second pass: transfer new updates
         let mut local = self.local.write().await;
@@ -380,9 +468,23 @@ impl ShardReplicaSet {
         };
 
         let (local_shard, remote_shard) = queue_proxy.forget_updates_and_finalize();
-        let forward_proxy = ForwardProxyShard::new(local_shard, remote_shard);
+        let forward_proxy = ForwardProxyShard::new(self.shard_id, local_shard, remote_shard, None);
         let _ = local.insert(Shard::ForwardProxy(forward_proxy));
 
         Ok(())
+    }
+
+    pub async fn resolve_wal_delta(
+        &self,
+        recovery_point: RecoveryPoint,
+    ) -> CollectionResult<Option<u64>> {
+        let local_shard_read = self.local.read().await;
+        let Some(local_shard) = local_shard_read.deref() else {
+            return Err(CollectionError::service_error(
+                "Cannot resolve WAL delta, shard replica set does not have local shard",
+            ));
+        };
+
+        local_shard.resolve_wal_delta(recovery_point).await
     }
 }

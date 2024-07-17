@@ -1,11 +1,12 @@
 use std::collections::HashSet;
 use std::iter::FromIterator;
+use std::sync::atomic::AtomicBool;
 
 use itertools::Itertools;
 use segment::common::operation_error::OperationError;
 use segment::data_types::named_vectors::NamedVectors;
 use segment::data_types::vectors::{
-    only_default_vector, VectorRef, VectorStruct, DEFAULT_VECTOR_NAME,
+    only_default_vector, VectorRef, VectorStructInternal, DEFAULT_VECTOR_NAME,
 };
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::index_fixtures::random_vector;
@@ -35,7 +36,6 @@ fn test_point_exclusion() {
             None,
             1,
             None,
-            &false.into(),
         )
         .unwrap();
 
@@ -44,11 +44,7 @@ fn test_point_exclusion() {
 
     let ids: HashSet<_> = HashSet::from_iter([3.into()]);
 
-    let frt = Filter {
-        should: None,
-        must: None,
-        must_not: Some(vec![Condition::HasId(ids.into())]),
-    };
+    let frt = Filter::new_must_not(Condition::HasId(ids.into()));
 
     let res = segment
         .search(
@@ -59,7 +55,6 @@ fn test_point_exclusion() {
             Some(&frt),
             1,
             None,
-            &false.into(),
         )
         .unwrap();
 
@@ -94,7 +89,6 @@ fn test_named_vector_search() {
             None,
             1,
             None,
-            &false.into(),
         )
         .unwrap();
 
@@ -105,6 +99,7 @@ fn test_named_vector_search() {
 
     let frt = Filter {
         should: None,
+        min_should: None,
         must: None,
         must_not: Some(vec![Condition::HasId(ids.into())]),
     };
@@ -118,7 +113,6 @@ fn test_named_vector_search() {
             Some(&frt),
             1,
             None,
-            &false.into(),
         )
         .unwrap();
 
@@ -143,7 +137,7 @@ fn test_missed_vector_name() {
         .upsert_point(
             7,
             1.into(),
-            NamedVectors::from([
+            NamedVectors::from_pairs([
                 ("vector2".to_owned(), vec![10.]),
                 ("vector3".to_owned(), vec![5., 6., 7., 8.]),
             ]),
@@ -155,7 +149,7 @@ fn test_missed_vector_name() {
         .upsert_point(
             8,
             6.into(),
-            NamedVectors::from([
+            NamedVectors::from_pairs([
                 ("vector2".to_owned(), vec![10.]),
                 ("vector3".to_owned(), vec![5., 6., 7., 8.]),
             ]),
@@ -172,7 +166,7 @@ fn test_vector_name_not_exists() {
     let result = segment.upsert_point(
         6,
         6.into(),
-        NamedVectors::from([
+        NamedVectors::from_pairs([
             ("vector1".to_owned(), vec![5., 6., 7., 8.]),
             ("vector2".to_owned(), vec![10.]),
             ("vector3".to_owned(), vec![5., 6., 7., 8.]),
@@ -195,11 +189,13 @@ fn ordered_deletion_test() {
         let mut segment = build_segment_1(dir.path());
         segment.delete_point(6, 5.into()).unwrap();
         segment.delete_point(6, 4.into()).unwrap();
-        segment.flush(true).unwrap();
+        segment.flush(true, false).unwrap();
         segment.current_path.clone()
     };
 
-    let segment = load_segment(&path).unwrap().unwrap();
+    let segment = load_segment(&path, &AtomicBool::new(false))
+        .unwrap()
+        .unwrap();
     let query_vector = [1.0, 1.0, 1.0, 1.0].into();
 
     let res = segment
@@ -211,7 +207,6 @@ fn ordered_deletion_test() {
             None,
             1,
             None,
-            &false.into(),
         )
         .unwrap();
     let best_match = res.first().expect("Non-empty result");
@@ -226,14 +221,14 @@ fn skip_deleted_segment() {
         let mut segment = build_segment_1(dir.path());
         segment.delete_point(6, 5.into()).unwrap();
         segment.delete_point(6, 4.into()).unwrap();
-        segment.flush(true).unwrap();
+        segment.flush(true, false).unwrap();
         segment.current_path.clone()
     };
 
     let new_path = path.with_extension("deleted");
     std::fs::rename(&path, new_path).unwrap();
 
-    let segment = load_segment(&path).unwrap();
+    let segment = load_segment(&path, &AtomicBool::new(false)).unwrap();
 
     assert!(segment.is_none());
 }
@@ -276,7 +271,6 @@ fn test_update_named_vector() {
             None,
             1,
             Some(&search_params),
-            &false.into(),
         )
         .unwrap();
     let nearest_upsert = nearest_upsert.first().unwrap();
@@ -285,10 +279,10 @@ fn test_update_named_vector() {
 
     // check if nearest_upsert is normalized
     match &nearest_upsert.vector {
-        Some(VectorStruct::Single(v)) => {
+        Some(VectorStructInternal::Single(v)) => {
             assert!((sqrt_distance(v) - 1.).abs() < 1e-5);
         }
-        Some(VectorStruct::Multi(v)) => {
+        Some(VectorStructInternal::Named(v)) => {
             let v: VectorRef = (&v[DEFAULT_VECTOR_NAME]).into();
             let v: &[_] = v.try_into().unwrap();
             assert!((sqrt_distance(v) - 1.).abs() < 1e-5);
@@ -314,17 +308,16 @@ fn test_update_named_vector() {
             None,
             1,
             Some(&search_params),
-            &false.into(),
         )
         .unwrap();
     let nearest_update = nearest_update.first().unwrap();
 
     // check that nearest_upsert is normalized
     match &nearest_update.vector {
-        Some(VectorStruct::Single(v)) => {
+        Some(VectorStructInternal::Single(v)) => {
             assert!((sqrt_distance(v) - 1.).abs() < 1e-5);
         }
-        Some(VectorStruct::Multi(v)) => {
+        Some(VectorStructInternal::Named(v)) => {
             let v: VectorRef = (&v[DEFAULT_VECTOR_NAME]).into();
             let v: &[_] = v.try_into().unwrap();
             assert!((sqrt_distance(v) - 1.).abs() < 1e-5);

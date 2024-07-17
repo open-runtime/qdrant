@@ -8,10 +8,10 @@
 
 <p align=center>
     <a href="https://github.com/qdrant/qdrant/actions/workflows/rust.yml"><img src="https://img.shields.io/github/actions/workflow/status/qdrant/qdrant/rust.yml?style=flat-square" alt="Tests status"></a>
-    <a href="https://qdrant.github.io/qdrant/redoc/index.html"><img src="https://img.shields.io/badge/Docs-OpenAPI%203.0-success?style=flat-square" alt="OpenAPI Docs"></a>
+    <a href="https://api.qdrant.tech/"><img src="https://img.shields.io/badge/Docs-OpenAPI%203.0-success?style=flat-square" alt="OpenAPI Docs"></a>
     <a href="https://github.com/qdrant/qdrant/blob/master/LICENSE"><img src="https://img.shields.io/github/license/qdrant/qdrant?style=flat-square" alt="Apache 2.0 License"></a>
     <a href="https://qdrant.to/discord"><img src="https://img.shields.io/discord/907569970500743200?logo=Discord&style=flat-square&color=7289da" alt="Discord"></a>
-    <a href="https://qdrant.to/roadmap"><img src="https://img.shields.io/badge/Roadmap-2023-bc1439.svg?style=flat-square" alt="Roadmap 2023"></a>
+    <a href="https://qdrant.to/roadmap"><img src="https://img.shields.io/badge/Roadmap-2024-bc1439.svg?style=flat-square" alt="Roadmap 2024"></a>
     <a href="https://cloud.qdrant.io/"><img src="https://img.shields.io/badge/Qdrant-Cloud-24386C.svg?logo=cloud&style=flat-square" alt="Qdrant Cloud"></a>
 </p>
 
@@ -50,7 +50,7 @@ client = QdrantClient(path="path/to/db")  # Persists changes to disk, fast proto
 
 ### Client-Server
 
-This is the recommended method for production usage. To run the container, use the command:
+To experience the full power of Qdrant locally, run the container with this command:
 
 ```bash
 docker run -p 6333:6333 qdrant/qdrant
@@ -59,22 +59,27 @@ docker run -p 6333:6333 qdrant/qdrant
 Now you can connect to this with any client, including Python:
 
 ```python
-qdrant = QdrantClient("http://localhost:6333") # Connect to existing Qdrant instance, for production
+qdrant = QdrantClient("http://localhost:6333") # Connect to existing Qdrant instance
 ```
+
+Before deploying Qdrant to production, be sure to read our [installation](https://qdrant.tech/documentation/guides/installation/) and [security](https://qdrant.tech/documentation/guides/security/) guides.
 
 ### Clients
 
 Qdrant offers the following client libraries to help you integrate it into your application stack with ease:
 
-- Official: [Go client](https://github.com/qdrant/go-client)
-- Official: [Rust client](https://github.com/qdrant/rust-client)
-- Official: [JavaScript/TypeScript client](https://github.com/qdrant/qdrant-js)
-- Official: [Python client](https://github.com/qdrant/qdrant-client)
-- Official: [.NET/C# client](https://github.com/qdrant/qdrant-dotnet)
-- Community: [Elixir](https://hexdocs.pm/qdrant/readme.html)
-- Community: [PHP](https://github.com/hkulekci/qdrant-php)
-- Community: [Ruby](https://github.com/andreibondarev/qdrant-ruby)
-- Community: [Java](https://github.com/metaloom/qdrant-java-client)
+- Official:
+  - [Go client](https://github.com/qdrant/go-client)
+  - [Rust client](https://github.com/qdrant/rust-client)
+  - [JavaScript/TypeScript client](https://github.com/qdrant/qdrant-js)
+  - [Python client](https://github.com/qdrant/qdrant-client)
+  - [.NET/C# client](https://github.com/qdrant/qdrant-dotnet)
+  - [Java client](https://github.com/qdrant/java-client)
+- Community:
+  - [Elixir](https://hexdocs.pm/qdrant/readme.html)
+  - [PHP](https://github.com/hkulekci/qdrant-php)
+  - [Ruby](https://github.com/andreibondarev/qdrant-ruby)
+  - [Java](https://github.com/metaloom/qdrant-java-client)
 
 ### Where do I go from here?
 
@@ -83,7 +88,7 @@ Qdrant offers the following client libraries to help you integrate it into your 
 - Detailed [Documentation](https://qdrant.tech/documentation/) are great starting points
 - [Step-by-Step Tutorial](https://qdrant.to/qdrant-tutorial) to create your first neural network project with Qdrant
 
-## Demo Projects
+## Demo Projects  <a href="https://replit.com/@qdrant"><img align="right" src="https://replit.com/badge/github/qdrant/qdrant" alt="Run on Repl.it"></a>
 
 ### Discover Semantic Text Search 🔍
 
@@ -156,7 +161,7 @@ Enter the cutting-edge realm of extreme classification, an emerging machine lear
 
 ### REST
 
-Online OpenAPI 3.0 documentation is available [here](https://qdrant.github.io/qdrant/redoc/index.html).
+Online OpenAPI 3.0 documentation is available [here](https://api.qdrant.tech/).
 OpenAPI makes it easy to generate a client for virtually any framework or programming language.
 
 You can also download raw OpenAPI [definitions](https://github.com/qdrant/qdrant/blob/master/docs/redoc/master/openapi.json).
@@ -169,39 +174,49 @@ For faster production-tier searches, Qdrant also provides a gRPC interface. You 
 
 ### Filtering and Payload
 
-Qdrant enables JSON payloads to be associated with vectors, providing both storage and filtering based on payload values. It supports various combinations of `should`, `must`, and `must_not` conditions, ensuring retrieval of all relevant vectors unlike `ElasticSearch` post-filtering.
+Qdrant can attach any JSON payloads to vectors, allowing for both the storage and filtering of data based on the values in these payloads.
+Payload supports a wide range of data types and query conditions, including keyword matching, full-text filtering, numerical ranges, geo-locations, and more.
 
-### Rich Data Types
+Filtering conditions can be combined in various ways, including `should`, `must`, and `must_not` clauses,
+ensuring that you can implement any desired business logic on top of similarity matching.
 
-The vector payload accommodates diverse data types and query conditions, including string matching, numerical ranges, geo-locations, and more. These filtering conditions empower you to create custom business logic on top of similarity matching.
 
-### Query Planning and Payload Indexes
+### Hybrid Search with Sparse Vectors
 
-The _query planner_ leverages stored payload information to optimize query execution. For instance, smaller search spaces limited by filters might benefit from full brute force over an index.
+To address the limitations of vector embeddings when searching for specific keywords, Qdrant introduces support for sparse vectors in addition to the regular dense ones.
 
-### SIMD Hardware Acceleration
+Sparse vectors can be viewed as an generalisation of BM25 or TF-IDF ranking. They enable you to harness the capabilities of transformer-based neural networks to weigh individual tokens effectively.
 
-Utilizing modern CPU x86-x64 architectures, Qdrant delivers faster search performance on modern hardware.
 
-### Write-Ahead Logging
+### Vector Quantization and On-Disk Storage
 
-Qdrant ensures data persistence with update confirmation, even during power outages. The update journal stores all operations, enabling effortless reconstruction of the latest database state.
+Qdrant provides multiple options to make vector search cheaper and more resource-efficient.
+Built-in vector quantization reduces RAM usage by up to 97% and dynamically manages the trade-off between search speed and precision.
+
 
 ### Distributed Deployment
 
-As of [v0.8.0](https://github.com/qdrant/qdrant/releases/tag/v0.8.0), Qdrant supports distributed deployment. Multiple Qdrant machines form a cluster for horizontal scaling, coordinated through the [Raft](https://raft.github.io/) protocol.
+Qdrant offers comprehensive horizontal scaling support through two key mechanisms:
+1. Size expansion via sharding and throughput enhancement via replication
+2. Zero-downtime rolling updates and seamless dynamic scaling of the collections
 
-### Stand-alone
 
-Qdrant operates independently, without reliance on external databases or orchestration controllers, simplifying configuration.
+### Highlighted Features
+
+* **Query Planning and Payload Indexes** - leverages stored payload information to optimize query execution strategy.
+* **SIMD Hardware Acceleration** - utilizes modern CPU x86-x64 and Neon architectures to deliver better performance.
+* **Async I/O** - uses `io_uring` to maximize disk throughput utilization even on a network-attached storage.
+* **Write-Ahead Logging** - ensures data persistence with update confirmation, even during power outages.
+
 
 # Integrations
 
 Examples and/or documentation of Qdrant integrations:
 
-- [Cohere](https://docs.cohere.com/docs/integrations#qdrant) ([blogpost on building a QA app with Cohere and Qdrant](https://qdrant.tech/articles/qa-with-cohere-and-qdrant/)) - Use Cohere embeddings with Qdrant
-- [DocArray](https://docarray.jina.ai/advanced/document-store/qdrant/) - Use Qdrant as a document store in DocArray
-- [LangChain](https://python.langchain.com/en/latest/modules/indexes/vectorstores/examples/qdrant.html) ([blogpost](https://qdrant.tech/articles/langchain-integration/)) - Use Qdrant as a memory backend for LangChain.
+- [Cohere](https://docs.cohere.com/docs/qdrant-and-cohere) ([blogpost on building a QA app with Cohere and Qdrant](https://qdrant.tech/articles/qa-with-cohere-and-qdrant/)) - Use Cohere embeddings with Qdrant
+- [DocArray](https://docs.docarray.org/user_guide/storing/index_qdrant/) - Use Qdrant as a document store in DocArray
+- [Haystack](https://haystack.deepset.ai/integrations/qdrant-document-store) - Use Qdrant as a document store with Haystack ([blogpost](https://haystack.deepset.ai/blog/qdrant-integration)).
+- [LangChain](https://python.langchain.com/docs/integrations/providers/qdrant/) ([blogpost](https://qdrant.tech/articles/langchain-integration/)) - Use Qdrant as a memory backend for LangChain.
 - [LlamaIndex](https://gpt-index.readthedocs.io/en/latest/examples/vector_stores/QdrantIndexDemo.html) - Use Qdrant as a Vector Store with LlamaIndex.
 - [OpenAI - ChatGPT retrieval plugin](https://github.com/openai/chatgpt-retrieval-plugin/blob/main/docs/providers/qdrant/setup.md) - Use Qdrant as a memory backend for ChatGPT
 - [Microsoft Semantic Kernel](https://devblogs.microsoft.com/semantic-kernel/the-power-of-persistent-memory-with-semantic-kernel-and-qdrant-vector-database/) - Use Qdrant as persistent memory with Semantic Kernel

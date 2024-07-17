@@ -11,6 +11,7 @@ use storage::content_manager::consensus_manager::ConsensusStateRef;
 use storage::content_manager::shard_distribution::ShardDistributionProposal;
 use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
+use storage::rbac::{Access, AccessRequirements};
 
 /// Processes the existing collections, which were created outside the consensus:
 /// - during the migration from single to cluster
@@ -22,9 +23,17 @@ pub async fn handle_existing_collections(
     this_peer_id: PeerId,
     collections: Vec<String>,
 ) {
+    let full_access = Access::full("Migration from single to cluster");
+    let multipass = full_access
+        .check_global_access(AccessRequirements::new().manage())
+        .expect("Full access should have manage rights");
+
     consensus_state.is_leader_established.await_ready();
     for collection_name in collections {
-        let collection_obj = match toc_arc.get_collection(&collection_name).await {
+        let collection_obj = match toc_arc
+            .get_collection(&multipass.issue_pass(&collection_name))
+            .await
+        {
             Ok(collection_obj) => collection_obj,
             Err(_) => break,
         };
@@ -107,7 +116,7 @@ pub async fn handle_existing_collections(
 
         for operation in consensus_operations {
             let _res = dispatcher_arc
-                .submit_collection_meta_op(operation, None)
+                .submit_collection_meta_op(operation, full_access.clone(), None)
                 .await;
         }
 
@@ -122,6 +131,7 @@ pub async fn handle_existing_collections(
                             state: ReplicaState::Active,
                             from_state: None,
                         }),
+                        full_access.clone(),
                         None,
                     )
                     .await;

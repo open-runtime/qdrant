@@ -1,9 +1,10 @@
 use std::path::Path;
 
 use chrono::{DateTime, SubsecRound, Utc};
+use common::types::{DetailsLevel, TelemetryDetail};
 use schemars::JsonSchema;
 use segment::common::anonymize::Anonymize;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::settings::Settings;
 
@@ -19,7 +20,7 @@ impl AppBuildTelemetryCollector {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Clone, Debug, JsonSchema)]
 pub struct AppFeaturesTelemetry {
     pub debug: bool,
     pub web_feature: bool,
@@ -27,7 +28,7 @@ pub struct AppFeaturesTelemetry {
     pub recovery_mode: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Clone, Debug, JsonSchema)]
 pub struct RunningEnvironmentTelemetry {
     distribution: Option<String>,
     distribution_version: Option<String>,
@@ -38,43 +39,36 @@ pub struct RunningEnvironmentTelemetry {
     cpu_flags: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Clone, Debug, JsonSchema)]
 pub struct AppBuildTelemetry {
     pub name: String,
     pub version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
     pub features: Option<AppFeaturesTelemetry>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
     pub system: Option<RunningEnvironmentTelemetry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jwt_rbac: Option<bool>,
     pub startup: DateTime<Utc>,
 }
 
 impl AppBuildTelemetry {
     pub fn collect(
-        level: usize,
+        detail: TelemetryDetail,
         collector: &AppBuildTelemetryCollector,
         settings: &Settings,
     ) -> Self {
         AppBuildTelemetry {
             name: env!("CARGO_PKG_NAME").to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            features: if level > 0 {
-                Some(AppFeaturesTelemetry {
-                    debug: cfg!(debug_assertions),
-                    web_feature: cfg!(feature = "web"),
-                    service_debug_feature: cfg!(feature = "service_debug"),
-                    recovery_mode: settings.storage.recovery_mode.is_some(),
-                })
-            } else {
-                None
-            },
-            system: if level > 0 {
-                Some(get_system_data())
-            } else {
-                None
-            },
+            features: (detail.level >= DetailsLevel::Level1).then(|| AppFeaturesTelemetry {
+                debug: cfg!(debug_assertions),
+                web_feature: cfg!(feature = "web"),
+                service_debug_feature: cfg!(feature = "service_debug"),
+                recovery_mode: settings.storage.recovery_mode.is_some(),
+            }),
+            system: (detail.level >= DetailsLevel::Level1).then(get_system_data),
+            jwt_rbac: settings.service.jwt_rbac,
             startup: collector.startup,
         }
     }
@@ -145,6 +139,7 @@ impl Anonymize for AppBuildTelemetry {
             version: self.version.clone(),
             features: self.features.anonymize(),
             system: self.system.anonymize(),
+            jwt_rbac: self.jwt_rbac,
             startup: self.startup.anonymize(),
         }
     }

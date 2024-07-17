@@ -5,14 +5,17 @@ use api::grpc::transport_channel_pool::{
 };
 use collection::operations::validation;
 use config::{Config, ConfigError, Environment, File, FileFormat, Source};
-use segment::common::cpu::get_num_cpus;
 use serde::Deserialize;
 use storage::types::StorageConfig;
 use validator::Validate;
 
+use crate::common::debugger::DebuggerConfig;
+use crate::tracing;
+
 const DEFAULT_CONFIG: &str = include_str!("../config/config.yaml");
 
 #[derive(Debug, Deserialize, Validate, Clone)]
+#[allow(dead_code)] // necessary because some field are only used in main.rs
 pub struct ServiceConfig {
     #[validate(length(min = 1))]
     pub host: String,
@@ -28,6 +31,8 @@ pub struct ServiceConfig {
     pub verify_https_client_certificate: bool,
     pub api_key: Option<String>,
     pub read_only_api_key: Option<String>,
+    #[serde(default)]
+    pub jwt_rbac: Option<bool>,
 
     /// Directory where static files are served from.
     /// For example, the Web-UI should be placed here.
@@ -38,6 +43,9 @@ pub struct ServiceConfig {
     /// This includes the Web-UI. True by default.
     #[serde(default)]
     pub enable_static_content: Option<bool>,
+
+    /// How much time is considered too long for a query to execute.
+    pub slow_query_secs: Option<f32>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default, Validate)]
@@ -58,6 +66,7 @@ pub struct ClusterConfig {
 }
 
 #[derive(Debug, Deserialize, Clone, Validate)]
+#[allow(dead_code)] // necessary because some field are only used in main.rs
 pub struct P2pConfig {
     #[serde(default)]
     pub port: Option<u16>,
@@ -115,9 +124,12 @@ pub struct TlsConfig {
 }
 
 #[derive(Debug, Deserialize, Clone, Validate)]
+#[allow(dead_code)] // necessary because some field are only used in main.rs
 pub struct Settings {
-    #[serde(default = "default_log_level")]
-    pub log_level: String,
+    #[serde(default)]
+    pub log_level: Option<String>,
+    #[serde(default)]
+    pub logger: tracing::LoggerConfig,
     #[validate]
     pub storage: StorageConfig,
     #[validate]
@@ -129,97 +141,13 @@ pub struct Settings {
     pub telemetry_disabled: bool,
     #[validate]
     pub tls: Option<TlsConfig>,
+    #[serde(default)]
+    pub debugger: DebuggerConfig,
     /// A list of messages for errors that happened during loading the configuration. We collect
     /// them and store them here while loading because then our logger is not configured yet.
     /// We therefore need to log these messages later, after the logger is ready.
     #[serde(default, skip)]
     pub load_errors: Vec<LogMsg>,
-}
-
-#[derive(Clone, Debug)]
-pub enum LogMsg {
-    Warn(String),
-    Error(String),
-}
-
-impl LogMsg {
-    fn log(&self) {
-        match self {
-            Self::Warn(msg) => log::warn!("{msg}"),
-            Self::Error(msg) => log::error!("{msg}"),
-        }
-    }
-}
-
-impl Settings {
-    pub fn tls(&self) -> io::Result<&TlsConfig> {
-        self.tls
-            .as_ref()
-            .ok_or_else(Self::tls_config_is_undefined_error)
-    }
-
-    pub fn tls_config_is_undefined_error() -> io::Error {
-        io::Error::new(
-            io::ErrorKind::Other,
-            "TLS config is not defined in the Qdrant config file",
-        )
-    }
-
-    #[allow(dead_code)]
-    pub fn validate_and_warn(&self) {
-        // Print any load error messages we had
-        self.load_errors.iter().for_each(LogMsg::log);
-
-        if let Err(ref errs) = self.validate() {
-            validation::warn_validation_errors("Settings configuration file", errs);
-        }
-    }
-}
-
-const fn default_telemetry_disabled() -> bool {
-    false
-}
-
-const fn default_cors() -> bool {
-    true
-}
-
-fn default_log_level() -> String {
-    "INFO".to_string()
-}
-
-const fn default_timeout_ms() -> u64 {
-    DEFAULT_GRPC_TIMEOUT.as_millis() as u64
-}
-
-const fn default_connection_timeout_ms() -> u64 {
-    DEFAULT_CONNECT_TIMEOUT.as_millis() as u64
-}
-
-const fn default_tick_period_ms() -> u64 {
-    100
-}
-
-// Should not be less than `DEFAULT_META_OP_WAIT` as bootstrapping perform sync. consensus meta operations.
-const fn default_bootstrap_timeout_sec() -> u64 {
-    15
-}
-
-const fn default_max_message_queue_size() -> usize {
-    100
-}
-
-const fn default_connection_pool_size() -> usize {
-    DEFAULT_POOL_SIZE
-}
-
-const fn default_message_timeout_tics() -> u64 {
-    10
-}
-
-const fn default_tls_cert_ttl() -> Option<u64> {
-    // Default one hour
-    Some(3600)
 }
 
 impl Settings {
@@ -275,21 +203,98 @@ impl Settings {
         settings.load_errors.extend(load_errors);
         Ok(settings)
     }
+
+    pub fn tls(&self) -> io::Result<&TlsConfig> {
+        self.tls
+            .as_ref()
+            .ok_or_else(Self::tls_config_is_undefined_error)
+    }
+
+    pub fn tls_config_is_undefined_error() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Other,
+            "TLS config is not defined in the Qdrant config file",
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn validate_and_warn(&self) {
+        // Print any load error messages we had
+        self.load_errors.iter().for_each(LogMsg::log);
+
+        if let Err(ref errs) = self.validate() {
+            validation::warn_validation_errors("Settings configuration file", errs);
+        }
+    }
 }
 
 /// Returns the number of maximum actix workers.
-#[allow(dead_code)]
 pub fn max_web_workers(settings: &Settings) -> usize {
-    let max_workers = settings.service.max_workers;
-
-    if max_workers == Some(0) {
-        let num_cpu = get_num_cpus();
-        std::cmp::max(1, num_cpu - 1)
-    } else if max_workers.is_none() {
-        settings.storage.performance.max_search_threads
-    } else {
-        max_workers.unwrap()
+    match settings.service.max_workers {
+        Some(0) => {
+            let num_cpu = common::cpu::get_num_cpus();
+            std::cmp::max(1, num_cpu - 1)
+        }
+        Some(max_workers) => max_workers,
+        None => settings.storage.performance.max_search_threads,
     }
+}
+
+#[derive(Clone, Debug)]
+pub enum LogMsg {
+    Warn(String),
+    Error(String),
+}
+
+impl LogMsg {
+    fn log(&self) {
+        match self {
+            Self::Warn(msg) => log::warn!("{msg}"),
+            Self::Error(msg) => log::error!("{msg}"),
+        }
+    }
+}
+
+const fn default_telemetry_disabled() -> bool {
+    false
+}
+
+const fn default_cors() -> bool {
+    true
+}
+
+const fn default_timeout_ms() -> u64 {
+    DEFAULT_GRPC_TIMEOUT.as_millis() as u64
+}
+
+const fn default_connection_timeout_ms() -> u64 {
+    DEFAULT_CONNECT_TIMEOUT.as_millis() as u64
+}
+
+const fn default_tick_period_ms() -> u64 {
+    100
+}
+
+// Should not be less than `DEFAULT_META_OP_WAIT` as bootstrapping perform sync. consensus meta operations.
+const fn default_bootstrap_timeout_sec() -> u64 {
+    15
+}
+
+const fn default_max_message_queue_size() -> usize {
+    100
+}
+
+const fn default_connection_pool_size() -> usize {
+    DEFAULT_POOL_SIZE
+}
+
+const fn default_message_timeout_tics() -> u64 {
+    10
+}
+
+const fn default_tls_cert_ttl() -> Option<u64> {
+    // Default one hour
+    Some(3600)
 }
 
 #[cfg(test)]

@@ -11,7 +11,9 @@ use segment::common::anonymize::Anonymize;
 use segment::data_types::vectors::DEFAULT_VECTOR_NAME;
 use segment::index::sparse_index::sparse_index_config::{SparseIndexConfig, SparseIndexType};
 use segment::types::{
-    Distance, HnswConfig, Indexes, QuantizationConfig, SparseVectorDataConfig, VectorDataConfig,
+    default_replication_factor_const, default_shard_number_const,
+    default_write_consistency_factor_const, Distance, HnswConfig, Indexes, PayloadStorageType,
+    QuantizationConfig, SparseVectorDataConfig, VectorDataConfig, VectorStorageDatatype,
     VectorStorageType,
 };
 use serde::{Deserialize, Serialize};
@@ -106,6 +108,16 @@ pub struct CollectionParams {
     pub sparse_vectors: Option<BTreeMap<String, SparseVectorParams>>,
 }
 
+impl CollectionParams {
+    pub fn payload_storage_type(&self) -> PayloadStorageType {
+        if self.on_disk_payload {
+            PayloadStorageType::OnDisk
+        } else {
+            PayloadStorageType::InMemory
+        }
+    }
+}
+
 impl Anonymize for CollectionParams {
     fn anonymize(&self) -> Self {
         CollectionParams {
@@ -122,15 +134,15 @@ impl Anonymize for CollectionParams {
 }
 
 pub fn default_shard_number() -> NonZeroU32 {
-    NonZeroU32::new(1).unwrap()
+    NonZeroU32::new(default_shard_number_const()).unwrap()
 }
 
 pub fn default_replication_factor() -> NonZeroU32 {
-    NonZeroU32::new(1).unwrap()
+    NonZeroU32::new(default_replication_factor_const()).unwrap()
 }
 
 pub fn default_write_consistency_factor() -> NonZeroU32 {
-    NonZeroU32::new(1).unwrap()
+    NonZeroU32::new(default_write_consistency_factor_const()).unwrap()
 }
 
 const fn default_on_disk_payload() -> bool {
@@ -235,6 +247,12 @@ impl CollectionParams {
             })
     }
 
+    pub fn get_sparse_vector_params_opt(&self, vector_name: &str) -> Option<&SparseVectorParams> {
+        self.sparse_vectors
+            .as_ref()
+            .and_then(|sparse_vectors| sparse_vectors.get(vector_name))
+    }
+
     pub fn get_sparse_vector_params_mut(
         &mut self,
         vector_name: &str,
@@ -300,7 +318,11 @@ impl CollectionParams {
     ) -> CollectionResult<()> {
         for (vector_name, update_params) in update_vectors.0.iter() {
             let sparse_vector_params = self.get_sparse_vector_params_mut(vector_name)?;
-            let SparseVectorParams { index } = update_params.clone();
+            let SparseVectorParams { index, modifier } = update_params.clone();
+
+            if let Some(modifier) = modifier {
+                sparse_vector_params.modifier = Some(modifier);
+            }
 
             if let Some(index) = index {
                 if let Some(existing_index) = &mut sparse_vector_params.index {
@@ -317,7 +339,7 @@ impl CollectionParams {
     ///
     /// It is the job of the segment optimizer to change this configuration with optimized settings
     /// based on threshold configurations.
-    pub fn into_base_vector_data(&self) -> CollectionResult<HashMap<String, VectorDataConfig>> {
+    pub fn to_base_vector_data(&self) -> CollectionResult<HashMap<String, VectorDataConfig>> {
         Ok(self
             .vectors
             .params_iter()
@@ -337,6 +359,8 @@ impl CollectionParams {
                         } else {
                             VectorStorageType::Memory
                         },
+                        multivector_config: params.multivector_config,
+                        datatype: params.datatype.map(VectorStorageDatatype::from),
                     },
                 )
             })
@@ -347,14 +371,14 @@ impl CollectionParams {
     ///
     /// It is the job of the segment optimizer to change this configuration with optimized settings
     /// based on threshold configurations.
-    pub fn into_sparse_vector_data(
+    pub fn to_sparse_vector_data(
         &self,
     ) -> CollectionResult<HashMap<String, SparseVectorDataConfig>> {
         if let Some(sparse_vectors) = &self.sparse_vectors {
-            Ok(sparse_vectors
+            sparse_vectors
                 .iter()
                 .map(|(name, params)| {
-                    (
+                    Ok((
                         name.into(),
                         SparseVectorDataConfig {
                             index: SparseIndexConfig {
@@ -362,11 +386,15 @@ impl CollectionParams {
                                     .index
                                     .and_then(|index| index.full_scan_threshold),
                                 index_type: SparseIndexType::MutableRam,
+                                datatype: params
+                                    .index
+                                    .and_then(|index| index.datatype)
+                                    .map(VectorStorageDatatype::from),
                             },
                         },
-                    )
+                    ))
                 })
-                .collect())
+                .collect()
         } else {
             Ok(Default::default())
         }

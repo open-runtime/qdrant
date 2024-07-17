@@ -11,10 +11,6 @@ use crate::operations::CollectionUpdateOperations;
 pub struct CollectionUpdater {}
 
 impl CollectionUpdater {
-    pub fn new() -> Self {
-        Self {}
-    }
-
     fn handle_update_result(
         segments: &RwLock<SegmentHolder>,
         op_num: SeqNumberType,
@@ -72,7 +68,10 @@ impl CollectionUpdater {
 
 #[cfg(test)]
 mod tests {
-    use segment::data_types::vectors::{only_default_vector, DEFAULT_VECTOR_NAME};
+    use itertools::Itertools;
+    use segment::data_types::vectors::{
+        only_default_vector, VectorStructInternal, DEFAULT_VECTOR_NAME,
+    };
     use segment::types::{Payload, WithPayload};
     use serde_json::json;
     use tempfile::Builder;
@@ -97,27 +96,27 @@ mod tests {
         let points = vec![
             PointStruct {
                 id: 11.into(),
-                vector: vec11.into(),
+                vector: VectorStructInternal::from(vec11).into(),
                 payload: None,
             },
             PointStruct {
                 id: 12.into(),
-                vector: vec12.into(),
+                vector: VectorStructInternal::from(vec12).into(),
                 payload: None,
             },
             PointStruct {
                 id: 13.into(),
-                vector: vec13.into(),
+                vector: VectorStructInternal::from(vec13).into(),
                 payload: Some(json!({ "color": "red" }).into()),
             },
             PointStruct {
                 id: 14.into(),
-                vector: vec![0., 0., 0., 0.].into(),
+                vector: VectorStructInternal::from(vec![0., 0., 0., 0.]).into(),
                 payload: None,
             },
             PointStruct {
                 id: 500.into(),
-                vector: vec![2., 0., 2., 0.].into(),
+                vector: VectorStructInternal::from(vec![2., 0., 2., 0.]).into(),
                 payload: None,
             },
         ];
@@ -139,12 +138,12 @@ mod tests {
         let points = vec![
             PointStruct {
                 id: 1.into(),
-                vector: vec![2., 2., 2., 2.].into(),
+                vector: VectorStructInternal::from(vec![2., 2., 2., 2.]).into(),
                 payload: None,
             },
             PointStruct {
                 id: 500.into(),
-                vector: vec![2., 0., 2., 0.].into(),
+                vector: VectorStructInternal::from(vec![2., 0., 2., 0.]).into(),
                 payload: None,
             },
         ];
@@ -158,7 +157,9 @@ mod tests {
             &WithPayload::from(true),
             &true.into(),
         )
-        .unwrap();
+        .unwrap()
+        .into_values()
+        .collect_vec();
 
         assert_eq!(records.len(), 3);
 
@@ -190,7 +191,9 @@ mod tests {
             &WithPayload::from(true),
             &true.into(),
         )
-        .unwrap();
+        .unwrap()
+        .into_values()
+        .collect_vec();
 
         for record in records {
             assert!(record.vector.is_some());
@@ -214,13 +217,16 @@ mod tests {
                 payload,
                 points: Some(points.clone()),
                 filter: None,
+                key: None,
             }),
         )
         .unwrap();
 
         let res =
             SegmentsSearcher::retrieve(&segments, &points, &WithPayload::from(true), &false.into())
-                .unwrap();
+                .unwrap()
+                .into_values()
+                .collect_vec();
 
         assert_eq!(res.len(), 3);
 
@@ -240,7 +246,7 @@ mod tests {
             101,
             PayloadOps::DeletePayload(DeletePayloadOp {
                 points: Some(vec![3.into()]),
-                keys: vec!["color".to_string(), "empty".to_string()],
+                keys: vec!["color".parse().unwrap(), "empty".parse().unwrap()],
                 filter: None,
             }),
         )
@@ -252,7 +258,10 @@ mod tests {
             &WithPayload::from(true),
             &false.into(),
         )
-        .unwrap();
+        .unwrap()
+        .into_values()
+        .collect_vec();
+
         assert_eq!(res.len(), 1);
         assert!(!res[0].payload.as_ref().unwrap().contains_key("color"));
 
@@ -264,7 +273,10 @@ mod tests {
             &WithPayload::from(true),
             &false.into(),
         )
-        .unwrap();
+        .unwrap()
+        .into_values()
+        .collect_vec();
+
         assert_eq!(res.len(), 1);
         assert!(res[0].payload.as_ref().unwrap().contains_key("color"));
 
@@ -282,7 +294,10 @@ mod tests {
             &WithPayload::from(true),
             &false.into(),
         )
-        .unwrap();
+        .unwrap()
+        .into_values()
+        .collect_vec();
+
         assert_eq!(res.len(), 1);
         assert!(!res[0].payload.as_ref().unwrap().contains_key("color"));
     }

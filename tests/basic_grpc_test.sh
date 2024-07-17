@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # This test checks that Qdrant answers to all API mentioned in README.md as expected
 
 set -ex
@@ -202,8 +202,8 @@ $docker_grpcurl $QDRANT_HOST describe qdrant.UpsertPoints
 # grpc protocol compliant health check
 $docker_grpcurl $QDRANT_HOST grpc.health.v1.Health/Check
 
-#SAVED_VECTORS_COUNT=$(curl --fail -s "http://$QDRANT_HOST/collections/test_collection" | jq '.result.vectors_count')
-#[[ "$SAVED_VECTORS_COUNT" == "6" ]] || {
+#SAVED_POINTS_COUNT=$(curl --fail -s "http://$QDRANT_HOST/collections/test_collection" | jq '.result.points_count')
+#[[ "$SAVED_POINTS_COUNT" == "6" ]] || {
 #  echo 'check failed'
 #  exit 1
 #}

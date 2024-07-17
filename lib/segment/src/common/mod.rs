@@ -1,15 +1,17 @@
 pub mod anonymize;
-pub mod arc_atomic_ref_cell_iterator;
-pub mod cpu;
 pub mod error_logging;
+pub mod macros;
 pub mod mmap_type;
 pub mod operation_error;
 pub mod operation_time_statistics;
+pub mod reciprocal_rank_fusion;
 pub mod rocksdb_buffered_delete_wrapper;
+pub mod rocksdb_buffered_update_wrapper;
 pub mod rocksdb_wrapper;
+pub mod score_fusion;
 pub mod utils;
+pub mod validate_snapshot_archive;
 pub mod vector_utils;
-pub mod version;
 
 use std::sync::atomic::AtomicBool;
 
@@ -19,7 +21,6 @@ use crate::data_types::vectors::{QueryVector, VectorRef};
 use crate::types::{SegmentConfig, SparseVectorDataConfig, VectorDataConfig};
 
 pub type Flusher = Box<dyn FnOnce() -> OperationResult<()> + Send>;
-
 /// Check that the given vector name is part of the segment config.
 ///
 /// Returns an error if incompatible.
@@ -55,19 +56,19 @@ fn check_query_vector(
 ) -> OperationResult<()> {
     match query_vector {
         QueryVector::Nearest(vector) => {
-            check_vector_against_config(vector.to_vec_ref(), vector_config)?
+            check_vector_against_config(VectorRef::from(vector), vector_config)?
         }
         QueryVector::Recommend(reco_query) => reco_query.flat_iter().try_for_each(|vector| {
-            check_vector_against_config(vector.to_vec_ref(), vector_config)
+            check_vector_against_config(VectorRef::from(vector), vector_config)
         })?,
         QueryVector::Discovery(discovery_query) => {
             discovery_query.flat_iter().try_for_each(|vector| {
-                check_vector_against_config(vector.to_vec_ref(), vector_config)
+                check_vector_against_config(VectorRef::from(vector), vector_config)
             })?
         }
         QueryVector::Context(discovery_context_query) => {
             discovery_context_query.flat_iter().try_for_each(|vector| {
-                check_vector_against_config(vector.to_vec_ref(), vector_config)
+                check_vector_against_config(VectorRef::from(vector), vector_config)
             })?
         }
     }
@@ -81,19 +82,19 @@ fn check_query_sparse_vector(
 ) -> OperationResult<()> {
     match query_vector {
         QueryVector::Nearest(vector) => {
-            check_sparse_vector_against_config(vector.to_vec_ref(), vector_config)?
+            check_sparse_vector_against_config(VectorRef::from(vector), vector_config)?
         }
         QueryVector::Recommend(reco_query) => reco_query.flat_iter().try_for_each(|vector| {
-            check_sparse_vector_against_config(vector.to_vec_ref(), vector_config)
+            check_sparse_vector_against_config(VectorRef::from(vector), vector_config)
         })?,
         QueryVector::Discovery(discovery_query) => {
             discovery_query.flat_iter().try_for_each(|vector| {
-                check_sparse_vector_against_config(vector.to_vec_ref(), vector_config)
+                check_sparse_vector_against_config(VectorRef::from(vector), vector_config)
             })?
         }
         QueryVector::Context(discovery_context_query) => {
             discovery_context_query.flat_iter().try_for_each(|vector| {
-                check_sparse_vector_against_config(vector.to_vec_ref(), vector_config)
+                check_sparse_vector_against_config(VectorRef::from(vector), vector_config)
             })?
         }
     }
@@ -178,7 +179,7 @@ fn check_vector_against_config(
             // Check dimensionality
             let dim = vector_config.size;
             if vector.len() != dim {
-                return Err(OperationError::WrongVector {
+                return Err(OperationError::WrongVectorDimension {
                     expected_dim: dim,
                     received_dim: vector.len(),
                 });
@@ -186,6 +187,19 @@ fn check_vector_against_config(
             Ok(())
         }
         VectorRef::Sparse(_) => Err(OperationError::WrongSparse),
+        VectorRef::MultiDense(multi_vector) => {
+            // Check dimensionality
+            let dim = vector_config.size;
+            for vector in multi_vector.multi_vectors() {
+                if vector.len() != dim {
+                    return Err(OperationError::WrongVectorDimension {
+                        expected_dim: dim,
+                        received_dim: vector.len(),
+                    });
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -196,6 +210,7 @@ fn check_sparse_vector_against_config(
     match vector {
         VectorRef::Dense(_) => Err(OperationError::WrongSparse),
         VectorRef::Sparse(_vector) => Ok(()), // TODO(sparse) check vector by config
+        VectorRef::MultiDense(_) => Err(OperationError::WrongMulti),
     }
 }
 

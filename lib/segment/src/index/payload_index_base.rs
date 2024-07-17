@@ -5,9 +5,9 @@ use common::types::PointOffsetType;
 use serde_json::Value;
 
 use crate::common::operation_error::OperationResult;
-use crate::common::utils::JsonPathPayload;
 use crate::common::Flusher;
 use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition};
+use crate::json_path::JsonPath;
 use crate::payload_storage::FilterContext;
 use crate::types::{
     Filter, Payload, PayloadFieldSchema, PayloadKeyType, PayloadKeyTypeRef, PayloadSchemaType,
@@ -21,7 +21,7 @@ pub trait PayloadIndex {
     fn set_indexed(
         &mut self,
         field: PayloadKeyTypeRef,
-        payload_schema: PayloadFieldSchema,
+        payload_schema: impl Into<PayloadFieldSchema>,
     ) -> OperationResult<()>;
 
     /// Remove index
@@ -36,7 +36,7 @@ pub trait PayloadIndex {
     fn estimate_nested_cardinality(
         &self,
         query: &Filter,
-        nested_path: &JsonPathPayload,
+        nested_path: &JsonPath,
     ) -> CardinalityEstimation;
 
     /// Return list of all point ids, which satisfy filtering criteria
@@ -60,12 +60,17 @@ pub trait PayloadIndex {
     /// Assign same payload to each given point
     fn assign_all(&mut self, point_id: PointOffsetType, payload: &Payload) -> OperationResult<()> {
         self.drop(point_id)?;
-        self.assign(point_id, payload)?;
+        self.assign(point_id, payload, &None)?;
         Ok(())
     }
 
     /// Assign payload to a concrete point with a concrete payload value
-    fn assign(&mut self, point_id: PointOffsetType, payload: &Payload) -> OperationResult<()>;
+    fn assign(
+        &mut self,
+        point_id: PointOffsetType,
+        payload: &Payload,
+        key: &Option<JsonPath>,
+    ) -> OperationResult<()>;
 
     /// Get payload for point
     fn payload(&self, point_id: PointOffsetType) -> OperationResult<Payload>;

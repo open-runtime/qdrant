@@ -7,6 +7,7 @@ use rocksdb::DB;
 use self::memory::{BinaryItem, BinaryMemory};
 use super::{CardinalityEstimation, PayloadFieldIndex, PrimaryCondition, ValueIndexer};
 use crate::common::operation_error::{OperationError, OperationResult};
+use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
 use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
 use crate::telemetry::PayloadIndexTelemetry;
 use crate::types::{FieldCondition, Match, MatchValue, PayloadKeyType, ValueVariants};
@@ -161,13 +162,16 @@ mod memory {
 
 pub struct BinaryIndex {
     memory: BinaryMemory,
-    db_wrapper: DatabaseColumnWrapper,
+    db_wrapper: DatabaseColumnScheduledDeleteWrapper,
 }
 
 impl BinaryIndex {
     pub fn new(db: Arc<RwLock<DB>>, field_name: &str) -> BinaryIndex {
         let store_cf_name = Self::storage_cf_name(field_name);
-        let db_wrapper = DatabaseColumnWrapper::new(db, &store_cf_name);
+        let db_wrapper = DatabaseColumnScheduledDeleteWrapper::new(DatabaseColumnWrapper::new(
+            db,
+            &store_cf_name,
+        ));
         Self {
             memory: BinaryMemory::new(),
             db_wrapper,
@@ -217,7 +221,10 @@ impl PayloadFieldIndex for BinaryIndex {
             return Ok(false);
         }
 
-        for (key, value) in self.db_wrapper.lock_db().iter()? {
+        let db_lock = self.db_wrapper.lock_db();
+        let pending_deletes = self.db_wrapper.pending_deletes();
+
+        for (key, value) in db_lock.iter_pending_deletes(pending_deletes)? {
             let idx = PointOffsetType::from_be_bytes(key.as_ref().try_into().unwrap());
 
             debug_assert_eq!(value.len(), 1);
@@ -354,8 +361,8 @@ mod tests {
 
     use super::BinaryIndex;
     use crate::common::rocksdb_wrapper::open_db_with_existing_cf;
-    use crate::common::utils::MultiValue;
     use crate::index::field_index::{PayloadFieldIndex, ValueIndexer};
+    use crate::json_path::JsonPath;
 
     const FIELD_NAME: &str = "bool_field";
     const DB_NAME: &str = "test_db";
@@ -370,7 +377,7 @@ mod tests {
 
     fn match_bool(value: bool) -> crate::types::FieldCondition {
         crate::types::FieldCondition::new_match(
-            FIELD_NAME.to_string(),
+            JsonPath::new(FIELD_NAME),
             crate::types::Match::Value(crate::types::MatchValue {
                 value: crate::types::ValueVariants::Bool(value),
             }),
@@ -397,7 +404,7 @@ mod tests {
     fn filter(given: serde_json::Value, match_on: bool, expected_count: usize) {
         let (_tmp_dir, mut index) = new_binary_index();
 
-        index.add_point(0, &MultiValue::one(&given)).unwrap();
+        index.add_point(0, &[&given]).unwrap();
 
         let count = index.filter(&match_bool(match_on)).unwrap().count();
 
@@ -438,12 +445,11 @@ mod tests {
             .into_iter()
             .enumerate()
             .for_each(|(i, value)| {
-                let payload = MultiValue::one(&value);
-                index.add_point(i as u32, &payload).unwrap();
+                index.add_point(i as u32, &[&value]).unwrap();
             });
 
         index.flusher()().unwrap();
-        let db = index.db_wrapper.database;
+        let db = index.db_wrapper.get_database();
 
         let mut new_index = BinaryIndex::new(db, FIELD_NAME);
         assert!(new_index.load().unwrap());
@@ -463,12 +469,12 @@ mod tests {
         let (_tmp_dir, mut index) = new_binary_index();
 
         let idx = 1000;
-        index.add_point(idx, &MultiValue::one(&before)).unwrap();
+        index.add_point(idx, &[&before]).unwrap();
 
         let point_offsets = index.filter(&match_bool(false)).unwrap().collect_vec();
         assert_eq!(point_offsets, vec![idx]);
 
-        index.add_point(idx, &MultiValue::one(&after)).unwrap();
+        index.add_point(idx, &[&after]).unwrap();
 
         let point_offsets = index.filter(&match_bool(true)).unwrap().collect_vec();
         assert_eq!(point_offsets, vec![idx]);
@@ -484,8 +490,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .for_each(|(i, value)| {
-                let payload = MultiValue::one(&value);
-                index.add_point(i as u32, &payload).unwrap();
+                index.add_point(i as u32, &[&value]).unwrap();
             });
 
         assert_eq!(index.count_indexed_points(), 9);
@@ -499,12 +504,11 @@ mod tests {
             .into_iter()
             .enumerate()
             .for_each(|(i, value)| {
-                let payload = MultiValue::one(&value);
-                index.add_point(i as u32, &payload).unwrap();
+                index.add_point(i as u32, &[&value]).unwrap();
             });
 
         let blocks = index
-            .payload_blocks(0, FIELD_NAME.to_string())
+            .payload_blocks(0, JsonPath::new(FIELD_NAME))
             .collect_vec();
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].cardinality, 6);
@@ -519,8 +523,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .for_each(|(i, value)| {
-                let payload = MultiValue::one(&value);
-                index.add_point(i as u32, &payload).unwrap();
+                index.add_point(i as u32, &[&value]).unwrap();
             });
 
         let cardinality = index.estimate_cardinality(&match_bool(true)).unwrap();

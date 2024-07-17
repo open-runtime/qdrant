@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # This runs all integration test in isolation
 
 set -ex
@@ -20,11 +20,8 @@ else
   ./target/debug/qdrant &
 fi
 
-# Sleep to make sure the process has started (workaround for empty pidof)
-sleep 5
-
 ## Capture PID of the run
-PID=$(pidof "./target/debug/qdrant")
+PID=$!
 echo $PID
 
 function clear_after_tests()
@@ -34,6 +31,7 @@ function clear_after_tests()
   echo "END"
 }
 
+trap clear_after_tests SIGINT
 trap clear_after_tests EXIT
 
 until curl --output /dev/null --silent --get --fail http://$QDRANT_HOST/collections; do
@@ -48,7 +46,7 @@ if [ "$MODE" == "distributed" ]; then
   sleep 10
 fi
 
-./tests/openapi_integration_test.sh
+pytest tests/openapi
 
 ./tests/basic_api_test.sh
 
@@ -57,3 +55,7 @@ fi
 ./tests/basic_grpc_test.sh
 
 ./tests/basic_sparse_grpc_test.sh
+
+./tests/basic_multivector_grpc_test.sh
+
+./tests/basic_query_grpc_test.sh

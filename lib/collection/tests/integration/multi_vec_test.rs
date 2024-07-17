@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::NonZeroU32;
 use std::path::Path;
 
+use api::rest::SearchRequestInternal;
 use collection::collection::Collection;
 use collection::config::{CollectionConfig, CollectionParams, WalConfig};
 use collection::operations::point_ops::{
@@ -9,13 +10,13 @@ use collection::operations::point_ops::{
 };
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::types::{
-    CollectionError, PointRequestInternal, RecommendRequestInternal, SearchRequestInternal,
-    VectorParams, VectorsConfig,
+    CollectionError, PointRequestInternal, RecommendRequestInternal, VectorsConfig,
 };
+use collection::operations::vector_params_builder::VectorParamsBuilder;
 use collection::operations::CollectionUpdateOperations;
 use collection::recommendations::recommend_by;
 use segment::data_types::named_vectors::NamedVectors;
-use segment::data_types::vectors::{NamedVector, VectorStruct};
+use segment::data_types::vectors::{NamedVector, VectorStructInternal};
 use segment::types::{Distance, WithPayloadInterface, WithVector};
 use tempfile::Builder;
 
@@ -37,20 +38,8 @@ pub async fn multi_vec_collection_fixture(collection_path: &Path, shard_number: 
         wal_segments_ahead: 0,
     };
 
-    let vector_params1 = VectorParams {
-        size: NonZeroU64::new(4).unwrap(),
-        distance: Distance::Dot,
-        hnsw_config: None,
-        quantization_config: None,
-        on_disk: None,
-    };
-    let vector_params2 = VectorParams {
-        size: NonZeroU64::new(4).unwrap(),
-        distance: Distance::Dot,
-        hnsw_config: None,
-        quantization_config: None,
-        on_disk: None,
-    };
+    let vector_params1 = VectorParamsBuilder::new(4, Distance::Dot).build();
+    let vector_params2 = VectorParamsBuilder::new(4, Distance::Dot).build();
 
     let mut vectors_config = BTreeMap::new();
 
@@ -101,7 +90,7 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
 
         points.push(PointStruct {
             id: i.into(),
-            vector: vectors.into(),
+            vector: VectorStructInternal::from(vectors).into(),
             payload: Some(serde_json::from_str(r#"{"number": "John Doe"}"#).unwrap()),
         });
     }
@@ -142,8 +131,9 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
 
     for hit in result {
         match hit.vector.unwrap() {
-            VectorStruct::Single(_) => panic!("expected multi vector"),
-            VectorStruct::Multi(vectors) => {
+            VectorStructInternal::Single(_) => panic!("expected multi vector"),
+            VectorStructInternal::MultiDense(_) => panic!("expected multi vector"),
+            VectorStructInternal::Named(vectors) => {
                 assert!(vectors.contains_key(VEC_NAME1));
                 assert!(vectors.contains_key(VEC_NAME2));
             }
@@ -204,8 +194,9 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
 
     for hit in result {
         match hit.vector.unwrap() {
-            VectorStruct::Single(_) => panic!("expected multi vector"),
-            VectorStruct::Multi(vectors) => {
+            VectorStructInternal::Single(_) => panic!("expected multi vector"),
+            VectorStructInternal::MultiDense(_) => panic!("expected multi vector"),
+            VectorStructInternal::Named(vectors) => {
                 assert!(vectors.contains_key(VEC_NAME1));
                 assert!(vectors.contains_key(VEC_NAME2));
             }
@@ -227,8 +218,9 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
 
     assert_eq!(retrieve.len(), 1);
     match retrieve[0].vector.as_ref().unwrap() {
-        VectorStruct::Single(_) => panic!("expected multi vector"),
-        VectorStruct::Multi(vectors) => {
+        VectorStructInternal::Single(_) => panic!("expected multi vector"),
+        VectorStructInternal::MultiDense(_) => panic!("expected multi vector"),
+        VectorStructInternal::Named(vectors) => {
             assert!(vectors.contains_key(VEC_NAME1));
             assert!(!vectors.contains_key(VEC_NAME2));
         }
@@ -280,8 +272,9 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
     assert_eq!(recommend_result.len(), 10);
     for hit in recommend_result {
         match hit.vector.as_ref().unwrap() {
-            VectorStruct::Single(_) => panic!("expected multi vector"),
-            VectorStruct::Multi(vectors) => {
+            VectorStructInternal::Single(_) => panic!("expected multi vector"),
+            VectorStructInternal::MultiDense(_) => panic!("expected multi vector"),
+            VectorStructInternal::Named(vectors) => {
                 assert!(!vectors.contains_key(VEC_NAME1));
                 assert!(vectors.contains_key(VEC_NAME2));
             }

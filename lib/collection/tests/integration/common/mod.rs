@@ -1,23 +1,22 @@
-#![allow(deprecated)]
-
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Arc;
 
 use collection::collection::{Collection, RequestShardTransfer};
 use collection::config::{CollectionConfig, CollectionParams, WalConfig};
-use collection::operations::types::{CollectionError, VectorParams};
+use collection::operations::types::CollectionError;
+use collection::operations::vector_params_builder::VectorParamsBuilder;
 use collection::optimizers_builder::OptimizersConfig;
 use collection::shards::channel_service::ChannelService;
 use collection::shards::collection_shard_distribution::CollectionShardDistribution;
 use collection::shards::replica_set::{AbortShardTransfer, ChangePeerState, ReplicaState};
 use collection::shards::CollectionId;
+use common::cpu::CpuBudget;
 use segment::types::Distance;
 
 /// Test collections for this upper bound of shards.
 /// Testing with more shards is problematic due to `number of open files problem`
 /// See https://github.com/qdrant/qdrant/issues/379
-#[allow(dead_code)]
 pub const N_SHARDS: u32 = 3;
 
 pub const REST_PORT: u16 = 6333;
@@ -30,11 +29,10 @@ pub const TEST_OPTIMIZERS_CONFIG: OptimizersConfig = OptimizersConfig {
     memmap_threshold: None,
     indexing_threshold: Some(50_000),
     flush_interval_sec: 30,
-    max_optimization_threads: 2,
+    max_optimization_threads: Some(2),
 };
 
 #[cfg(test)]
-#[allow(dead_code)]
 pub async fn simple_collection_fixture(collection_path: &Path, shard_number: u32) -> Collection {
     let wal_config = WalConfig {
         wal_capacity_mb: 1,
@@ -42,14 +40,7 @@ pub async fn simple_collection_fixture(collection_path: &Path, shard_number: u32
     };
 
     let collection_params = CollectionParams {
-        vectors: VectorParams {
-            size: NonZeroU64::new(4).unwrap(),
-            distance: Distance::Dot,
-            hnsw_config: None,
-            quantization_config: None,
-            on_disk: None,
-        }
-        .into(),
+        vectors: VectorParamsBuilder::new(4, Distance::Dot).build().into(),
         shard_number: NonZeroU32::new(shard_number).expect("Shard number can not be zero"),
         ..CollectionParams::empty()
     };
@@ -103,11 +94,13 @@ pub async fn new_local_collection(
         config,
         Default::default(),
         CollectionShardDistribution::all_local(Some(config.params.shard_number.into()), 0),
-        ChannelService::new(REST_PORT),
+        ChannelService::new(REST_PORT, None),
         dummy_on_replica_failure(),
         dummy_request_shard_transfer(),
         dummy_abort_shard_transfer(),
         None,
+        None,
+        CpuBudget::default(),
         None,
     )
     .await;
@@ -124,7 +117,7 @@ pub async fn new_local_collection(
 }
 
 /// Default to a collection with all the shards local
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn load_local_collection(
     id: CollectionId,
     path: &Path,
@@ -136,11 +129,13 @@ pub async fn load_local_collection(
         path,
         snapshots_path,
         Default::default(),
-        ChannelService::new(REST_PORT),
+        ChannelService::new(REST_PORT, None),
         dummy_on_replica_failure(),
         dummy_request_shard_transfer(),
         dummy_abort_shard_transfer(),
         None,
+        None,
+        CpuBudget::default(),
         None,
     )
     .await

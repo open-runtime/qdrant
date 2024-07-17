@@ -3,18 +3,23 @@ use serde_json::Value;
 
 use crate::common::operation_error::OperationResult;
 use crate::common::Flusher;
+use crate::json_path::JsonPath;
+#[cfg(feature = "testing")]
 use crate::payload_storage::in_memory_payload_storage::InMemoryPayloadStorage;
 use crate::payload_storage::on_disk_payload_storage::OnDiskPayloadStorage;
 use crate::payload_storage::simple_payload_storage::SimplePayloadStorage;
 use crate::payload_storage::PayloadStorage;
-use crate::types::{Payload, PayloadKeyTypeRef};
+use crate::types::Payload;
 
+#[derive(Debug)]
 pub enum PayloadStorageEnum {
+    #[cfg(feature = "testing")]
     InMemoryPayloadStorage(InMemoryPayloadStorage),
     SimplePayloadStorage(SimplePayloadStorage),
     OnDiskPayloadStorage(OnDiskPayloadStorage),
 }
 
+#[cfg(feature = "testing")]
 impl From<InMemoryPayloadStorage> for PayloadStorageEnum {
     fn from(a: InMemoryPayloadStorage) -> Self {
         PayloadStorageEnum::InMemoryPayloadStorage(a)
@@ -39,6 +44,7 @@ impl PayloadStorageEnum {
         F: FnMut(PointOffsetType, &Payload) -> OperationResult<bool>,
     {
         match self {
+            #[cfg(feature = "testing")]
             PayloadStorageEnum::InMemoryPayloadStorage(s) => s.iter(callback),
             PayloadStorageEnum::SimplePayloadStorage(s) => s.iter(callback),
             PayloadStorageEnum::OnDiskPayloadStorage(s) => s.iter(callback),
@@ -49,26 +55,41 @@ impl PayloadStorageEnum {
 impl PayloadStorage for PayloadStorageEnum {
     fn assign(&mut self, point_id: PointOffsetType, payload: &Payload) -> OperationResult<()> {
         match self {
+            #[cfg(feature = "testing")]
             PayloadStorageEnum::InMemoryPayloadStorage(s) => s.assign(point_id, payload),
             PayloadStorageEnum::SimplePayloadStorage(s) => s.assign(point_id, payload),
             PayloadStorageEnum::OnDiskPayloadStorage(s) => s.assign(point_id, payload),
         }
     }
 
+    fn assign_by_key(
+        &mut self,
+        point_id: PointOffsetType,
+        payload: &Payload,
+        key: &JsonPath,
+    ) -> OperationResult<()> {
+        match self {
+            #[cfg(feature = "testing")]
+            PayloadStorageEnum::InMemoryPayloadStorage(s) => {
+                s.assign_by_key(point_id, payload, key)
+            }
+            PayloadStorageEnum::SimplePayloadStorage(s) => s.assign_by_key(point_id, payload, key),
+            PayloadStorageEnum::OnDiskPayloadStorage(s) => s.assign_by_key(point_id, payload, key),
+        }
+    }
+
     fn payload(&self, point_id: PointOffsetType) -> OperationResult<Payload> {
         match self {
+            #[cfg(feature = "testing")]
             PayloadStorageEnum::InMemoryPayloadStorage(s) => s.payload(point_id),
             PayloadStorageEnum::SimplePayloadStorage(s) => s.payload(point_id),
             PayloadStorageEnum::OnDiskPayloadStorage(s) => s.payload(point_id),
         }
     }
 
-    fn delete(
-        &mut self,
-        point_id: PointOffsetType,
-        key: PayloadKeyTypeRef,
-    ) -> OperationResult<Vec<Value>> {
+    fn delete(&mut self, point_id: PointOffsetType, key: &JsonPath) -> OperationResult<Vec<Value>> {
         match self {
+            #[cfg(feature = "testing")]
             PayloadStorageEnum::InMemoryPayloadStorage(s) => s.delete(point_id, key),
             PayloadStorageEnum::SimplePayloadStorage(s) => s.delete(point_id, key),
             PayloadStorageEnum::OnDiskPayloadStorage(s) => s.delete(point_id, key),
@@ -77,6 +98,7 @@ impl PayloadStorage for PayloadStorageEnum {
 
     fn drop(&mut self, point_id: PointOffsetType) -> OperationResult<Option<Payload>> {
         match self {
+            #[cfg(feature = "testing")]
             PayloadStorageEnum::InMemoryPayloadStorage(s) => s.drop(point_id),
             PayloadStorageEnum::SimplePayloadStorage(s) => s.drop(point_id),
             PayloadStorageEnum::OnDiskPayloadStorage(s) => s.drop(point_id),
@@ -85,6 +107,7 @@ impl PayloadStorage for PayloadStorageEnum {
 
     fn wipe(&mut self) -> OperationResult<()> {
         match self {
+            #[cfg(feature = "testing")]
             PayloadStorageEnum::InMemoryPayloadStorage(s) => s.wipe(),
             PayloadStorageEnum::SimplePayloadStorage(s) => s.wipe(),
             PayloadStorageEnum::OnDiskPayloadStorage(s) => s.wipe(),
@@ -93,6 +116,7 @@ impl PayloadStorage for PayloadStorageEnum {
 
     fn flusher(&self) -> Flusher {
         match self {
+            #[cfg(feature = "testing")]
             PayloadStorageEnum::InMemoryPayloadStorage(s) => s.flusher(),
             PayloadStorageEnum::SimplePayloadStorage(s) => s.flusher(),
             PayloadStorageEnum::OnDiskPayloadStorage(s) => s.flusher(),
@@ -153,7 +177,7 @@ mod tests {
             let partial_payload: Payload = serde_json::from_str(r#"{ "age": 53 }"#).unwrap();
             storage.assign(100, &partial_payload).unwrap();
 
-            storage.delete(100, "location.geo").unwrap();
+            storage.delete(100, &JsonPath::new("location.geo")).unwrap();
 
             let res = storage.payload(100).unwrap();
 
@@ -177,8 +201,10 @@ mod tests {
                 serde_json::from_str(r#"{ "hobby": "vector search" }"#).unwrap();
             storage.assign(100, &partial_payload).unwrap();
 
-            storage.delete(100, "location.city").unwrap();
-            storage.delete(100, "location").unwrap();
+            storage
+                .delete(100, &JsonPath::new("location.city"))
+                .unwrap();
+            storage.delete(100, &JsonPath::new("location")).unwrap();
 
             let res = storage.payload(100).unwrap();
 

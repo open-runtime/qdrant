@@ -1,7 +1,6 @@
 import pathlib
-import shutil
 
-from .fixtures import create_collection, upsert_random_points, random_dense_vector, search
+from .fixtures import create_collection, upsert_random_points
 from .utils import *
 from .assertions import assert_http_ok
 
@@ -37,7 +36,7 @@ def test_collection_recovery_below_limit(tmp_path: pathlib.Path):
     upsert_random_points(peer_urls[0], N_POINTS)
 
     # Restart the peer, wait until it is up
-    peer_url = start_peer(peer_dirs[-1], f"peer_0_restarted.log", bootstrap_url)
+    peer_url = start_peer(peer_dirs[-1], "peer_0_restarted.log", bootstrap_url)
     wait_for_peer_online(peer_url)
 
     # Wait until all shards are active, never allow more than 1 shard transfer
@@ -84,14 +83,15 @@ def test_collection_recovery_reach_limit(tmp_path: pathlib.Path):
     upsert_random_points(peer_urls[0], N_POINTS)
 
     # Restart the peer, wait until it is up
-    peer_url = start_peer(peer_dirs[-1], f"peer_0_restarted.log", bootstrap_url, extra_env=env)
+    peer_url = start_peer(peer_dirs[-1], "peer_0_restarted.log", bootstrap_url, extra_env=env)
     wait_for_peer_online(peer_url)
 
     # We must see 3 transfers at one point with our customized limits
-    wait_for(transfers_reached_threshold, peer_url, wait_for_interval=0.1, transfer_threshold=3, transfer_limit=3)
+    # WARN: this check is disabled, as it's not guaranteed that we are lucky enough to see 3 transfers in our check interval
+    # wait_for(transfers_reached_threshold, peer_url, wait_for_interval=0.1, transfer_threshold=3, transfer_limit=3)
 
     # Wait until all shards are active, never allow more than 3 shard transfers
-    wait_for(transfers_below_limit_or_done, peer_url, transfer_limit=3)
+    wait_for(transfers_below_limit_or_done, peer_url, transfer_limit=3, wait_for_interval=0.1)
 
     # Check, that the collection is not empty on recovered node
     info = get_collection_cluster_info(peer_url, COLLECTION_NAME)
@@ -152,17 +152,18 @@ def test_collection_recovery_user_requests_above_limit(tmp_path: pathlib.Path):
         assert_http_ok(r)
 
     # Restart the peer, wait unil it is up
-    peer_url = start_peer(killed_peer_dir, f"peer_0_restarted.log", bootstrap_url)
+    peer_url = start_peer(killed_peer_dir, "peer_0_restarted.log", bootstrap_url)
     wait_for_peer_online(peer_url)
 
     # We must see N_SHARDS transfers on our new node
-    wait_for(transfers_reached_threshold, peer_urls[-1], wait_for_interval=0.1, transfer_threshold=N_SHARDS, transfer_limit=N_SHARDS + 1)
+    # WARN: this check is disabled, as it's not guaranteed that we are lucky enough to see 3 transfers in our check interval
+    # wait_for(transfers_reached_threshold, peer_urls[-1], wait_for_interval=0.1, transfer_threshold=N_SHARDS, transfer_limit=N_SHARDS + 1)
+
+    # Wait until all shards are active on our recovering node, never allow more than 1 shard transfers
+    wait_for(transfers_below_limit_or_done, peer_url, wait_for_interval=0.1, transfer_limit=1)
 
     # Wait until all shards are active on our new node we replicated to
     wait_for(all_collection_shards_are_active, peer_urls[-1], COLLECTION_NAME)
-
-    # Wait until all shards are active on our recovering node, never allow more than 1 shard transfers
-    wait_for(transfers_below_limit_or_done, peer_url, transfer_limit=1)
 
     # Check, that the collection is not empty on recovered node
     info = get_collection_cluster_info(peer_url, COLLECTION_NAME)

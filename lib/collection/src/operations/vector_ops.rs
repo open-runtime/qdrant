@@ -1,17 +1,16 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
+use api::rest::schema::ShardKeySelector;
 use schemars::JsonSchema;
-use segment::data_types::vectors::VectorStruct;
 use segment::types::{Filter, PointIdType};
 use serde::{Deserialize, Serialize};
+use strum::{EnumDiscriminants, EnumIter};
 use validator::{Validate, ValidationError, ValidationErrors};
 
 use super::point_ops::PointIdsList;
-use super::{point_to_shard, split_iter_by_shard, OperationToShard, SplitByShard};
+use super::{point_to_shards, split_iter_by_shard, OperationToShard, SplitByShard};
 use crate::hash_ring::HashRing;
-use crate::operations::shard_key_selector::ShardKeySelector;
-use crate::shards::shard::ShardId;
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone)]
 pub struct UpdateVectors {
@@ -23,13 +22,13 @@ pub struct UpdateVectors {
     pub shard_key: Option<ShardKeySelector>,
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 pub struct PointVectors {
     /// Point id
     pub id: PointIdType,
     /// Vectors
     #[serde(alias = "vectors")]
-    pub vector: VectorStruct,
+    pub vector: api::rest::VectorStruct,
 }
 
 impl Validate for PointVectors {
@@ -61,7 +60,7 @@ pub struct DeleteVectors {
     pub shard_key: Option<ShardKeySelector>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Validate)]
 pub struct UpdateVectorsOp {
     /// Points with named vectors
     #[validate]
@@ -69,7 +68,8 @@ pub struct UpdateVectorsOp {
     pub points: Vec<PointVectors>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, EnumDiscriminants)]
+#[strum_discriminants(derive(EnumIter))]
 #[serde(rename_all = "snake_case")]
 pub enum VectorOperations {
     /// Update vectors
@@ -101,21 +101,22 @@ impl Validate for VectorOperations {
 }
 
 impl SplitByShard for Vec<PointVectors> {
-    fn split_by_shard(self, ring: &HashRing<ShardId>) -> OperationToShard<Self> {
+    fn split_by_shard(self, ring: &HashRing) -> OperationToShard<Self> {
         split_iter_by_shard(self, |point| point.id, ring)
     }
 }
 
 impl SplitByShard for VectorOperations {
-    fn split_by_shard(self, ring: &HashRing<ShardId>) -> OperationToShard<Self> {
+    fn split_by_shard(self, ring: &HashRing) -> OperationToShard<Self> {
         match self {
             VectorOperations::UpdateVectors(update_vectors) => {
                 let shard_points = update_vectors
                     .points
                     .into_iter()
-                    .map(|point| {
-                        let shard_id = point_to_shard(point.id, ring);
-                        (shard_id, point)
+                    .flat_map(|point| {
+                        point_to_shards(&point.id, ring)
+                            .into_iter()
+                            .map(move |shard_id| (shard_id, point.clone()))
                     })
                     .fold(
                         HashMap::new(),

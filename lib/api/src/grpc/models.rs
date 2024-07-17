@@ -2,12 +2,20 @@ use std::fmt::Debug;
 
 use schemars::JsonSchema;
 use serde;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-#[derive(Serialize, Deserialize)]
+pub fn get_git_commit_id() -> Option<String> {
+    option_env!("GIT_COMMIT_ID")
+        .map(ToString::to_string)
+        .filter(|s| !s.trim().is_empty())
+}
+
+#[derive(Serialize, JsonSchema)]
 pub struct VersionInfo {
     pub title: String,
     pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
 }
 
 impl Default for VersionInfo {
@@ -15,23 +23,12 @@ impl Default for VersionInfo {
         VersionInfo {
             title: "qdrant - vector search engine".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            commit: get_git_commit_id(),
         }
     }
 }
 
-impl VersionInfo {
-    pub fn minor_version(&self) -> String {
-        let minor = self
-            .version
-            .split('.')
-            .take(2)
-            .collect::<Vec<&str>>()
-            .join(".");
-        format!("{}.x", minor)
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiStatus {
     Ok,
@@ -48,13 +45,13 @@ pub struct ApiResponse<D> {
     pub time: f64,
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct CollectionDescription {
     pub name: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct CollectionsResponse {
     pub collections: Vec<CollectionDescription>,

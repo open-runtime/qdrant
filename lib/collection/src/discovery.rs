@@ -4,8 +4,7 @@ use futures::Future;
 use itertools::Itertools;
 use segment::data_types::vectors::NamedQuery;
 use segment::types::{Condition, Filter, HasIdCondition, ScoredPoint};
-use segment::vector_storage::query::context_query::{ContextPair, ContextQuery};
-use segment::vector_storage::query::discovery_query::DiscoveryQuery;
+use segment::vector_storage::query::{ContextPair, ContextQuery, DiscoveryQuery};
 use tokio::sync::RwLockReadGuard;
 
 use crate::collection::Collection;
@@ -15,19 +14,23 @@ use crate::common::fetch_vectors::{
 };
 use crate::common::retrieve_request_trait::RetrieveRequest;
 use crate::operations::consistency_params::ReadConsistency;
+use crate::operations::query_enum::QueryEnum;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::types::{
     CollectionError, CollectionResult, CoreSearchRequest, CoreSearchRequestBatch,
-    DiscoverRequestInternal, QueryEnum,
+    DiscoverRequestInternal,
 };
 
 fn discovery_into_core_search(
+    collection_name: &str,
     request: DiscoverRequestInternal,
     all_vectors_records_map: &ReferencedVectors,
 ) -> CollectionResult<CoreSearchRequest> {
-    let lookup_collection_name = request.lookup_from.as_ref().map(|x| &x.collection);
+    let lookup_collection_name = request.get_lookup_collection();
 
-    let lookup_vector_name = request.get_search_vector_name();
+    let lookup_vector_name = request.get_lookup_vector_name();
+
+    let using = request.using.as_ref().map(|using| using.as_string());
 
     // Check we actually fetched all referenced vectors in this request
     let referenced_ids = request.get_referenced_point_ids();
@@ -77,34 +80,38 @@ fn discovery_into_core_search(
         // Target with/without pairs => Discovery
         (Some(target), pairs) => QueryEnum::Discover(NamedQuery {
             query: DiscoveryQuery::new(target, pairs),
-            using: Some(lookup_vector_name),
+            using,
         }),
 
         // Only pairs => Context
         (None, pairs) => QueryEnum::Context(NamedQuery {
             query: ContextQuery::new(pairs),
-            using: Some(lookup_vector_name),
+            using,
         }),
     };
 
-    let filter = {
-        let not_ids = Filter {
-            should: None,
-            must: None,
-            must_not: Some(vec![Condition::HasId(HasIdCondition {
-                has_id: referenced_ids.into_iter().collect(),
-            })]),
-        };
+    // do not exclude vector ids from different lookup collection
+    let reference_vectors_ids_to_exclude = match lookup_collection_name {
+        Some(lookup_collection_name) if lookup_collection_name != collection_name => vec![],
+        _ => referenced_ids,
+    };
+
+    let filter = if reference_vectors_ids_to_exclude.is_empty() {
+        request.filter
+    } else {
+        let not_ids = Filter::new_must_not(Condition::HasId(HasIdCondition {
+            has_id: reference_vectors_ids_to_exclude.into_iter().collect(),
+        }));
 
         match &request.filter {
-            None => not_ids,
-            Some(filter) => not_ids.merge(filter),
+            None => Some(not_ids),
+            Some(filter) => Some(not_ids.merge(filter)),
         }
     };
 
     let core_search = CoreSearchRequest {
         query,
-        filter: Some(filter),
+        filter,
         params: request.params,
         limit: request.limit,
         offset: request.offset.unwrap_or_default(),
@@ -197,9 +204,11 @@ where
         request_batch,
         |(_req, shard)| shard,
         |(req, _), acc| {
-            discovery_into_core_search(req, &all_vectors_records_map).map(|core_req| {
-                acc.push(core_req);
-            })
+            discovery_into_core_search(&collection.name(), req, &all_vectors_records_map).map(
+                |core_req| {
+                    acc.push(core_req);
+                },
+            )
         },
         |shard_selector, core_searches, requests| {
             if core_searches.is_empty() {

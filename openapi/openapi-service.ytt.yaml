@@ -1,6 +1,23 @@
 #@ load("openapi.lib.yml", "response", "reference", "type", "array")
 
 paths:
+  /:
+    get:
+      summary: Returns information about the running Qdrant instance
+      description: Returns information about the running Qdrant instance like version and commit id
+      operationId: root
+      tags:
+        - service
+      responses:
+        "200":
+          description: Qdrant server version information
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VersionInfo"
+        "4XX":
+          description: error
+
   /telemetry:
     get:
       summary: Collect telemetry data
@@ -32,7 +49,7 @@ paths:
           schema:
             type: boolean
       responses:
-        '200':
+        "200":
           description: Metrics data in Prometheus format
           content:
             text/plain:
@@ -48,7 +65,7 @@ paths:
                   # HELP collections_total number of collections
                   # TYPE collections_total gauge
                   collections_total 1
-        '4XX':
+        "4XX":
           description: error
 
   /locks:
@@ -82,14 +99,14 @@ paths:
       tags:
         - service
       responses:
-        '200':
+        "200":
           description: Healthz response
           content:
             text/plain:
               schema:
                 type: string
                 example: healthz check passed
-        '4XX':
+        "4XX":
           description: error
 
   /livez:
@@ -100,14 +117,14 @@ paths:
       tags:
         - service
       responses:
-        '200':
+        "200":
           description: Healthz response
           content:
             text/plain:
               schema:
                 type: string
                 example: healthz check passed
-        '4XX':
+        "4XX":
           description: error
 
   /readyz:
@@ -118,12 +135,44 @@ paths:
       tags:
         - service
       responses:
-        '200':
+        "200":
           description: Healthz response
           content:
             text/plain:
               schema:
                 type: string
                 example: healthz check passed
-        '4XX':
+        "4XX":
+          description: error
+
+  /issues:
+    get:
+      summary: Get issues
+      description: Get a report of performance issues and configuration suggestions
+      operationId: get_issues
+      tags:
+        - beta
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+        "4XX":
+          description: error
+    delete:
+      summary: Clear issues
+      description: Removes all issues reported so far
+      operationId: clear_issues
+      tags:
+        - beta
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: boolean
+        "4XX":
           description: error

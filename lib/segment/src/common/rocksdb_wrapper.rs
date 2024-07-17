@@ -1,10 +1,12 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 //use atomic_refcell::{AtomicRef, AtomicRefCell};
 use rocksdb::{ColumnFamily, DBRecoveryMode, LogLevel, Options, WriteOptions, DB};
 
+use super::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapperIterator;
 //use crate::common::arc_rwlock_iterator::ArcRwLockIterator;
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::common::Flusher;
@@ -18,11 +20,13 @@ pub const DB_VECTOR_CF: &str = "vector";
 pub const DB_PAYLOAD_CF: &str = "payload";
 pub const DB_MAPPING_CF: &str = "mapping";
 pub const DB_VERSIONS_CF: &str = "version";
+/// If there is no Column Family specified, key-value pair is associated with Column Family "default".
+pub const DB_DEFAULT_CF: &str = "default";
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DatabaseColumnWrapper {
-    pub database: Arc<RwLock<DB>>,
-    pub column_name: String,
+    database: Arc<RwLock<DB>>,
+    column_name: String,
 }
 
 pub struct DatabaseColumnIterator<'a> {
@@ -35,9 +39,10 @@ pub struct LockedDatabaseColumnWrapper<'a> {
     column_name: &'a str,
 }
 
+/// RocksDB options (both global and for column families)
 pub fn db_options() -> Options {
     let mut options: Options = Options::default();
-    options.set_write_buffer_size(DB_CACHE_SIZE);
+    options.set_write_buffer_size(DB_CACHE_SIZE); // write_buffer_size is enforced per column family.
     options.create_if_missing(true);
     options.set_log_level(LogLevel::Error);
     options.set_recycle_log_file_num(1);
@@ -60,11 +65,17 @@ pub fn open_db<T: AsRef<str>>(
     path: &Path,
     vector_paths: &[T],
 ) -> Result<Arc<RwLock<DB>>, rocksdb::Error> {
-    let mut column_families = vec![DB_PAYLOAD_CF, DB_MAPPING_CF, DB_VERSIONS_CF];
+    let mut column_families = vec![DB_PAYLOAD_CF, DB_MAPPING_CF, DB_VERSIONS_CF, DB_DEFAULT_CF];
     for vector_path in vector_paths {
         column_families.push(vector_path.as_ref());
     }
-    let db = DB::open_cf(&db_options(), path, column_families)?;
+    let options = db_options();
+    // Make sure that all column families have the same options
+    let column_with_options = column_families
+        .into_iter()
+        .map(|cf| (cf, options.clone()))
+        .collect::<Vec<_>>();
+    let db = DB::open_cf_with_opts(&options, path, column_with_options)?;
     Ok(Arc::new(RwLock::new(db)))
 }
 
@@ -81,28 +92,6 @@ pub fn open_db_with_existing_cf(path: &Path) -> Result<Arc<RwLock<DB>>, rocksdb:
     };
     let db = DB::open_cf(&db_options(), path, existing_column_families)?;
     Ok(Arc::new(RwLock::new(db)))
-}
-
-pub fn create_db_cf_if_not_exists(
-    db: Arc<RwLock<DB>>,
-    store_cf_name: &str,
-) -> Result<(), rocksdb::Error> {
-    let mut db_mut = db.write();
-    if db_mut.cf_handle(store_cf_name).is_none() {
-        db_mut.create_cf(store_cf_name, &db_options())?;
-    }
-    Ok(())
-}
-
-pub fn recreate_cf(db: Arc<RwLock<DB>>, store_cf_name: &str) -> Result<(), rocksdb::Error> {
-    let mut db_mut = db.write();
-
-    if db_mut.cf_handle(store_cf_name).is_some() {
-        db_mut.drop_cf(store_cf_name)?;
-    }
-
-    db_mut.create_cf(store_cf_name, &db_options())?;
-    Ok(())
 }
 
 impl DatabaseColumnWrapper {
@@ -157,9 +146,10 @@ impl DatabaseColumnWrapper {
     {
         let db = self.database.read();
         let cf_handle = self.get_column_family(&db)?;
-        db.delete_cf(cf_handle, key).map_err(|err| {
-            OperationError::service_error(format!("RocksDB delete_cf error: {err}"))
-        })?;
+        db.delete_cf_opt(cf_handle, key, &Self::get_write_options())
+            .map_err(|err| {
+                OperationError::service_error(format!("RocksDB delete_cf error: {err}"))
+            })?;
         Ok(())
     }
 
@@ -228,7 +218,8 @@ impl DatabaseColumnWrapper {
     fn get_write_options() -> WriteOptions {
         let mut write_options = WriteOptions::default();
         write_options.set_sync(false);
-        write_options.disable_wal(true);
+        // RocksDB WAL is required for durability even if data is flushed
+        write_options.disable_wal(false);
         write_options
     }
 
@@ -243,11 +234,30 @@ impl DatabaseColumnWrapper {
             ))
         })
     }
+
+    pub fn get_database(&self) -> Arc<RwLock<DB>> {
+        self.database.clone()
+    }
+
+    pub fn get_column_name(&self) -> &str {
+        &self.column_name
+    }
 }
 
 impl<'a> LockedDatabaseColumnWrapper<'a> {
-    pub fn iter(&self) -> OperationResult<DatabaseColumnIterator> {
+    pub fn iter(&'a self) -> OperationResult<DatabaseColumnIterator> {
         DatabaseColumnIterator::new(&self.guard, self.column_name)
+    }
+
+    pub fn iter_pending_deletes(
+        &'a self,
+        pending_deletes: Arc<Mutex<HashSet<Vec<u8>>>>,
+    ) -> OperationResult<DatabaseColumnScheduledDeleteWrapperIterator> {
+        DatabaseColumnScheduledDeleteWrapperIterator::new(
+            &self.guard,
+            self.column_name,
+            pending_deletes,
+        )
     }
 }
 

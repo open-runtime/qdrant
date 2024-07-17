@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
+use common::cpu::CpuPermit;
 use itertools::Itertools;
 use rand::prelude::StdRng;
 use rand::{Rng, SeedableRng};
@@ -8,15 +10,16 @@ use segment::data_types::vectors::{only_default_vector, QueryVector, DEFAULT_VEC
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::random_vector;
 use segment::index::hnsw_index::graph_links::GraphLinksRam;
-use segment::index::hnsw_index::hnsw::HNSWIndex;
+use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
+use segment::index::hnsw_index::num_rayon_threads;
 use segment::index::{PayloadIndex, VectorIndex};
+use segment::json_path::JsonPath;
 use segment::segment_constructor::build_segment;
 use segment::types::{
     Condition, Distance, FieldCondition, Filter, HnswConfig, Indexes, Payload, PayloadSchemaType,
     SearchParams, SegmentConfig, SeqNumberType, VectorDataConfig, VectorStorageType,
 };
-use segment::vector_storage::query::context_query::ContextPair;
-use segment::vector_storage::query::discovery_query::DiscoveryQuery;
+use segment::vector_storage::query::{ContextPair, DiscoveryQuery};
 use serde_json::json;
 use tempfile::Builder;
 
@@ -72,6 +75,8 @@ fn hnsw_discover_precision() {
                 storage_type: VectorStorageType::Memory,
                 index: Indexes::Plain {},
                 quantization_config: None,
+                multivector_config: None,
+                datatype: None,
             },
         )]),
         payload_storage_type: Default::default(),
@@ -100,19 +105,22 @@ fn hnsw_discover_precision() {
         payload_m: None,
     };
 
+    let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
+    let permit = Arc::new(CpuPermit::dummy(permit_cpu_count as u32));
+
     let vector_storage = &segment.vector_data[DEFAULT_VECTOR_NAME].vector_storage;
     let quantized_vectors = &segment.vector_data[DEFAULT_VECTOR_NAME].quantized_vectors;
-    let mut hnsw_index = HNSWIndex::<GraphLinksRam>::open(
-        hnsw_dir.path(),
-        segment.id_tracker.clone(),
-        vector_storage.clone(),
-        quantized_vectors.clone(),
-        payload_index_ptr.clone(),
+    let hnsw_index = HNSWIndex::<GraphLinksRam>::open(HnswIndexOpenArgs {
+        path: hnsw_dir.path(),
+        id_tracker: segment.id_tracker.clone(),
+        vector_storage: vector_storage.clone(),
+        quantized_vectors: quantized_vectors.clone(),
+        payload_index: payload_index_ptr.clone(),
         hnsw_config,
-    )
+        permit: Some(permit),
+        stopped: &stopped,
+    })
     .unwrap();
-
-    hnsw_index.build_index(&stopped).unwrap();
 
     let top = 3;
     let mut discovery_hits = 0;
@@ -129,14 +137,14 @@ fn hnsw_discover_precision() {
                     hnsw_ef: Some(ef),
                     ..Default::default()
                 }),
-                &false.into(),
+                &Default::default(),
             )
             .unwrap();
 
         let plain_discovery_result = segment.vector_data[DEFAULT_VECTOR_NAME]
             .vector_index
             .borrow()
-            .search(&[&query], None, top, None, &false.into())
+            .search(&[&query], None, top, None, &Default::default())
             .unwrap();
 
         if plain_discovery_result == index_discovery_result {
@@ -179,6 +187,8 @@ fn filtered_hnsw_discover_precision() {
                 storage_type: VectorStorageType::Memory,
                 index: Indexes::Plain {},
                 quantization_config: None,
+                multivector_config: None,
+                datatype: None,
             },
         )]),
         payload_storage_type: Default::default(),
@@ -204,6 +214,10 @@ fn filtered_hnsw_discover_precision() {
     }
 
     let payload_index_ptr = segment.payload_index.clone();
+    payload_index_ptr
+        .borrow_mut()
+        .set_indexed(&JsonPath::new(keyword_key), PayloadSchemaType::Keyword)
+        .unwrap();
 
     let hnsw_config = HnswConfig {
         m,
@@ -214,31 +228,29 @@ fn filtered_hnsw_discover_precision() {
         payload_m: None,
     };
 
+    let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
+    let permit = Arc::new(CpuPermit::dummy(permit_cpu_count as u32));
+
     let vector_storage = &segment.vector_data[DEFAULT_VECTOR_NAME].vector_storage;
     let quantized_vectors = &segment.vector_data[DEFAULT_VECTOR_NAME].quantized_vectors;
-    let mut hnsw_index = HNSWIndex::<GraphLinksRam>::open(
-        hnsw_dir.path(),
-        segment.id_tracker.clone(),
-        vector_storage.clone(),
-        quantized_vectors.clone(),
-        payload_index_ptr.clone(),
+    let hnsw_index = HNSWIndex::<GraphLinksRam>::open(HnswIndexOpenArgs {
+        path: hnsw_dir.path(),
+        id_tracker: segment.id_tracker.clone(),
+        vector_storage: vector_storage.clone(),
+        quantized_vectors: quantized_vectors.clone(),
+        payload_index: payload_index_ptr.clone(),
         hnsw_config,
-    )
+        permit: Some(permit),
+        stopped: &stopped,
+    })
     .unwrap();
-
-    payload_index_ptr
-        .borrow_mut()
-        .set_indexed(keyword_key, PayloadSchemaType::Keyword.into())
-        .unwrap();
-
-    hnsw_index.build_index(&stopped).unwrap();
 
     let top = 3;
     let mut discovery_hits = 0;
     let attempts = 100;
     for _i in 0..attempts {
         let filter = Filter::new_must(Condition::Field(FieldCondition::new_match(
-            keyword_key.to_owned(),
+            JsonPath::new(keyword_key),
             get_random_keyword_of(num_payload_values, &mut rnd).into(),
         )));
 
@@ -255,14 +267,14 @@ fn filtered_hnsw_discover_precision() {
                     hnsw_ef: Some(ef),
                     ..Default::default()
                 }),
-                &false.into(),
+                &Default::default(),
             )
             .unwrap();
 
         let plain_discovery_result = segment.vector_data[DEFAULT_VECTOR_NAME]
             .vector_index
             .borrow()
-            .search(&[&query], filter_query, top, None, &false.into())
+            .search(&[&query], filter_query, top, None, &Default::default())
             .unwrap();
 
         if plain_discovery_result == index_discovery_result {

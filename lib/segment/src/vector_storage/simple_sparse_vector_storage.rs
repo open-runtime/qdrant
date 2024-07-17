@@ -2,12 +2,10 @@ use std::ops::Range;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use atomic_refcell::AtomicRefCell;
 use bitvec::prelude::{BitSlice, BitVec};
 use common::types::PointOffsetType;
 use parking_lot::RwLock;
 use rocksdb::DB;
-use serde::{Deserialize, Serialize};
 use sparse::common::sparse_vector::SparseVector;
 
 use super::SparseVectorStorage;
@@ -16,16 +14,19 @@ use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
 use crate::common::Flusher;
 use crate::data_types::named_vectors::CowVector;
 use crate::data_types::vectors::VectorRef;
-use crate::types::Distance;
+use crate::types::{Distance, VectorStorageDatatype};
 use crate::vector_storage::bitvec::bitvec_set_deleted;
+use crate::vector_storage::common::StoredRecord;
 use crate::vector_storage::{VectorStorage, VectorStorageEnum};
 
 pub const SPARSE_VECTOR_DISTANCE: Distance = Distance::Dot;
 
+type StoredSparseVector = StoredRecord<SparseVector>;
+
 /// In-memory vector storage with on-update persistence using `store`
+#[derive(Debug)]
 pub struct SimpleSparseVectorStorage {
     db_wrapper: DatabaseColumnWrapper,
-    update_buffer: StoredRecord,
     /// BitVec for deleted flags. Grows dynamically upto last set flag.
     deleted: BitVec,
     /// Current number of deleted vectors.
@@ -35,17 +36,11 @@ pub struct SimpleSparseVectorStorage {
     total_sparse_size: usize,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct StoredRecord {
-    pub deleted: bool,
-    pub vector: SparseVector,
-}
-
-#[allow(unused)]
 pub fn open_simple_sparse_vector_storage(
     database: Arc<RwLock<DB>>,
     database_column_name: &str,
-) -> OperationResult<Arc<AtomicRefCell<VectorStorageEnum>>> {
+    stopped: &AtomicBool,
+) -> OperationResult<VectorStorageEnum> {
     let (mut deleted, mut deleted_count) = (BitVec::new(), 0);
     let db_wrapper = DatabaseColumnWrapper::new(database, database_column_name);
 
@@ -55,7 +50,7 @@ pub fn open_simple_sparse_vector_storage(
     for (key, value) in db_wrapper.lock_db().iter()? {
         let point_id: PointOffsetType = bincode::deserialize(&key)
             .map_err(|_| OperationError::service_error("cannot deserialize point id from db"))?;
-        let stored_record: StoredRecord = bincode::deserialize(&value)
+        let stored_record: StoredSparseVector = bincode::deserialize(&value)
             .map_err(|_| OperationError::service_error("cannot deserialize record from db"))?;
 
         // Propagate deleted flag
@@ -65,21 +60,17 @@ pub fn open_simple_sparse_vector_storage(
         }
         total_vector_count = std::cmp::max(total_vector_count, point_id as usize + 1);
         total_sparse_size += stored_record.vector.values.len();
+
+        check_process_stopped(stopped)?;
     }
 
-    Ok(Arc::new(AtomicRefCell::new(
-        VectorStorageEnum::SparseSimple(SimpleSparseVectorStorage {
-            db_wrapper,
-            update_buffer: StoredRecord {
-                deleted: false,
-                vector: SparseVector::default(),
-            },
-            deleted,
-            deleted_count,
-            total_vector_count,
-            total_sparse_size,
-        }),
-    )))
+    Ok(VectorStorageEnum::SparseSimple(SimpleSparseVectorStorage {
+        db_wrapper,
+        deleted,
+        deleted_count,
+        total_vector_count,
+        total_sparse_size,
+    }))
 }
 
 impl SimpleSparseVectorStorage {
@@ -107,15 +98,16 @@ impl SimpleSparseVectorStorage {
         vector: Option<&SparseVector>,
     ) -> OperationResult<()> {
         // Write vector state to buffer record
-        let record = &mut self.update_buffer;
-        record.deleted = deleted;
+        let record = StoredSparseVector {
+            deleted,
+            vector: vector.cloned().unwrap_or_default(),
+        };
         if let Some(vector) = vector {
             if deleted {
                 self.total_sparse_size = self.total_sparse_size.saturating_sub(vector.values.len());
             } else {
                 self.total_sparse_size += vector.values.len();
             }
-            record.vector = vector.clone();
         }
 
         // Store updated record
@@ -126,21 +118,6 @@ impl SimpleSparseVectorStorage {
 
         Ok(())
     }
-
-    /// Estimate average vector size based on total number of non-zero elements in all vectors.
-    ///
-    /// This is needed because the optimizer relies on the vector dimension * size_of_f32 * point_count to
-    /// trigger reindexing and on_disk data move.
-    /// TODO(sparse) get a separate function to get the vector storage instead for the optimizer
-    pub fn get_average_dimension(&self) -> usize {
-        if self.total_vector_count == 0 {
-            // default dimension to play nice with optimizers
-            1
-        } else {
-            // multiply by 2 to account for indices & values
-            (self.total_sparse_size / self.total_vector_count) * 2
-        }
-    }
 }
 
 impl SparseVectorStorage for SimpleSparseVectorStorage {
@@ -148,7 +125,7 @@ impl SparseVectorStorage for SimpleSparseVectorStorage {
         let bin_key = bincode::serialize(&key)
             .map_err(|_| OperationError::service_error("Cannot serialize sparse vector key"))?;
         let data = self.db_wrapper.get(bin_key)?;
-        let record: StoredRecord = bincode::deserialize(&data).map_err(|_| {
+        let record: StoredSparseVector = bincode::deserialize(&data).map_err(|_| {
             OperationError::service_error("Cannot deserialize sparse vector from db")
         })?;
         Ok(record.vector)
@@ -156,13 +133,12 @@ impl SparseVectorStorage for SimpleSparseVectorStorage {
 }
 
 impl VectorStorage for SimpleSparseVectorStorage {
-    fn vector_dim(&self) -> usize {
-        // estimate average vector size
-        self.get_average_dimension()
-    }
-
     fn distance(&self) -> Distance {
         SPARSE_VECTOR_DISTANCE
+    }
+
+    fn datatype(&self) -> VectorStorageDatatype {
+        VectorStorageDatatype::Float32
     }
 
     fn is_on_disk(&self) -> bool {
@@ -173,12 +149,20 @@ impl VectorStorage for SimpleSparseVectorStorage {
         self.total_vector_count
     }
 
-    fn get_vector(&self, key: PointOffsetType) -> CowVector {
-        self.get_vector_opt(key).expect("Vector must exist")
+    fn available_size_in_bytes(&self) -> usize {
+        self.total_sparse_size * (std::mem::size_of::<f32>() + std::mem::size_of::<u32>())
     }
 
+    fn get_vector(&self, key: PointOffsetType) -> CowVector {
+        let vector = self.get_vector_opt(key);
+        debug_assert!(vector.is_some());
+        vector.unwrap_or_else(CowVector::default_sparse)
+    }
+
+    /// Get vector by key, if it exists.
+    ///
+    /// ignore any error
     fn get_vector_opt(&self, key: PointOffsetType) -> Option<CowVector> {
-        // ignore any error
         self.get_sparse(key).ok().map(CowVector::from)
     }
 
@@ -194,7 +178,7 @@ impl VectorStorage for SimpleSparseVectorStorage {
     fn update_from(
         &mut self,
         other: &VectorStorageEnum,
-        other_ids: &mut dyn Iterator<Item = PointOffsetType>,
+        other_ids: &mut impl Iterator<Item = PointOffsetType>,
         stopped: &AtomicBool,
     ) -> OperationResult<Range<PointOffsetType>> {
         let start_index = self.total_vector_count as PointOffsetType;

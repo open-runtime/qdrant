@@ -23,6 +23,7 @@ use super::{validate, validate_and_log};
 use crate::common;
 use crate::common::collections::{do_create_snapshot, do_list_snapshots};
 use crate::common::http_client::HttpClient;
+use crate::tonic::auth::extract_access;
 
 pub struct SnapshotsService {
     dispatcher: Arc<Dispatcher>,
@@ -38,15 +39,23 @@ impl SnapshotsService {
 impl Snapshots for SnapshotsService {
     async fn create(
         &self,
-        request: Request<CreateSnapshotRequest>,
+        mut request: Request<CreateSnapshotRequest>,
     ) -> Result<Response<CreateSnapshotResponse>, Status> {
         validate(request.get_ref())?;
+        let access = extract_access(&mut request);
         let collection_name = request.into_inner().collection_name;
         let timing = Instant::now();
         let dispatcher = self.dispatcher.clone();
-        let response = do_create_snapshot(&dispatcher, &collection_name, true)
-            .await
-            .map_err(error_to_status)?;
+        let response = async move {
+            do_create_snapshot(
+                Arc::clone(dispatcher.toc(&access)),
+                access,
+                &collection_name,
+            )?
+            .await?
+        }
+        .await
+        .map_err(error_to_status)?;
         Ok(Response::new(CreateSnapshotResponse {
             snapshot_description: Some(response.into()),
             time: timing.elapsed().as_secs_f64(),
@@ -55,13 +64,14 @@ impl Snapshots for SnapshotsService {
 
     async fn list(
         &self,
-        request: Request<ListSnapshotsRequest>,
+        mut request: Request<ListSnapshotsRequest>,
     ) -> Result<Response<ListSnapshotsResponse>, Status> {
         validate(request.get_ref())?;
-        let collection_name = request.into_inner().collection_name;
+        let access = extract_access(&mut request);
+        let ListSnapshotsRequest { collection_name } = request.into_inner();
 
         let timing = Instant::now();
-        let snapshots = do_list_snapshots(&self.dispatcher, &collection_name)
+        let snapshots = do_list_snapshots(self.dispatcher.toc(&access), access, &collection_name)
             .await
             .map_err(error_to_status)?;
         Ok(Response::new(ListSnapshotsResponse {
@@ -72,18 +82,27 @@ impl Snapshots for SnapshotsService {
 
     async fn delete(
         &self,
-        request: Request<DeleteSnapshotRequest>,
+        mut request: Request<DeleteSnapshotRequest>,
     ) -> Result<Response<DeleteSnapshotResponse>, Status> {
         validate(request.get_ref())?;
+        let access = extract_access(&mut request);
         let DeleteSnapshotRequest {
             collection_name,
             snapshot_name,
         } = request.into_inner();
         let timing = Instant::now();
-        let _response =
-            do_delete_collection_snapshot(&self.dispatcher, &collection_name, &snapshot_name, true)
-                .await
-                .map_err(error_to_status)?;
+        let _response = async move {
+            do_delete_collection_snapshot(
+                &self.dispatcher,
+                access,
+                &collection_name,
+                &snapshot_name,
+            )
+            .await?
+            .await?
+        }
+        .await
+        .map_err(error_to_status)?;
         Ok(Response::new(DeleteSnapshotResponse {
             time: timing.elapsed().as_secs_f64(),
         }))
@@ -91,26 +110,29 @@ impl Snapshots for SnapshotsService {
 
     async fn create_full(
         &self,
-        request: Request<CreateFullSnapshotRequest>,
+        mut request: Request<CreateFullSnapshotRequest>,
     ) -> Result<Response<CreateSnapshotResponse>, Status> {
         validate(request.get_ref())?;
         let timing = Instant::now();
-        let response = do_create_full_snapshot(&self.dispatcher, true)
+        let access = extract_access(&mut request);
+        let response = async move { do_create_full_snapshot(&self.dispatcher, access)?.await? }
             .await
             .map_err(error_to_status)?;
+
         Ok(Response::new(CreateSnapshotResponse {
-            snapshot_description: response.map(|x| x.into()),
+            snapshot_description: Some(response.into()),
             time: timing.elapsed().as_secs_f64(),
         }))
     }
 
     async fn list_full(
         &self,
-        request: Request<ListFullSnapshotsRequest>,
+        mut request: Request<ListFullSnapshotsRequest>,
     ) -> Result<Response<ListSnapshotsResponse>, Status> {
         validate(request.get_ref())?;
         let timing = Instant::now();
-        let snapshots = do_list_full_snapshots(&self.dispatcher)
+        let access = extract_access(&mut request);
+        let snapshots = do_list_full_snapshots(self.dispatcher.toc(&access), access)
             .await
             .map_err(error_to_status)?;
         Ok(Response::new(ListSnapshotsResponse {
@@ -121,14 +143,21 @@ impl Snapshots for SnapshotsService {
 
     async fn delete_full(
         &self,
-        request: Request<DeleteFullSnapshotRequest>,
+        mut request: Request<DeleteFullSnapshotRequest>,
     ) -> Result<Response<DeleteSnapshotResponse>, Status> {
         validate(request.get_ref())?;
+        let access = extract_access(&mut request);
         let snapshot_name = request.into_inner().snapshot_name;
         let timing = Instant::now();
-        let _response = do_delete_full_snapshot(&self.dispatcher, &snapshot_name, true)
-            .await
-            .map_err(error_to_status)?;
+        let _response = async move {
+            Ok(
+                do_delete_full_snapshot(&self.dispatcher, access, &snapshot_name)
+                    .await?
+                    .await?,
+            )
+        }
+        .await
+        .map_err(error_to_status)?;
         Ok(Response::new(DeleteSnapshotResponse {
             time: timing.elapsed().as_secs_f64(),
         }))
@@ -150,8 +179,9 @@ impl ShardSnapshotsService {
 impl ShardSnapshots for ShardSnapshotsService {
     async fn create(
         &self,
-        request: Request<CreateShardSnapshotRequest>,
+        mut request: Request<CreateShardSnapshotRequest>,
     ) -> Result<Response<CreateSnapshotResponse>, Status> {
+        let access = extract_access(&mut request);
         let request = request.into_inner();
         validate_and_log(&request);
 
@@ -159,6 +189,7 @@ impl ShardSnapshots for ShardSnapshotsService {
 
         let snapshot_description = common::snapshots::create_shard_snapshot(
             self.toc.clone(),
+            access,
             request.collection_name,
             request.shard_id,
         )
@@ -173,8 +204,9 @@ impl ShardSnapshots for ShardSnapshotsService {
 
     async fn list(
         &self,
-        request: Request<ListShardSnapshotsRequest>,
+        mut request: Request<ListShardSnapshotsRequest>,
     ) -> Result<Response<ListSnapshotsResponse>, Status> {
+        let access = extract_access(&mut request);
         let request = request.into_inner();
         validate_and_log(&request);
 
@@ -182,6 +214,7 @@ impl ShardSnapshots for ShardSnapshotsService {
 
         let snapshot_descriptions = common::snapshots::list_shard_snapshots(
             self.toc.clone(),
+            access,
             request.collection_name,
             request.shard_id,
         )
@@ -196,8 +229,9 @@ impl ShardSnapshots for ShardSnapshotsService {
 
     async fn delete(
         &self,
-        request: Request<DeleteShardSnapshotRequest>,
+        mut request: Request<DeleteShardSnapshotRequest>,
     ) -> Result<Response<DeleteSnapshotResponse>, Status> {
+        let access = extract_access(&mut request);
         let request = request.into_inner();
         validate_and_log(&request);
 
@@ -205,6 +239,7 @@ impl ShardSnapshots for ShardSnapshotsService {
 
         common::snapshots::delete_shard_snapshot(
             self.toc.clone(),
+            access,
             request.collection_name,
             request.shard_id,
             request.snapshot_name,
@@ -219,8 +254,9 @@ impl ShardSnapshots for ShardSnapshotsService {
 
     async fn recover(
         &self,
-        request: Request<RecoverShardSnapshotRequest>,
+        mut request: Request<RecoverShardSnapshotRequest>,
     ) -> Result<Response<RecoverSnapshotResponse>, Status> {
+        let access = extract_access(&mut request);
         let request = request.into_inner();
         validate_and_log(&request);
 
@@ -228,11 +264,14 @@ impl ShardSnapshots for ShardSnapshotsService {
 
         common::snapshots::recover_shard_snapshot(
             self.toc.clone(),
+            access,
             request.collection_name,
             request.shard_id,
             request.snapshot_location.try_into()?,
             request.snapshot_priority.try_into()?,
+            request.checksum,
             self.http_client.clone(),
+            request.api_key,
         )
         .await
         .map_err(error_to_status)?;

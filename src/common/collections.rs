@@ -1,10 +1,12 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use api::grpc::models::{CollectionDescription, CollectionsResponse};
+use api::grpc::qdrant::CollectionExists;
 use collection::config::ShardingMethod;
 use collection::operations::cluster_ops::{
     AbortTransferOperation, ClusterOperations, DropReplicaOperation, MoveShardOperation,
-    ReplicateShardOperation,
+    ReplicateShardOperation, RestartTransfer, RestartTransferOperation, StartResharding,
 };
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::snapshot_ops::SnapshotDescription;
@@ -12,24 +14,50 @@ use collection::operations::types::{
     AliasDescription, CollectionClusterInfo, CollectionInfo, CollectionsAliasesResponse,
 };
 use collection::shards::replica_set;
+use collection::shards::resharding::ReshardKey;
 use collection::shards::shard::{PeerId, ShardId, ShardsPlacement};
-use collection::shards::transfer::{ShardTransfer, ShardTransferKey};
+use collection::shards::transfer::{ShardTransfer, ShardTransferKey, ShardTransferRestart};
 use itertools::Itertools;
 use rand::prelude::SliceRandom;
 use storage::content_manager::collection_meta_ops::ShardTransferOperations::{Abort, Start};
 use storage::content_manager::collection_meta_ops::{
-    CollectionMetaOperations, CreateShardKey, DropShardKey, UpdateCollectionOperation,
+    CollectionMetaOperations, CreateShardKey, DropShardKey, ReshardingOperation,
+    ShardTransferOperations, UpdateCollectionOperation,
 };
 use storage::content_manager::errors::StorageError;
 use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
+use storage::rbac::{Access, AccessRequirements};
+use tokio::task::JoinHandle;
+
+pub async fn do_collection_exists(
+    toc: &TableOfContent,
+    access: Access,
+    name: &str,
+) -> Result<CollectionExists, StorageError> {
+    let collection_pass = access.check_collection_access(name, AccessRequirements::new())?;
+
+    // if this returns Ok, it means the collection exists.
+    // if not, we check that the error is NotFound
+    let Err(error) = toc.get_collection(&collection_pass).await else {
+        return Ok(CollectionExists { exists: true });
+    };
+    match error {
+        StorageError::NotFound { .. } => Ok(CollectionExists { exists: false }),
+        e => Err(e),
+    }
+}
 
 pub async fn do_get_collection(
     toc: &TableOfContent,
+    access: Access,
     name: &str,
     shard_selection: Option<ShardId>,
 ) -> Result<CollectionInfo, StorageError> {
-    let collection = toc.get_collection(name).await?;
+    let collection_pass =
+        access.check_collection_access(name, AccessRequirements::new().whole())?;
+
+    let collection = toc.get_collection(&collection_pass).await?;
 
     let shard_selection = match shard_selection {
         None => ShardSelectorInternal::All,
@@ -39,15 +67,20 @@ pub async fn do_get_collection(
     Ok(collection.info(&shard_selection).await?)
 }
 
-pub async fn do_list_collections(toc: &TableOfContent) -> CollectionsResponse {
+pub async fn do_list_collections(
+    toc: &TableOfContent,
+    access: Access,
+) -> Result<CollectionsResponse, StorageError> {
     let collections = toc
-        .all_collections()
+        .all_collections(&access)
         .await
         .into_iter()
-        .map(|name| CollectionDescription { name })
+        .map(|pass| CollectionDescription {
+            name: pass.name().to_string(),
+        })
         .collect_vec();
 
-    CollectionsResponse { collections }
+    Ok(CollectionsResponse { collections })
 }
 
 /// Construct shards-replicas layout for the shard from the given scope of peers
@@ -91,60 +124,66 @@ fn generate_even_placement(
 
 pub async fn do_list_collection_aliases(
     toc: &TableOfContent,
+    access: Access,
     collection_name: &str,
 ) -> Result<CollectionsAliasesResponse, StorageError> {
-    let mut aliases: Vec<AliasDescription> = Default::default();
-    for alias in toc.collection_aliases(collection_name).await? {
-        aliases.push(AliasDescription {
-            alias_name: alias.to_string(),
+    let collection_pass =
+        access.check_collection_access(collection_name, AccessRequirements::new())?;
+    let aliases: Vec<AliasDescription> = toc
+        .collection_aliases(&collection_pass, &access)
+        .await?
+        .into_iter()
+        .map(|alias| AliasDescription {
+            alias_name: alias,
             collection_name: collection_name.to_string(),
-        });
-    }
+        })
+        .collect();
     Ok(CollectionsAliasesResponse { aliases })
 }
 
 pub async fn do_list_aliases(
     toc: &TableOfContent,
+    access: Access,
 ) -> Result<CollectionsAliasesResponse, StorageError> {
-    let aliases = toc.list_aliases().await?;
+    let aliases = toc.list_aliases(&access).await?;
     Ok(CollectionsAliasesResponse { aliases })
 }
 
 pub async fn do_list_snapshots(
     toc: &TableOfContent,
+    access: Access,
     collection_name: &str,
 ) -> Result<Vec<SnapshotDescription>, StorageError> {
+    let collection_pass =
+        access.check_collection_access(collection_name, AccessRequirements::new().whole())?;
     Ok(toc
-        .get_collection(collection_name)
+        .get_collection(&collection_pass)
         .await?
         .list_snapshots()
         .await?)
 }
 
-pub async fn do_create_snapshot(
-    dispatcher: &Dispatcher,
+pub fn do_create_snapshot(
+    toc: Arc<TableOfContent>,
+    access: Access,
     collection_name: &str,
-    wait: bool,
-) -> Result<SnapshotDescription, StorageError> {
-    let collection = collection_name.to_string();
-    let dispatcher = dispatcher.clone();
-    let snapshot = tokio::spawn(async move { dispatcher.create_snapshot(&collection).await });
-    if wait {
-        Ok(snapshot.await??)
-    } else {
-        Ok(SnapshotDescription {
-            name: "".to_string(),
-            creation_time: None,
-            size: 0,
-        })
-    }
+) -> Result<JoinHandle<Result<SnapshotDescription, StorageError>>, StorageError> {
+    let collection_pass = access
+        .check_collection_access(collection_name, AccessRequirements::new().write().whole())?
+        .into_static();
+    Ok(tokio::spawn(async move {
+        toc.create_snapshot(&collection_pass).await
+    }))
 }
 
 pub async fn do_get_collection_cluster(
     toc: &TableOfContent,
+    access: Access,
     name: &str,
 ) -> Result<CollectionClusterInfo, StorageError> {
-    let collection = toc.get_collection(name).await?;
+    let collection_pass =
+        access.check_collection_access(name, AccessRequirements::new().whole())?;
+    let collection = toc.get_collection(&collection_pass).await?;
     Ok(collection.cluster_info(toc.this_peer_id).await?)
 }
 
@@ -152,8 +191,14 @@ pub async fn do_update_collection_cluster(
     dispatcher: &Dispatcher,
     collection_name: String,
     operation: ClusterOperations,
+    access: Access,
     wait_timeout: Option<Duration>,
 ) -> Result<bool, StorageError> {
+    let collection_pass = access.check_collection_access(
+        &collection_name,
+        AccessRequirements::new().write().manage().whole(),
+    )?;
+
     if dispatcher.consensus_state().is_none() {
         return Err(StorageError::BadRequest {
             description: "Distributed mode disabled".to_string(),
@@ -187,7 +232,10 @@ pub async fn do_update_collection_cluster(
         Ok(())
     };
 
-    let collection = dispatcher.get_collection(&collection_name).await?;
+    let collection = dispatcher
+        .toc(&access)
+        .get_collection(&collection_pass)
+        .await?;
 
     match operation {
         ClusterOperations::MoveShard(MoveShardOperation { move_shard }) => {
@@ -212,12 +260,14 @@ pub async fn do_update_collection_cluster(
                         collection_name,
                         Start(ShardTransfer {
                             shard_id: move_shard.shard_id,
+                            to_shard_id: move_shard.to_shard_id,
                             to: move_shard.to_peer_id,
                             from: move_shard.from_peer_id,
                             sync: false,
                             method: move_shard.method,
                         }),
                     ),
+                    access,
                     wait_timeout,
                 )
                 .await
@@ -246,12 +296,14 @@ pub async fn do_update_collection_cluster(
                         collection_name,
                         Start(ShardTransfer {
                             shard_id: replicate_shard.shard_id,
+                            to_shard_id: replicate_shard.to_shard_id,
                             to: replicate_shard.to_peer_id,
                             from: replicate_shard.from_peer_id,
                             sync: true,
                             method: replicate_shard.method,
                         }),
                     ),
+                    access,
                     wait_timeout,
                 )
                 .await
@@ -259,6 +311,7 @@ pub async fn do_update_collection_cluster(
         ClusterOperations::AbortTransfer(AbortTransferOperation { abort_transfer }) => {
             let transfer = ShardTransferKey {
                 shard_id: abort_transfer.shard_id,
+                to_shard_id: abort_transfer.to_shard_id,
                 to: abort_transfer.to_peer_id,
                 from: abort_transfer.from_peer_id,
             };
@@ -281,6 +334,7 @@ pub async fn do_update_collection_cluster(
                             reason: "user request".to_string(),
                         },
                     ),
+                    access,
                     wait_timeout,
                 )
                 .await
@@ -307,6 +361,7 @@ pub async fn do_update_collection_cluster(
             dispatcher
                 .submit_collection_meta_op(
                     CollectionMetaOperations::UpdateCollection(update_operation),
+                    access,
                     wait_timeout,
                 )
                 .await
@@ -379,6 +434,7 @@ pub async fn do_update_collection_cluster(
                         shard_key: create_sharding_key.shard_key,
                         placement: exact_placement,
                     }),
+                    access,
                     wait_timeout,
                 )
                 .await
@@ -416,6 +472,134 @@ pub async fn do_update_collection_cluster(
                         collection_name,
                         shard_key: drop_sharding_key.shard_key,
                     }),
+                    access,
+                    wait_timeout,
+                )
+                .await
+        }
+        ClusterOperations::RestartTransfer(RestartTransferOperation { restart_transfer }) => {
+            let RestartTransfer {
+                shard_id,
+                to_shard_id,
+                from_peer_id,
+                to_peer_id,
+                method,
+            } = restart_transfer;
+
+            let transfer_key = ShardTransferKey {
+                shard_id,
+                to_shard_id,
+                to: to_peer_id,
+                from: from_peer_id,
+            };
+
+            if !collection.check_transfer_exists(&transfer_key).await {
+                return Err(StorageError::NotFound {
+                    description: format!(
+                        "Shard transfer {} -> {} for collection {}:{} does not exist",
+                        transfer_key.from, transfer_key.to, collection_name, transfer_key.shard_id
+                    ),
+                });
+            }
+
+            dispatcher
+                .submit_collection_meta_op(
+                    CollectionMetaOperations::TransferShard(
+                        collection_name,
+                        ShardTransferOperations::Restart(ShardTransferRestart {
+                            shard_id,
+                            to_shard_id,
+                            to: to_peer_id,
+                            from: from_peer_id,
+                            method,
+                        }),
+                    ),
+                    access,
+                    wait_timeout,
+                )
+                .await
+        }
+        ClusterOperations::StartResharding(op) => {
+            let StartResharding { peer_id, shard_key } = op.start_resharding;
+
+            let peer_id = match peer_id {
+                Some(peer_id) => {
+                    validate_peer_exists(peer_id)?;
+                    peer_id
+                }
+
+                None => {
+                    // TODO(resharding): Select `peer_id` for resharding in a more reasonable way!?
+                    consensus_state
+                        .persistent
+                        .read()
+                        .peer_address_by_id
+                        .read()
+                        .keys()
+                        .copied()
+                        .next()
+                        .unwrap()
+                }
+            };
+
+            let collection_state = collection.state().await;
+
+            // TODO(resharding): Select `shard_id` for resharding in a more reasonable way?..
+            let shard_id = collection_state
+                .shards
+                .keys()
+                .copied()
+                .max()
+                .map_or(0, |id| id + 1);
+
+            if let Some(shard_key) = &shard_key {
+                if !collection_state.shards_key_mapping.contains_key(shard_key) {
+                    return Err(StorageError::bad_request(format!(
+                        "sharding key {shard_key} does not exists for collection {collection_name}"
+                    )));
+                }
+            }
+
+            if let Some(resharding) = &collection_state.resharding {
+                return Err(StorageError::bad_request(format!(
+                    "resharding {resharding:?} is already in progress \
+                     for collection {collection_name}"
+                )));
+            }
+
+            dispatcher
+                .submit_collection_meta_op(
+                    CollectionMetaOperations::Resharding(
+                        collection_name.clone(),
+                        ReshardingOperation::Start(ReshardKey {
+                            peer_id,
+                            shard_id,
+                            shard_key,
+                        }),
+                    ),
+                    access,
+                    wait_timeout,
+                )
+                .await
+        }
+        ClusterOperations::AbortResharding(_) => {
+            let Some(state) = collection.resharding_state().await else {
+                return Err(StorageError::bad_request(format!(
+                    "resharding is not in progress for collection {collection_name}"
+                )));
+            };
+
+            dispatcher
+                .submit_collection_meta_op(
+                    CollectionMetaOperations::Resharding(
+                        collection_name.clone(),
+                        ReshardingOperation::Abort(ReshardKey {
+                            peer_id: state.peer_id,
+                            shard_id: state.shard_id,
+                            shard_key: state.shard_key.clone(),
+                        }),
+                    ),
+                    access,
                     wait_timeout,
                 )
                 .await

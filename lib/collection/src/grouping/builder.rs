@@ -79,7 +79,7 @@ where
 
         let core_group_by = self
             .group_by
-            .into_core_group_request(
+            .into_query_group_request(
                 self.collection,
                 self.collection_by_name.clone(),
                 self.read_consistency,
@@ -116,7 +116,9 @@ where
 
             // Put the lookups in their respective groups
             groups.iter_mut().for_each(|group| {
-                group.lookup = lookups.remove(&PseudoId::from(group.id.clone()));
+                group.lookup = lookups
+                    .remove(&PseudoId::from(group.id.clone()))
+                    .map(api::rest::Record::from);
             });
         }
 

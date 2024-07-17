@@ -29,6 +29,8 @@ pub fn build_simple_segment(
                     storage_type: VectorStorageType::Memory,
                     index: Indexes::Plain {},
                     quantization_config: None,
+                    multivector_config: None,
+                    datatype: None,
                 },
             )]),
             sparse_vector_data: Default::default(),
@@ -53,6 +55,8 @@ pub fn build_multivec_segment(
             storage_type: VectorStorageType::Memory,
             index: Indexes::Plain {},
             quantization_config: None,
+            multivector_config: None,
+            datatype: None,
         },
     );
     vectors_config.insert(
@@ -63,6 +67,8 @@ pub fn build_multivec_segment(
             storage_type: VectorStorageType::Memory,
             index: Indexes::Plain {},
             quantization_config: None,
+            multivector_config: None,
+            datatype: None,
         },
     );
 
@@ -108,7 +114,7 @@ mod tests {
         let vec5 = vec![1.0, 0.0, 0.0, 0.0];
 
         match segment.upsert_point(1, 120.into(), only_default_vector(&wrong_vec)) {
-            Err(OperationError::WrongVector { .. }) => (),
+            Err(OperationError::WrongVectorDimension { .. }) => (),
             Err(_) => panic!("Wrong error"),
             Ok(_) => panic!("Operation with wrong vector should fail"),
         };
@@ -134,6 +140,7 @@ mod tests {
                 3,
                 1.into(),
                 &json!({ "color": vec!["red".to_owned(), "green".to_owned()] }).into(),
+                &None,
             )
             .unwrap();
 
@@ -142,6 +149,7 @@ mod tests {
                 3,
                 2.into(),
                 &json!({ "color": vec!["red".to_owned(), "blue".to_owned()] }).into(),
+                &None,
             )
             .unwrap();
 
@@ -150,6 +158,7 @@ mod tests {
                 3,
                 3.into(),
                 &json!({ "color": vec!["red".to_owned(), "yellow".to_owned()] }).into(),
+                &None,
             )
             .unwrap();
 
@@ -158,6 +167,7 @@ mod tests {
                 3,
                 4.into(),
                 &json!({ "color": vec!["red".to_owned(), "green".to_owned()] }).into(),
+                &None,
             )
             .unwrap();
 

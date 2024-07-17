@@ -1,10 +1,9 @@
-#![allow(deprecated)]
-
 #[cfg(feature = "web")]
 mod actix;
 mod common;
 mod consensus;
 mod greeting;
+mod issues_setup;
 mod migrations;
 mod settings;
 mod snapshots;
@@ -18,6 +17,7 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use ::common::cpu::{get_cpu_budget, CpuBudget};
 use ::tonic::transport::Uri;
 use api::grpc::transport_channel_pool::TransportChannelPool;
 use clap::Parser;
@@ -31,7 +31,11 @@ use storage::content_manager::consensus_manager::{ConsensusManager, ConsensusSta
 use storage::content_manager::toc::transfer::ShardTransferDispatcher;
 use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
-#[cfg(not(target_env = "msvc"))]
+use storage::rbac::Access;
+#[cfg(all(
+    not(target_env = "msvc"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 use tikv_jemallocator::Jemalloc;
 
 use crate::common::helpers::{
@@ -46,9 +50,14 @@ use crate::settings::Settings;
 use crate::snapshots::{recover_full_snapshot, recover_snapshots};
 use crate::startup::{remove_started_file_indicator, touch_started_file_indicator};
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(
+    not(target_env = "msvc"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
+
+const FULL_ACCESS: Access = Access::full("For main");
 
 /// Qdrant (read: quadrant ) is a vector similarity search engine.
 /// It provides a production-ready service with a convenient API to store, search, and manage points - vectors with an additional payload.
@@ -96,7 +105,7 @@ struct Args {
     /// Path to an alternative configuration file.
     /// Format: <config_file_path>
     ///
-    /// Default path : config/config.yaml
+    /// Default path: config/config.yaml
     #[arg(long, value_name = "PATH")]
     config_path: Option<String>,
 
@@ -131,7 +140,11 @@ fn main() -> anyhow::Result<()> {
 
     let reporting_id = TelemetryCollector::generate_id();
 
-    tracing::setup(&settings.log_level)?;
+    let logger_handle = tracing::setup(
+        settings
+            .logger
+            .with_top_level_directive(settings.log_level.clone()),
+    )?;
 
     setup_panic_hook(reporting_enabled, reporting_id.to_string());
 
@@ -194,6 +207,11 @@ fn main() -> anyhow::Result<()> {
         create_general_purpose_runtime().expect("Can't optimizer general purpose runtime.");
     let runtime_handle = general_runtime.handle().clone();
 
+    // Use global CPU budget for optimizations based on settings
+    let optimizer_cpu_budget = CpuBudget::new(get_cpu_budget(
+        settings.storage.performance.optimizer_cpu_budget,
+    ));
+
     // Create a signal sender and receiver. It is used to communicate with the consensus thread.
     let (propose_sender, propose_receiver) = std::sync::mpsc::channel();
 
@@ -207,7 +225,8 @@ fn main() -> anyhow::Result<()> {
 
     // Channel service is used to manage connections between peers.
     // It allocates required number of channels and manages proper reconnection handling
-    let mut channel_service = ChannelService::new(settings.service.http_port);
+    let mut channel_service =
+        ChannelService::new(settings.service.http_port, settings.service.api_key.clone());
 
     if is_distributed_deployment {
         // We only need channel_service in case if cluster is enabled.
@@ -224,6 +243,7 @@ fn main() -> anyhow::Result<()> {
             tls_config,
         ));
         channel_service.id_to_address = persistent_consensus_state.peer_address_by_id.clone();
+        channel_service.id_to_metadata = persistent_consensus_state.peer_metadata_by_id.clone();
     }
 
     // Table of content manages the list of collections.
@@ -233,6 +253,7 @@ fn main() -> anyhow::Result<()> {
         search_runtime,
         update_runtime,
         general_runtime,
+        optimizer_cpu_budget,
         channel_service.clone(),
         persistent_consensus_state.this_peer_id(),
         propose_operation_sender.clone(),
@@ -242,8 +263,8 @@ fn main() -> anyhow::Result<()> {
 
     // Here we load all stored collections.
     runtime_handle.block_on(async {
-        for collection in toc.all_collections().await {
-            log::debug!("Loaded collection: {}", collection);
+        for collection in toc.all_collections(&FULL_ACCESS).await {
+            log::debug!("Loaded collection: {collection}");
         }
     });
 
@@ -290,6 +311,8 @@ fn main() -> anyhow::Result<()> {
             toc_arc.clone(),
             consensus_state.clone(),
             runtime_handle.clone(),
+            // NOTE: `wait_for_bootstrap` should be calculated *before* starting `Consensus` thread
+            consensus_state.is_new_deployment() && args.bootstrap.is_some(),
         ));
 
         let handle = Consensus::run(
@@ -326,8 +349,12 @@ fn main() -> anyhow::Result<()> {
         });
 
         let collections_to_recover_in_consensus = if is_new_deployment {
-            let existing_collections = runtime_handle.block_on(toc_arc.all_collections());
+            let existing_collections =
+                runtime_handle.block_on(toc_arc.all_collections(&FULL_ACCESS));
             existing_collections
+                .into_iter()
+                .map(|pass| pass.name().to_string())
+                .collect()
         } else {
             restored_collections
         };
@@ -370,6 +397,9 @@ fn main() -> anyhow::Result<()> {
         log::info!("Telemetry reporting disabled");
     }
 
+    // Setup subscribers to listen for issue-able events
+    issues_setup::setup_subscribers(&settings);
+
     // Helper to better log start errors
     let log_err_if_any = |server_name, result| match result {
         Err(err) => {
@@ -383,7 +413,7 @@ fn main() -> anyhow::Result<()> {
     // REST API server
     //
 
-    #[cfg(feature = "web")]
+    // #[cfg(feature = "web")]
     // {
     //     let dispatcher_arc = dispatcher_arc.clone();
     //     let settings = settings.clone();
@@ -397,6 +427,7 @@ fn main() -> anyhow::Result<()> {
     //                     telemetry_collector,
     //                     health_checker,
     //                     settings,
+    //                     logger_handle,
     //                 ),
     //             )
     //         })
@@ -410,6 +441,7 @@ fn main() -> anyhow::Result<()> {
 
     if let Some(grpc_port) = settings.service.grpc_port {
         let settings = settings.clone();
+        let toc_arc_clone = toc_arc.clone();
         let handle = thread::Builder::new()
             .name("grpc".to_string())
             .spawn(move || {
@@ -421,6 +453,7 @@ fn main() -> anyhow::Result<()> {
                         settings,
                         grpc_port,
                         runtime_handle,
+                        toc_arc_clone,
                     ),
                 )
             })

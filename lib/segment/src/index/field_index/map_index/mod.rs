@@ -1,13 +1,11 @@
-pub mod immutable_map_index;
-pub mod mutable_map_index;
-
 use std::fmt::Display;
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash};
 use std::str::FromStr;
 use std::sync::Arc;
 
 use common::types::PointOffsetType;
 use immutable_map_index::ImmutableMapIndex;
+use indexmap::IndexSet;
 use itertools::Itertools;
 use mutable_map_index::MutableMapIndex;
 use parking_lot::RwLock;
@@ -16,7 +14,7 @@ use serde_json::Value;
 use smol_str::SmolStr;
 
 use crate::common::operation_error::{OperationError, OperationResult};
-use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
+use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
 use crate::common::Flusher;
 use crate::index::field_index::stat_tools::number_of_selected_points;
 use crate::index::field_index::{
@@ -29,7 +27,10 @@ use crate::types::{
     PayloadKeyType, ValueVariants,
 };
 
-pub enum MapIndex<N: Hash + Eq + Clone + Display + FromStr> {
+pub mod immutable_map_index;
+pub mod mutable_map_index;
+
+pub enum MapIndex<N: Hash + Eq + Clone + Display + FromStr + Default> {
     Mutable(MutableMapIndex<N>),
     Immutable(ImmutableMapIndex<N>),
 }
@@ -43,7 +44,7 @@ impl<N: Hash + Eq + Clone + Display + FromStr + Default> MapIndex<N> {
         }
     }
 
-    fn get_db_wrapper(&self) -> &DatabaseColumnWrapper {
+    fn get_db_wrapper(&self) -> &DatabaseColumnScheduledDeleteWrapper {
         match self {
             MapIndex::Mutable(index) => index.get_db_wrapper(),
             MapIndex::Immutable(index) => index.get_db_wrapper(),
@@ -291,17 +292,20 @@ impl<N: Hash + Eq + Clone + Display + FromStr + Default> MapIndex<N> {
         }
     }
 
-    fn except_iterator<'a, Q>(
+    fn except_set<'a, A, K, S>(
         &'a self,
-        excluded: &'a [Q],
+        excluded: &'a IndexSet<K, A>,
     ) -> Box<dyn Iterator<Item = PointOffsetType> + 'a>
     where
-        Q: PartialEq<N>,
+        A: BuildHasher,
+        K: std::borrow::Borrow<S> + Hash + Eq,
+        N: std::borrow::Borrow<S>,
+        S: ?Sized + Hash + Eq,
     {
         Box::new(
             self.get_values_iterator()
-                .filter(|key| !excluded.iter().any(|e| e.eq(*key)))
-                .flat_map(|key| self.get_iterator(key))
+                .filter(|key| !excluded.contains((*key).borrow()))
+                .flat_map(|key| self.get_iterator(key.borrow()))
                 .unique(),
         )
     }
@@ -351,7 +355,7 @@ impl PayloadFieldIndex for MapIndex<SmolStr> {
             },
             Some(Match::Except(MatchExcept {
                 except: AnyVariants::Keywords(keywords),
-            })) => Ok(self.except_iterator(keywords)),
+            })) => Ok(self.except_set::<_, _, str>(keywords)),
             _ => Err(OperationError::service_error("failed to filter")),
         }
     }
@@ -465,7 +469,7 @@ impl PayloadFieldIndex for MapIndex<IntPayloadType> {
             },
             Some(Match::Except(MatchExcept {
                 except: AnyVariants::Integers(integers),
-            })) => Ok(self.except_iterator(integers)),
+            })) => Ok(self.except_set(integers)),
             _ => Err(OperationError::service_error("failed to filter")),
         }
     }

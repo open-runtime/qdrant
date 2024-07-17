@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # This test checks that Qdrant answers to all API mentioned in README.md as expected
 
 set -ex
@@ -89,8 +89,8 @@ curl -L -X POST "http://$QDRANT_HOST/collections/test_collection/points" \
       "ids": [1, 2]
     }' | jq
 
-SAVED_VECTORS_COUNT=$(curl --fail -s "http://$QDRANT_HOST/collections/test_collection" | jq '.result.vectors_count')
-[[ "$SAVED_VECTORS_COUNT" == "6" ]] || {
+SAVED_POINTS_COUNT=$(curl --fail -s "http://$QDRANT_HOST/collections/test_collection" | jq '.result.points_count')
+[[ "$SAVED_POINTS_COUNT" == "6" ]] || {
   echo 'check failed - 6 points expected'
   exit 1
 }

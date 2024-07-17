@@ -308,9 +308,7 @@ impl GraphLayersBuilder {
         let entry_point_opt = self
             .entry_points
             .lock()
-            .new_point(point_id, level, |point_id| {
-                points_scorer.check_vector(point_id)
-            });
+            .get_entry_point(|point_id| points_scorer.check_vector(point_id));
         match entry_point_opt {
             // New point is a new empty entry (for this filter, at least)
             // We can't do much here, so just quit
@@ -450,6 +448,11 @@ impl GraphLayersBuilder {
             }
         }
         self.ready_list.write().set(point_id as usize, true);
+        self.entry_points
+            .lock()
+            .new_point(point_id, level, |point_id| {
+                points_scorer.check_vector(point_id)
+            });
     }
 
     /// This function returns average number of links per node in HNSW graph
@@ -484,7 +487,7 @@ mod tests {
     use rand::SeedableRng;
 
     use super::*;
-    use crate::data_types::vectors::VectorElementType;
+    use crate::data_types::vectors::{DenseVector, VectorElementType};
     use crate::fixtures::index_fixtures::{
         random_vector, FakeFilterContext, TestRawScorerProducer,
     };
@@ -496,7 +499,7 @@ mod tests {
     const M: usize = 8;
 
     #[cfg(not(windows))]
-    fn parallel_graph_build<TMetric: Metric + Sync + Send, R>(
+    fn parallel_graph_build<TMetric: Metric<VectorElementType> + Sync + Send, R>(
         num_vectors: usize,
         dim: usize,
         use_heuristic: bool,
@@ -546,7 +549,7 @@ mod tests {
         (vector_holder, graph_layers)
     }
 
-    fn create_graph_layer<TMetric: Metric, R>(
+    fn create_graph_layer<TMetric: Metric<VectorElementType>, R>(
         num_vectors: usize,
         dim: usize,
         use_heuristic: bool,
@@ -632,7 +635,7 @@ mod tests {
 
         let top = 5;
         let query = random_vector(&mut rng, dim);
-        let processed_query = M::preprocess(query.clone());
+        let processed_query = <M as Metric<VectorElementType>>::preprocess(query.clone());
         let mut reference_top = FixedLengthPriorityQueue::new(top);
         for idx in 0..vector_holder.vectors.len() as PointOffsetType {
             let vec = &vector_holder.vectors.get(idx);
@@ -715,7 +718,7 @@ mod tests {
 
         let top = 5;
         let query = random_vector(&mut rng, dim);
-        let processed_query = M::preprocess(query.clone());
+        let processed_query = <M as Metric<VectorElementType>>::preprocess(query.clone());
         let mut reference_top = FixedLengthPriorityQueue::new(top);
         for idx in 0..vector_holder.vectors.len() as PointOffsetType {
             let vec = &vector_holder.vectors.get(idx);
@@ -836,7 +839,7 @@ mod tests {
         let ef_construct = 32;
 
         // See illustration in docs
-        let points: Vec<Vec<VectorElementType>> = vec![
+        let points: Vec<DenseVector> = vec![
             vec![21.79, 7.18],  // Target
             vec![20.58, 5.46],  // 1  B - yes
             vec![21.19, 4.51],  // 2  C

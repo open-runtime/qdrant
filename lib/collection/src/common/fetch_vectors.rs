@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::Debug;
 
+use api::rest::ShardKeySelector;
 use futures::future::try_join_all;
 use futures::Future;
 use segment::data_types::vectors::{Vector, VectorRef};
@@ -10,10 +12,13 @@ use crate::collection::Collection;
 use crate::common::batching::batch_requests;
 use crate::common::retrieve_request_trait::RetrieveRequest;
 use crate::operations::consistency_params::ReadConsistency;
-use crate::operations::shard_key_selector::ShardKeySelector;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::types::{
     CollectionError, CollectionResult, PointRequestInternal, RecommendExample, Record,
+};
+use crate::operations::universal_query::collection_query;
+use crate::operations::universal_query::collection_query::{
+    CollectionQueryRequest, CollectionQueryResolveRequest, VectorInput,
 };
 
 pub async fn retrieve_points(
@@ -64,15 +69,31 @@ pub async fn retrieve_points_with_locked_collection(
         }
     }
 }
-#[derive(Eq, PartialEq, Hash)]
-pub struct PointRef<'a> {
-    pub collection_name: Option<&'a String>,
-    pub point_id: PointIdType,
-}
 
 pub type CollectionName = String;
 
-#[derive(Default)]
+///
+///  ┌──────────────┐
+///  │              │  -> Batch request
+///  │ request(+ids)├───────┐   to storage
+///  │              │       │
+///  └──────────────┘       │
+///                         │
+///                         │
+///    Reference Vectors    ▼
+///  ┌──────────────────────────────┐
+///  │                              │
+///  │  ┌───────┐      ┌──────────┐ │
+///  │  │       │      │          │ │
+///  │  │  IDs  ├─────►│ Vectors  │ │
+///  │  │       │      │          │ │
+///  │  └───────┘      └──────────┘ │
+///  │                              │
+///  └──────────────────────────────┘
+///
+/// This is a temporary structure, which holds resolved references to vectors,
+/// mentioned in the query.
+#[derive(Default, Debug)]
 pub struct ReferencedVectors {
     collection_mapping: HashMap<CollectionName, HashMap<PointIdType, Record>>,
     default_mapping: HashMap<PointIdType, Record>,
@@ -105,10 +126,10 @@ impl ReferencedVectors {
 
     pub fn get(
         &self,
-        collection_name: &Option<&CollectionName>,
+        lookup_collection_name: &Option<&CollectionName>,
         point_id: PointIdType,
     ) -> Option<&Record> {
-        match collection_name {
+        match lookup_collection_name {
             None => self.default_mapping.get(&point_id),
             Some(collection) => {
                 let collection_mapping = self.collection_mapping.get(*collection)?;
@@ -116,19 +137,32 @@ impl ReferencedVectors {
             }
         }
     }
+
+    /// Convert potential reference to a vector (vector id) into actual vector,
+    /// which was resolved by the request to the storage.
+    pub fn resolve_reference<'a>(
+        &'a self,
+        collection_name: Option<&'a String>,
+        vector_name: &str,
+        vector_input: VectorInput,
+    ) -> Option<Vector> {
+        match vector_input {
+            VectorInput::Vector(vector) => Some(vector),
+            VectorInput::Id(vid) => {
+                let rec = self.get(&collection_name, vid)?;
+                rec.get_vector_by_name(vector_name).map(|v| v.to_owned())
+            }
+        }
+    }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct ReferencedPoints<'coll_name> {
     ids_per_collection: HashMap<Option<&'coll_name String>, HashSet<PointIdType>>,
     vector_names_per_collection: HashMap<Option<&'coll_name String>, HashSet<String>>,
 }
 
 impl<'coll_name> ReferencedPoints<'coll_name> {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.ids_per_collection.is_empty() && self.vector_names_per_collection.is_empty()
     }
@@ -279,7 +313,7 @@ where
         |(request, _)| request.get_lookup_shard_key(),
         |(request, _), referenced_points| {
             let collection_name = request.get_lookup_collection();
-            let vector_name = request.get_search_vector_name();
+            let vector_name = request.get_lookup_vector_name();
             let point_ids_iter = request.get_referenced_point_ids();
             referenced_points.add_from_iter(
                 point_ids_iter.into_iter(),
@@ -321,4 +355,46 @@ where
     }
 
     Ok(all_vectors_records_map)
+}
+
+/// This function is used to build a list of queries to resolve vectors for the given batch of query requests.
+/// For each request, one query is issue for the root request and one query for each nested prefetch.
+/// The resolver queries have no prefetches.
+pub fn build_vector_resolver_queries(
+    requests_batch: &Vec<(CollectionQueryRequest, ShardSelectorInternal)>,
+) -> Vec<(CollectionQueryResolveRequest, ShardSelectorInternal)> {
+    let mut resolve_prefetches = vec![];
+    for (request, shard_selector) in requests_batch {
+        build_vector_resolver_query(request, shard_selector)
+            .into_iter()
+            .for_each(|(resolve_request, shard_selector)| {
+                resolve_prefetches.push((resolve_request, shard_selector))
+            });
+    }
+    resolve_prefetches
+}
+
+pub fn build_vector_resolver_query<'a>(
+    request: &'a CollectionQueryRequest,
+    shard_selector: &'a ShardSelectorInternal,
+) -> Vec<(CollectionQueryResolveRequest<'a>, ShardSelectorInternal)> {
+    let mut resolve_prefetches = vec![];
+    // resolve query for root query
+    if let Some(collection_query::Query::Vector(vector_query)) = &request.query {
+        let resolve_root = CollectionQueryResolveRequest {
+            vector_query,
+            lookup_from: request.lookup_from.clone(),
+            using: request.using.clone(),
+        };
+        resolve_prefetches.push((resolve_root, shard_selector.clone()));
+    }
+
+    // flatten prefetches
+    for prefetch in &request.prefetch {
+        for flatten in prefetch.flatten_resolver_requests() {
+            resolve_prefetches.push((flatten, shard_selector.clone()));
+        }
+    }
+
+    resolve_prefetches
 }

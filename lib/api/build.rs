@@ -1,9 +1,18 @@
-use std::env;
 use std::path::PathBuf;
+use std::process::Command;
+use std::{env, str};
 
+use common::defaults;
 use tonic_build::Builder;
 
 fn main() -> std::io::Result<()> {
+    // Ensure Qdrant version is configured correctly
+    assert_eq!(
+        defaults::QDRANT_VERSION.to_string(),
+        env!("CARGO_PKG_VERSION"),
+        "crate version does not match with defaults.rs",
+    );
+
     let build_out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     // Build gRPC bits from proto file
@@ -22,6 +31,24 @@ fn main() -> std::io::Result<()> {
 
     // Append trait extension imports to generated gRPC output
     append_to_file("src/grpc/qdrant.rs", "use super::validate::ValidateExt;");
+
+    // Fetch git commit ID and pass it to the compiler
+    let git_commit_id =
+        option_env!("GIT_COMMIT_ID").map(Into::into).or_else(|| {
+            match Command::new("git").args(["rev-parse", "HEAD"]).output() {
+                Ok(output) if output.status.success() => {
+                    Some(str::from_utf8(&output.stdout).unwrap().trim().to_string())
+                }
+                _ => {
+                    println!("cargo:warning=current git commit hash could not be determined");
+                    None
+                }
+            }
+        });
+
+    if let Some(commit_id) = git_commit_id {
+        println!("cargo:rustc-env=GIT_COMMIT_ID={commit_id}");
+    }
 
     Ok(())
 }
@@ -83,9 +110,12 @@ impl BuilderExt for Builder {
 #[rustfmt::skip]
 fn configure_validation(builder: Builder) -> Builder {
     builder
+        // prost_wkt_types needed for serde support
+        .extern_path(".google.protobuf.Timestamp", "::prost_wkt_types::Timestamp")
         // Service: collections.proto
         .validates(&[
             ("GetCollectionInfoRequest.collection_name", "length(min = 1, max = 255)"),
+            ("CollectionExistsRequest.collection_name", "length(min = 1, max = 255)"),
             ("CreateCollection.collection_name", "length(min = 1, max = 255), custom = \"common::validation::validate_collection_name\""),
             ("CreateCollection.hnsw_config", ""),
             ("CreateCollection.wal_config", ""),
@@ -145,10 +175,13 @@ fn configure_validation(builder: Builder) -> Builder {
             ("InitiateShardTransferRequest.collection_name", "length(min = 1, max = 255)"),
             ("WaitForShardStateRequest.collection_name", "length(min = 1, max = 255)"),
             ("WaitForShardStateRequest.timeout", "range(min = 1)"),
+            ("GetShardRecoveryPointRequest.collection_name", "length(min = 1, max = 255)"),
+            ("UpdateShardCutoffPointRequest.collection_name", "length(min = 1, max = 255)"),
         ], &[])
         // Service: points.proto
         .validates(&[
             ("UpsertPoints.collection_name", "length(min = 1, max = 255)"),
+            ("UpsertPoints.points", ""),
             ("DeletePoints.collection_name", "length(min = 1, max = 255)"),
             ("UpdatePointVectors.collection_name", "length(min = 1, max = 255)"),
             ("UpdatePointVectors.vectors", "custom(function = \"crate::grpc::validate::validate_named_vectors_not_empty\", message = \"must specify vectors to update\")"),
@@ -164,7 +197,6 @@ fn configure_validation(builder: Builder) -> Builder {
             ("CreateFieldIndexCollection.field_name", "length(min = 1)"),
             ("DeleteFieldIndexCollection.collection_name", "length(min = 1, max = 255)"),
             ("DeleteFieldIndexCollection.field_name", "length(min = 1)"),
-            // TODO(sparse) validate sparse vector for `SearchPoints`
             ("SearchPoints.collection_name", "length(min = 1, max = 255)"),
             ("SearchPoints.filter", ""),
             ("SearchPoints.limit", "range(min = 1)"),
@@ -173,7 +205,6 @@ fn configure_validation(builder: Builder) -> Builder {
             ("SearchBatchPoints.collection_name", "length(min = 1, max = 255)"),
             ("SearchBatchPoints.search_points", ""),
             ("SearchBatchPoints.timeout", "custom = \"crate::grpc::validate::validate_u64_range_min_1\""),
-            // TODO(sparse) validate sparse vector for `SearchPointGroups`
             ("SearchPointGroups.collection_name", "length(min = 1, max = 255)"),
             ("SearchPointGroups.group_by", "length(min = 1)"),
             ("SearchPointGroups.filter", ""),
@@ -221,15 +252,21 @@ fn configure_validation(builder: Builder) -> Builder {
             ("Filter.must_not", ""),
             ("NestedCondition.filter", ""),
             ("Condition.condition_one_of", ""),
+            ("PointStruct.vectors", ""),
             ("Vectors.vectors_options", ""),
             ("NamedVectors.vectors", ""),
-            ("RecoQuery.positives", ""),
-            ("RecoQuery.negatives", ""),
-            ("ContextPair.positive", ""),
-            ("ContextPair.negative", ""),
-            ("DiscoveryQuery.target", ""),
-            ("DiscoveryQuery.context", ""),
-            ("ContextQuery.context", ""),
+            ("DatetimeRange.lt", "custom = \"crate::grpc::validate::validate_timestamp\""),
+            ("DatetimeRange.gt", "custom = \"crate::grpc::validate::validate_timestamp\""),
+            ("DatetimeRange.lte", "custom = \"crate::grpc::validate::validate_timestamp\""),
+            ("DatetimeRange.gte", "custom = \"crate::grpc::validate::validate_timestamp\""),
+            ("QueryPoints.collection_name", "length(min = 1, max = 255)"),
+            ("QueryPoints.limit", "custom = \"crate::grpc::validate::validate_u64_range_min_1\""),
+            ("QueryPoints.filter", ""),
+            ("QueryPoints.params", ""),
+            ("QueryPoints.timeout", "custom = \"crate::grpc::validate::validate_u64_range_min_1\""),
+            ("QueryBatchPoints.collection_name", "length(min = 1, max = 255)"),
+            ("QueryBatchPoints.query_points", ""),
+            ("QueryBatchPoints.timeout", "custom = \"crate::grpc::validate::validate_u64_range_min_1\""),
         ], &[])
         .type_attribute(".", "#[derive(serde::Serialize)]")
         // Service: points_internal_service.proto
@@ -252,12 +289,21 @@ fn configure_validation(builder: Builder) -> Builder {
             ("CoreSearchPoints.params", ""),
             ("CoreSearchBatchPointsInternal.collection_name", "length(min = 1, max = 255)"),
             ("CoreSearchBatchPointsInternal.search_points", ""),
+            ("RecoQuery.positives", ""),
+            ("RecoQuery.negatives", ""),
+            ("ContextPair.positive", ""),
+            ("ContextPair.negative", ""),
+            ("DiscoveryQuery.target", ""),
+            ("DiscoveryQuery.context", ""),
+            ("ContextQuery.context", ""),
             ("RecommendPointsInternal.recommend_points", ""),
             ("ScrollPointsInternal.scroll_points", ""),
             ("GetPointsInternal.get_points", ""),
             ("CountPointsInternal.count_points", ""),
             ("SyncPointsInternal.sync_points", ""),
             ("SyncPoints.collection_name", "length(min = 1, max = 255)"),
+            ("QueryBatchPointsInternal.collection_name", "length(min = 1, max = 255)"),
+            ("QueryBatchPointsInternal.timeout", "custom = \"crate::grpc::validate::validate_u64_range_min_1\""),
         ], &[])
         // Service: raft_service.proto
         .validates(&[
@@ -277,22 +323,19 @@ fn configure_validation(builder: Builder) -> Builder {
             ("DeleteShardSnapshotRequest.snapshot_name", "length(min = 1)"),
             ("RecoverShardSnapshotRequest.collection_name", "length(min = 1, max = 255)"),
             ("RecoverShardSnapshotRequest.snapshot_name", "length(min = 1)"),
+            ("RecoverShardSnapshotRequest.checksum", "custom = \"common::validation::validate_sha256_hash_option\""),
+            ("SnapshotDescription.creation_time", "custom = \"crate::grpc::validate::validate_timestamp\""),
         ], &[
             "CreateFullSnapshotRequest",
             "ListFullSnapshotsRequest",
         ])
-        .field_attribute("SnapshotDescription.creation_time", "#[serde(skip)]")
 }
 
 fn append_to_file(path: &str, line: &str) {
     use std::fs::OpenOptions;
     use std::io::prelude::*;
     writeln!(
-        OpenOptions::new()
-            .write(true)
-            .append(true)
-            .open(path)
-            .unwrap(),
+        OpenOptions::new().append(true).open(path).unwrap(),
         "{line}",
     )
     .unwrap()

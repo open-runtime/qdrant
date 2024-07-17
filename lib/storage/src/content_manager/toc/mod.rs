@@ -1,8 +1,10 @@
 mod collection_container;
+use common::types::TelemetryDetail;
 mod collection_meta_ops;
 mod create_collection;
 mod locks;
 mod point_ops;
+mod point_ops_internal;
 mod snapshots;
 mod temp_directories;
 pub mod transfer;
@@ -14,11 +16,7 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::Duration;
 
-use api::grpc::qdrant::qdrant_internal_client::QdrantInternalClient;
-use api::grpc::qdrant::WaitOnConsensusCommitRequest;
-use api::grpc::transport_channel_pool::AddTimeout;
 use collection::collection::{Collection, RequestShardTransfer};
 use collection::config::{default_replication_factor, CollectionConfig};
 use collection::operations::types::*;
@@ -27,14 +25,9 @@ use collection::shards::replica_set;
 use collection::shards::replica_set::{AbortShardTransfer, ReplicaState};
 use collection::shards::shard::{PeerId, ShardId};
 use collection::telemetry::CollectionTelemetry;
-use futures::future::try_join_all;
-use futures::Future;
-use segment::common::cpu::get_num_cpus;
+use common::cpu::{get_num_cpus, CpuBudget};
 use tokio::runtime::Runtime;
 use tokio::sync::{Mutex, RwLock, RwLockReadGuard, Semaphore};
-use tonic::codegen::InterceptedService;
-use tonic::transport::Channel;
-use tonic::Status;
 
 use self::transfer::ShardTransferDispatcher;
 use crate::content_manager::alias_mapping::AliasPersistence;
@@ -43,7 +36,8 @@ use crate::content_manager::collections_ops::{Checker, Collections};
 use crate::content_manager::consensus::operation_sender::OperationSender;
 use crate::content_manager::errors::StorageError;
 use crate::content_manager::shard_distribution::ShardDistributionProposal;
-use crate::types::{PeerAddressById, StorageConfig};
+use crate::rbac::{Access, AccessRequirements, CollectionPass};
+use crate::types::StorageConfig;
 use crate::ConsensusOperations;
 
 pub const ALIASES_PATH: &str = "aliases";
@@ -55,10 +49,13 @@ pub const FULL_SNAPSHOT_FILE_NAME: &str = "full-snapshot";
 /// the launch of the service.
 pub struct TableOfContent {
     collections: Arc<RwLock<Collections>>,
-    pub(super) storage_config: Arc<StorageConfig>,
+    pub(crate) storage_config: Arc<StorageConfig>,
     search_runtime: Runtime,
     update_runtime: Runtime,
     general_runtime: Runtime,
+    /// Global CPU budget in number of cores for all optimization tasks.
+    /// Assigns CPU permits to tasks to limit overall resource utilization.
+    optimizer_cpu_budget: CpuBudget,
     alias_persistence: RwLock<AliasPersistence>,
     pub this_peer_id: PeerId,
     channel_service: ChannelService,
@@ -87,6 +84,7 @@ impl TableOfContent {
         search_runtime: Runtime,
         update_runtime: Runtime,
         general_runtime: Runtime,
+        optimizer_cpu_budget: CpuBudget,
         channel_service: ChannelService,
         this_peer_id: PeerId,
         consensus_proposal_sender: Option<OperationSender>,
@@ -110,8 +108,8 @@ impl TableOfContent {
 
             if !CollectionConfig::check(&collection_path) {
                 log::warn!(
-                    "Collection config is not found in the collection directory: {:?}, skipping",
-                    collection_path
+                    "Collection config is not found in the collection directory: {}, skipping",
+                    collection_path.display(),
                 );
                 continue;
             }
@@ -127,7 +125,7 @@ impl TableOfContent {
             create_dir_all(&collection_snapshots_path).unwrap_or_else(|e| {
                 panic!("Can't create a directory for snapshot of {collection_name}: {e}")
             });
-            log::info!("Loading collection: {}", collection_name);
+            log::info!("Loading collection: {collection_name}");
             let collection = general_runtime.block_on(Collection::load(
                 collection_name.clone(),
                 this_peer_id,
@@ -153,6 +151,8 @@ impl TableOfContent {
                 ),
                 Some(search_runtime.handle().clone()),
                 Some(update_runtime.handle().clone()),
+                optimizer_cpu_budget.clone(),
+                storage_config.optimizers_overwrite.clone(),
             ));
 
             collections.insert(collection_name, collection);
@@ -169,8 +169,7 @@ impl TableOfContent {
                     // Select number of working threads as a guess.
                     let limit = max(get_num_cpus(), 2);
                     log::debug!(
-                        "Auto adjusting update rate limit to {} parallel update requests",
-                        limit
+                        "Auto adjusting update rate limit to {limit} parallel update requests"
                     );
                     Some(Semaphore::new(limit))
                 } else {
@@ -185,6 +184,7 @@ impl TableOfContent {
             search_runtime,
             update_runtime,
             general_runtime,
+            optimizer_cpu_budget,
             alias_persistence: RwLock::new(alias_persistence),
             this_peer_id,
             channel_service,
@@ -206,9 +206,19 @@ impl TableOfContent {
         &self.storage_config.storage_path
     }
 
-    /// List of all collections
-    pub async fn all_collections(&self) -> Vec<String> {
-        self.collections.read().await.keys().cloned().collect()
+    /// List of all collections to which the user has access
+    pub async fn all_collections(&self, access: &Access) -> Vec<CollectionPass<'static>> {
+        self.collections
+            .read()
+            .await
+            .keys()
+            .filter_map(|name| {
+                access
+                    .check_collection_access(name, AccessRequirements::new())
+                    .ok()
+                    .map(|pass| pass.into_static())
+            })
+            .collect()
     }
 
     /// List of all collections
@@ -220,7 +230,11 @@ impl TableOfContent {
             .collect()
     }
 
-    pub async fn get_collection(
+    /// Same as `get_collection`, but does not check access rights.
+    /// Intended for internal use only.
+    ///
+    /// **Do no make public**
+    async fn get_collection_unchecked(
         &self,
         collection_name: &str,
     ) -> Result<RwLockReadGuard<Collection>, StorageError> {
@@ -232,15 +246,22 @@ impl TableOfContent {
         };
         // resolve_name already checked collection existence, unwrap is safe here
         Ok(RwLockReadGuard::map(read_collection, |collection| {
-            collection.get(&real_collection_name).unwrap()
+            collection.get(&real_collection_name).unwrap() // TODO: WTF!?
         }))
+    }
+
+    pub async fn get_collection<'a>(
+        &self,
+        collection: &CollectionPass<'a>,
+    ) -> Result<RwLockReadGuard<Collection>, StorageError> {
+        self.get_collection_unchecked(collection.name()).await
     }
 
     async fn get_collection_opt(
         &self,
         collection_name: String,
     ) -> Option<RwLockReadGuard<Collection>> {
-        self.get_collection(&collection_name).await.ok()
+        self.get_collection_unchecked(&collection_name).await.ok()
     }
 
     /// Finds the original name of the collection
@@ -276,25 +297,34 @@ impl TableOfContent {
     /// List of all aliases for a given collection
     pub async fn collection_aliases(
         &self,
-        collection_name: &str,
+        collection_pass: &CollectionPass<'_>,
+        access: &Access,
     ) -> Result<Vec<String>, StorageError> {
-        let result = self
+        let mut result = self
             .alias_persistence
             .read()
             .await
-            .collection_aliases(collection_name);
+            .collection_aliases(collection_pass.name());
+        result.retain(|alias| {
+            access
+                .check_collection_access(alias, AccessRequirements::new())
+                .is_ok()
+        });
         Ok(result)
     }
 
     /// List of all aliases across all collections
-    pub async fn list_aliases(&self) -> Result<Vec<AliasDescription>, StorageError> {
-        let all_collections = self.all_collections().await;
+    pub async fn list_aliases(
+        &self,
+        access: &Access,
+    ) -> Result<Vec<AliasDescription>, StorageError> {
+        let all_collections = self.all_collections(access).await;
         let mut aliases: Vec<AliasDescription> = Default::default();
-        for collection_name in &all_collections {
-            for alias in self.collection_aliases(collection_name).await? {
+        for collection_pass in &all_collections {
+            for alias in self.collection_aliases(collection_pass, access).await? {
                 aliases.push(AliasDescription {
                     alias_name: alias.to_string(),
-                    collection_name: collection_name.to_string(),
+                    collection_name: collection_pass.to_string(),
                 });
             }
         }
@@ -350,15 +380,11 @@ impl TableOfContent {
     ) -> Result<(), StorageError> {
         // TODO: Ensure cancel safety!
 
-        log::info!(
-            "Initiating receiving shard {}:{}",
-            collection_name,
-            shard_id
-        );
+        log::info!("Initiating receiving shard {collection_name}:{shard_id}");
 
         // TODO: Ensure cancel safety!
         let initiate_shard_transfer_future = self
-            .get_collection(&collection_name)
+            .get_collection_unchecked(&collection_name)
             .await?
             .initiate_shard_transfer(shard_id);
         initiate_shard_transfer_future.await?;
@@ -395,12 +421,16 @@ impl TableOfContent {
         false
     }
 
-    pub async fn get_telemetry_data(&self) -> Vec<CollectionTelemetry> {
+    pub async fn get_telemetry_data(
+        &self,
+        detail: TelemetryDetail,
+        access: &Access,
+    ) -> Vec<CollectionTelemetry> {
         let mut result = Vec::new();
-        let all_collections = self.all_collections().await;
-        for collection_name in &all_collections {
-            if let Ok(collection) = self.get_collection(collection_name).await {
-                result.push(collection.get_telemetry_data().await);
+        let all_collections = self.all_collections(access).await;
+        for collection_pass in &all_collections {
+            if let Ok(collection) = self.get_collection(collection_pass).await {
+                result.push(collection.get_telemetry_data(detail).await);
             }
         }
         result
@@ -568,107 +598,6 @@ impl TableOfContent {
         Path::new(&self.storage_config.storage_path)
             .join(COLLECTIONS_DIR)
             .join(collection_name)
-    }
-
-    /// Wait until all other known peers reach the given commit
-    ///
-    /// # Errors
-    ///
-    /// This errors if:
-    /// - any of the peers is not on the same term
-    /// - waiting takes longer than the specified timeout
-    /// - any of the peers cannot be reached
-    pub async fn await_commit_on_all_peers(
-        &self,
-        commit: u64,
-        term: u64,
-        timeout: Duration,
-    ) -> Result<(), StorageError> {
-        let requests = self
-            .peer_address_by_id()
-            .keys()
-            .filter(|id| **id != self.this_peer_id)
-            // The collective timeout at the bottom of this function handles actually timing out.
-            // Since an explicit timeout must be given here as well, it is multiplied by two to
-            // give the collective timeout some space.
-            .map(|peer_id| self.await_commit_on_peer(*peer_id, commit, term, timeout * 2))
-            .collect::<Vec<_>>();
-        let responses = try_join_all(requests);
-
-        // Handle requests with timeout
-        tokio::time::timeout(timeout, responses)
-            .await
-            .map(|_| ())
-            .map_err(|_elapsed| StorageError::Timeout {
-                description: "Failed to wait for consensus commit on all peers, timed out.".into(),
-            })
-    }
-
-    fn peer_address_by_id(&self) -> PeerAddressById {
-        self.channel_service.id_to_address.read().clone()
-    }
-
-    /// Wait until the given peer reaches the given commit
-    ///
-    /// # Errors
-    ///
-    /// This errors if the given peer is on a different term. Also errors if the peer cannot be reached.
-    async fn await_commit_on_peer(
-        &self,
-        peer_id: PeerId,
-        commit: u64,
-        term: u64,
-        timeout: Duration,
-    ) -> Result<(), StorageError> {
-        let response = self
-            .with_qdrant_client(peer_id, |mut client| async move {
-                let request = WaitOnConsensusCommitRequest {
-                    commit: commit as i64,
-                    term: term as i64,
-                    timeout: timeout.as_secs() as i64,
-                };
-                client
-                    .wait_on_consensus_commit(tonic::Request::new(request))
-                    .await
-            })
-            .await
-            .map_err(|err| {
-                StorageError::service_error(format!(
-                    "Failed to wait for consensus commit on peer {peer_id}: {err}"
-                ))
-            })?
-            .into_inner();
-
-        // Create error if wait request failed
-        if !response.ok {
-            return Err(StorageError::service_error(format!(
-                "Failed to wait for consensus commit on peer {peer_id}, has diverged commit/term or timed out."
-            )));
-        }
-        Ok(())
-    }
-
-    async fn with_qdrant_client<T, O: Future<Output = Result<T, Status>>>(
-        &self,
-        peer_id: PeerId,
-        f: impl Fn(QdrantInternalClient<InterceptedService<Channel, AddTimeout>>) -> O,
-    ) -> Result<T, CollectionError> {
-        let address = self
-            .channel_service
-            .id_to_address
-            .read()
-            .get(&peer_id)
-            .ok_or_else(|| CollectionError::service_error("Address for peer ID is not found."))?
-            .clone();
-        self.channel_service
-            .channel_pool
-            .with_channel(&address, |channel| {
-                let client = QdrantInternalClient::new(channel);
-                let client = client.max_decoding_message_size(usize::MAX);
-                f(client)
-            })
-            .await
-            .map_err(Into::into)
     }
 
     /// Insert dispatcher into table of contents for shard transfer.

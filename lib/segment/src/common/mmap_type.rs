@@ -24,7 +24,7 @@
 
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::{mem, slice};
+use std::{fmt, mem, slice};
 
 use bitvec::slice::BitSlice;
 use memmap2::MmapMut;
@@ -72,6 +72,14 @@ where
     mmap: Arc<MmapMut>,
 }
 
+impl<T: ?Sized> fmt::Debug for MmapType<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MmapType")
+            .field("mmap", &self.mmap)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<T> MmapType<T>
 where
     T: Sized + 'static,
@@ -116,28 +124,6 @@ impl<T> MmapType<[T]>
 where
     T: 'static,
 {
-    /// Transform a mmap into a typed slice mmap of type `&[T]`.
-    ///
-    /// # Warning
-    ///
-    /// This does not support slices, because those cannot be transmuted directly because it has
-    /// extra parts. See [`MmapSlice`], [`MmapType::slice_from`] and
-    /// [`std::slice::from_raw_parts`].
-    ///
-    /// # Safety
-    ///
-    /// Unsafe because malformed data in the mmap may break type `T` resulting in undefined
-    /// behavior.
-    ///
-    /// # Panics
-    ///
-    /// - panics when the size of the mmap isn't a multiple of size `T`
-    /// - panics when the mmap data is not correctly aligned for type `T`
-    /// - See: [`mmap_to_slice_unbounded`]
-    pub unsafe fn slice_from(mmap_with_slice: MmapMut) -> Self {
-        Self::try_slice_from(mmap_with_slice).unwrap()
-    }
-
     /// Transform a mmap into a typed slice mmap of type `&[T]`.
     ///
     /// Returns an error when the mmap has an incorrect size.
@@ -220,6 +206,14 @@ where
     mmap: MmapType<[T]>,
 }
 
+impl<T> fmt::Debug for MmapSlice<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MmapSlice")
+            .field("mmap", &self.mmap)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<T> MmapSlice<T> {
     /// Transform a mmap into a typed slice mmap of type `&[T]`.
     ///
@@ -281,6 +275,7 @@ impl<T> DerefMut for MmapSlice<T> {
 /// [`BitSlice`] on a memory mapped file
 ///
 /// Functions as if it is a [`BitSlice`] because this implements [`Deref`] and [`DerefMut`].
+#[derive(Debug)]
 pub struct MmapBitSlice {
     mmap: MmapType<BitSlice>,
 }

@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 use std::fs::create_dir_all;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use atomic_refcell::AtomicRefCell;
-use common::types::{PointOffsetType, ScoredPointOffset};
+use common::types::{PointOffsetType, ScoredPointOffset, TelemetryDetail};
 use parking_lot::Mutex;
 use schemars::_serde_json::Value;
 
@@ -13,21 +12,22 @@ use crate::common::operation_error::OperationResult;
 use crate::common::operation_time_statistics::{
     OperationDurationStatistics, OperationDurationsAggregator, ScopeDurationMeasurer,
 };
-use crate::common::utils::JsonPathPayload;
-use crate::common::Flusher;
+use crate::common::{Flusher, BYTES_IN_KB};
+use crate::data_types::query_context::VectorQueryContext;
 use crate::data_types::vectors::{QueryVector, VectorRef};
 use crate::id_tracker::IdTrackerSS;
 use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition};
 use crate::index::payload_config::PayloadConfig;
 use crate::index::struct_payload_index::StructPayloadIndex;
 use crate::index::{PayloadIndex, VectorIndex};
+use crate::json_path::JsonPath;
 use crate::payload_storage::{ConditionCheckerSS, FilterContext};
 use crate::telemetry::VectorIndexSearchesTelemetry;
 use crate::types::{
     Filter, Payload, PayloadFieldSchema, PayloadKeyType, PayloadKeyTypeRef, PayloadSchemaType,
     SearchParams,
 };
-use crate::vector_storage::{new_stoppable_raw_scorer, VectorStorageEnum};
+use crate::vector_storage::{new_stoppable_raw_scorer, VectorStorage, VectorStorageEnum};
 
 /// Implementation of `PayloadIndex` which does not really indexes anything.
 ///
@@ -86,8 +86,10 @@ impl PayloadIndex for PlainPayloadIndex {
     fn set_indexed(
         &mut self,
         field: PayloadKeyTypeRef,
-        payload_schema: PayloadFieldSchema,
+        payload_schema: impl Into<PayloadFieldSchema>,
     ) -> OperationResult<()> {
+        let payload_schema = payload_schema.into();
+
         if let Some(prev_schema) = self
             .config
             .indexed_fields
@@ -122,7 +124,7 @@ impl PayloadIndex for PlainPayloadIndex {
     fn estimate_nested_cardinality(
         &self,
         query: &Filter,
-        _nested_path: &JsonPathPayload,
+        _nested_path: &JsonPath,
     ) -> CardinalityEstimation {
         self.estimate_cardinality(query)
     }
@@ -156,7 +158,12 @@ impl PayloadIndex for PlainPayloadIndex {
         Box::new(vec![].into_iter())
     }
 
-    fn assign(&mut self, _point_id: PointOffsetType, _payload: &Payload) -> OperationResult<()> {
+    fn assign(
+        &mut self,
+        _point_id: PointOffsetType,
+        _payload: &Payload,
+        _key: &Option<JsonPath>,
+    ) -> OperationResult<()> {
         unreachable!()
     }
 
@@ -196,6 +203,7 @@ impl PayloadIndex for PlainPayloadIndex {
     }
 }
 
+#[derive(Debug)]
 pub struct PlainIndex {
     id_tracker: Arc<AtomicRefCell<IdTrackerSS>>,
     vector_storage: Arc<AtomicRefCell<VectorStorageEnum>>,
@@ -218,6 +226,32 @@ impl PlainIndex {
             unfiltered_searches_telemetry: OperationDurationsAggregator::new(),
         }
     }
+
+    pub fn is_small_enough_for_unindexed_search(
+        &self,
+        search_optimized_threshold_kb: usize,
+        filter: Option<&Filter>,
+    ) -> bool {
+        let vector_storage = self.vector_storage.borrow();
+        let available_vector_count = vector_storage.available_vector_count();
+        if available_vector_count > 0 {
+            let vector_size_bytes =
+                vector_storage.available_size_in_bytes() / available_vector_count;
+            let indexing_threshold_bytes = search_optimized_threshold_kb * BYTES_IN_KB;
+
+            if let Some(payload_filter) = filter {
+                let payload_index = self.payload_index.borrow();
+                let cardinality = payload_index.estimate_cardinality(payload_filter);
+                let scan_size = vector_size_bytes.saturating_mul(cardinality.max);
+                scan_size <= indexing_threshold_bytes
+            } else {
+                let vector_storage_size = vector_size_bytes.saturating_mul(available_vector_count);
+                vector_storage_size <= indexing_threshold_bytes
+            }
+        } else {
+            true
+        }
+    }
 }
 
 impl VectorIndex for PlainIndex {
@@ -226,9 +260,21 @@ impl VectorIndex for PlainIndex {
         vectors: &[&QueryVector],
         filter: Option<&Filter>,
         top: usize,
-        _params: Option<&SearchParams>,
-        is_stopped: &AtomicBool,
+        params: Option<&SearchParams>,
+        query_context: &VectorQueryContext,
     ) -> OperationResult<Vec<Vec<ScoredPointOffset>>> {
+        let is_indexed_only = params.map(|p| p.indexed_only).unwrap_or(false);
+        if is_indexed_only
+            && !self.is_small_enough_for_unindexed_search(
+                query_context.search_optimized_threshold_kb(),
+                filter,
+            )
+        {
+            return Ok(vec![vec![]; vectors.len()]);
+        }
+
+        let is_stopped = query_context.is_stopped();
+
         match filter {
             Some(filter) => {
                 let _timer = ScopeDurationMeasurer::new(&self.filtered_searches_telemetry);
@@ -236,14 +282,17 @@ impl VectorIndex for PlainIndex {
                 let payload_index = self.payload_index.borrow();
                 let vector_storage = self.vector_storage.borrow();
                 let filtered_ids_vec = payload_index.query_points(filter);
+                let deleted_points = query_context
+                    .deleted_points()
+                    .unwrap_or(id_tracker.deleted_point_bitslice());
                 vectors
                     .iter()
                     .map(|&vector| {
                         new_stoppable_raw_scorer(
                             vector.to_owned(),
                             &vector_storage,
-                            id_tracker.deleted_point_bitslice(),
-                            is_stopped,
+                            deleted_points,
+                            &is_stopped,
                         )
                         .map(|scorer| {
                             scorer.peek_top_iter(&mut filtered_ids_vec.iter().copied(), top)
@@ -255,14 +304,17 @@ impl VectorIndex for PlainIndex {
                 let _timer = ScopeDurationMeasurer::new(&self.unfiltered_searches_telemetry);
                 let vector_storage = self.vector_storage.borrow();
                 let id_tracker = self.id_tracker.borrow();
+                let deleted_points = query_context
+                    .deleted_points()
+                    .unwrap_or(id_tracker.deleted_point_bitslice());
                 vectors
                     .iter()
                     .map(|&vector| {
                         new_stoppable_raw_scorer(
                             vector.to_owned(),
                             &vector_storage,
-                            id_tracker.deleted_point_bitslice(),
-                            is_stopped,
+                            deleted_points,
+                            &is_stopped,
                         )
                         .map(|scorer| scorer.peek_top_all(top))
                     })
@@ -271,15 +323,17 @@ impl VectorIndex for PlainIndex {
         }
     }
 
-    fn build_index(&mut self, _stopped: &AtomicBool) -> OperationResult<()> {
-        Ok(())
-    }
-
-    fn get_telemetry_data(&self) -> VectorIndexSearchesTelemetry {
+    fn get_telemetry_data(&self, detail: TelemetryDetail) -> VectorIndexSearchesTelemetry {
         VectorIndexSearchesTelemetry {
             index_name: None,
-            unfiltered_plain: self.unfiltered_searches_telemetry.lock().get_statistics(),
-            filtered_plain: self.filtered_searches_telemetry.lock().get_statistics(),
+            unfiltered_plain: self
+                .unfiltered_searches_telemetry
+                .lock()
+                .get_statistics(detail),
+            filtered_plain: self
+                .filtered_searches_telemetry
+                .lock()
+                .get_statistics(detail),
             unfiltered_hnsw: OperationDurationStatistics::default(),
             filtered_small_cardinality: OperationDurationStatistics::default(),
             filtered_large_cardinality: OperationDurationStatistics::default(),
@@ -298,7 +352,26 @@ impl VectorIndex for PlainIndex {
         0
     }
 
-    fn update_vector(&mut self, _id: PointOffsetType, _vector: VectorRef) -> OperationResult<()> {
+    fn update_vector(
+        &mut self,
+        id: PointOffsetType,
+        vector: Option<VectorRef>,
+    ) -> OperationResult<()> {
+        let mut vector_storage = self.vector_storage.borrow_mut();
+
+        if let Some(vector) = vector {
+            vector_storage.insert_vector(id, vector)?;
+        } else {
+            if id as usize >= vector_storage.total_vector_count() {
+                debug_assert!(id as usize == vector_storage.total_vector_count());
+                // Vector doesn't exist in the storage
+                // Insert default vector to keep the sequence
+                let default_vector = vector_storage.default_vector();
+                vector_storage.insert_vector(id, VectorRef::from(&default_vector))?;
+            }
+            vector_storage.delete_vector(id)?;
+        }
+
         Ok(())
     }
 }

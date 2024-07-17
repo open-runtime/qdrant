@@ -5,6 +5,8 @@ use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::types::ScrollRequestInternal;
 use collection::operations::CollectionUpdateOperations;
 use itertools::Itertools;
+use segment::data_types::vectors::BatchVectorStructInternal;
+use segment::json_path::JsonPath;
 use segment::types::{PayloadContainer, PayloadSelectorExclude, WithPayloadInterface};
 use serde_json::Value;
 use tempfile::Builder;
@@ -33,7 +35,11 @@ async fn test_collection_reloading_with_shards(shard_number: u32) {
         let insert_points = CollectionUpdateOperations::PointOperation(
             PointOperations::UpsertPoints(PointInsertOperationsInternal::PointsBatch(Batch {
                 ids: vec![0, 1].into_iter().map(|x| x.into()).collect_vec(),
-                vectors: vec![vec![1.0, 0.0, 1.0, 1.0], vec![1.0, 0.0, 1.0, 0.0]].into(),
+                vectors: BatchVectorStructInternal::from(vec![
+                    vec![1.0, 0.0, 1.0, 1.0],
+                    vec![1.0, 0.0, 1.0, 0.0],
+                ])
+                .into(),
                 payloads: None,
             })),
         );
@@ -55,7 +61,7 @@ async fn test_collection_reloading_with_shards(shard_number: u32) {
             .info(&ShardSelectorInternal::All)
             .await
             .unwrap()
-            .vectors_count,
+            .points_count,
         Some(2),
     );
 }
@@ -73,7 +79,11 @@ async fn test_collection_payload_reloading_with_shards(shard_number: u32) {
         let insert_points = CollectionUpdateOperations::PointOperation(
             PointOperations::UpsertPoints(PointInsertOperationsInternal::PointsBatch(Batch {
                 ids: vec![0, 1].into_iter().map(|x| x.into()).collect_vec(),
-                vectors: vec![vec![1.0, 0.0, 1.0, 1.0], vec![1.0, 0.0, 1.0, 0.0]].into(),
+                vectors: BatchVectorStructInternal::from(vec![
+                    vec![1.0, 0.0, 1.0, 1.0],
+                    vec![1.0, 0.0, 1.0, 0.0],
+                ])
+                .into(),
                 payloads: serde_json::from_str(r#"[{ "k": "v1" } , { "k": "v2"}]"#).unwrap(),
             })),
         );
@@ -98,6 +108,7 @@ async fn test_collection_payload_reloading_with_shards(shard_number: u32) {
                 filter: None,
                 with_payload: Some(WithPayloadInterface::Bool(true)),
                 with_vector: true.into(),
+                order_by: None,
             },
             None,
             &ShardSelectorInternal::All,
@@ -111,7 +122,7 @@ async fn test_collection_payload_reloading_with_shards(shard_number: u32) {
         .payload
         .as_ref()
         .expect("has payload")
-        .get_value("k")
+        .get_value(&JsonPath::new("k"))
         .into_iter()
         .next()
         .expect("has value")
@@ -122,7 +133,11 @@ async fn test_collection_payload_reloading_with_shards(shard_number: u32) {
 
     eprintln!(
         "res = {:#?}",
-        res.points[0].payload.as_ref().unwrap().get_value("k")
+        res.points[0]
+            .payload
+            .as_ref()
+            .unwrap()
+            .get_value(&JsonPath::new("k"))
     );
 }
 
@@ -139,7 +154,11 @@ async fn test_collection_payload_custom_payload_with_shards(shard_number: u32) {
         let insert_points = CollectionUpdateOperations::PointOperation(
             PointOperations::UpsertPoints(PointInsertOperationsInternal::PointsBatch(Batch {
                 ids: vec![0.into(), 1.into()],
-                vectors: vec![vec![1.0, 0.0, 1.0, 1.0], vec![1.0, 0.0, 1.0, 0.0]].into(),
+                vectors: BatchVectorStructInternal::from(vec![
+                    vec![1.0, 0.0, 1.0, 1.0],
+                    vec![1.0, 0.0, 1.0, 0.0],
+                ])
+                .into(),
                 payloads: serde_json::from_str(
                     r#"[{ "k1": "v1" }, { "k1": "v2" , "k2": "v3", "k3": "v4"}]"#,
                 )
@@ -167,8 +186,9 @@ async fn test_collection_payload_custom_payload_with_shards(shard_number: u32) {
                 offset: None,
                 limit: Some(10),
                 filter: None,
-                with_payload: Some(WithPayloadInterface::Fields(vec![String::from("k2")])),
+                with_payload: Some(WithPayloadInterface::Fields(vec![JsonPath::new("k2")])),
                 with_vector: true.into(),
+                order_by: None,
             },
             None,
             &ShardSelectorInternal::All,
@@ -185,7 +205,7 @@ async fn test_collection_payload_custom_payload_with_shards(shard_number: u32) {
         .payload
         .as_ref()
         .expect("has payload")
-        .get_value("k2")
+        .get_value(&JsonPath::new("k2"))
         .into_iter()
         .next()
         .expect("has value")
@@ -201,8 +221,9 @@ async fn test_collection_payload_custom_payload_with_shards(shard_number: u32) {
                 offset: None,
                 limit: Some(10),
                 filter: None,
-                with_payload: Some(PayloadSelectorExclude::new(vec!["k1".to_string()]).into()),
+                with_payload: Some(PayloadSelectorExclude::new(vec![JsonPath::new("k1")]).into()),
                 with_vector: false.into(),
+                order_by: None,
             },
             None,
             &ShardSelectorInternal::All,
@@ -228,12 +249,12 @@ async fn test_collection_payload_custom_payload_with_shards(shard_number: u32) {
         .payload
         .as_ref()
         .expect("has payload")
-        .get_value("k3")
+        .get_value(&JsonPath::new("k3"))
         .into_iter()
         .next()
         .expect("has value")
     {
         Value::String(value) => assert_eq!("v4", value),
         _ => panic!("unexpected type"),
-    }
+    };
 }

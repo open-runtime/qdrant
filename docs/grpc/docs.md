@@ -4,14 +4,19 @@
 ## Table of Contents
 
 - [collections.proto](#collections-proto)
+    - [AbortShardTransfer](#qdrant-AbortShardTransfer)
     - [AliasDescription](#qdrant-AliasDescription)
     - [AliasOperations](#qdrant-AliasOperations)
     - [BinaryQuantization](#qdrant-BinaryQuantization)
+    - [BoolIndexParams](#qdrant-BoolIndexParams)
     - [ChangeAliases](#qdrant-ChangeAliases)
     - [CollectionClusterInfoRequest](#qdrant-CollectionClusterInfoRequest)
     - [CollectionClusterInfoResponse](#qdrant-CollectionClusterInfoResponse)
     - [CollectionConfig](#qdrant-CollectionConfig)
     - [CollectionDescription](#qdrant-CollectionDescription)
+    - [CollectionExists](#qdrant-CollectionExists)
+    - [CollectionExistsRequest](#qdrant-CollectionExistsRequest)
+    - [CollectionExistsResponse](#qdrant-CollectionExistsResponse)
     - [CollectionInfo](#qdrant-CollectionInfo)
     - [CollectionInfo.PayloadSchemaEntry](#qdrant-CollectionInfo-PayloadSchemaEntry)
     - [CollectionOperationResponse](#qdrant-CollectionOperationResponse)
@@ -22,15 +27,20 @@
     - [CreateShardKey](#qdrant-CreateShardKey)
     - [CreateShardKeyRequest](#qdrant-CreateShardKeyRequest)
     - [CreateShardKeyResponse](#qdrant-CreateShardKeyResponse)
+    - [DatetimeIndexParams](#qdrant-DatetimeIndexParams)
     - [DeleteAlias](#qdrant-DeleteAlias)
     - [DeleteCollection](#qdrant-DeleteCollection)
     - [DeleteShardKey](#qdrant-DeleteShardKey)
     - [DeleteShardKeyRequest](#qdrant-DeleteShardKeyRequest)
     - [DeleteShardKeyResponse](#qdrant-DeleteShardKeyResponse)
     - [Disabled](#qdrant-Disabled)
+    - [FloatIndexParams](#qdrant-FloatIndexParams)
+    - [GeoIndexParams](#qdrant-GeoIndexParams)
     - [GetCollectionInfoRequest](#qdrant-GetCollectionInfoRequest)
     - [GetCollectionInfoResponse](#qdrant-GetCollectionInfoResponse)
     - [HnswConfigDiff](#qdrant-HnswConfigDiff)
+    - [IntegerIndexParams](#qdrant-IntegerIndexParams)
+    - [KeywordIndexParams](#qdrant-KeywordIndexParams)
     - [ListAliasesRequest](#qdrant-ListAliasesRequest)
     - [ListAliasesResponse](#qdrant-ListAliasesResponse)
     - [ListCollectionAliasesRequest](#qdrant-ListCollectionAliasesRequest)
@@ -38,6 +48,7 @@
     - [ListCollectionsResponse](#qdrant-ListCollectionsResponse)
     - [LocalShardInfo](#qdrant-LocalShardInfo)
     - [MoveShard](#qdrant-MoveShard)
+    - [MultiVectorConfig](#qdrant-MultiVectorConfig)
     - [OptimizerStatus](#qdrant-OptimizerStatus)
     - [OptimizersConfigDiff](#qdrant-OptimizersConfigDiff)
     - [PayloadIndexParams](#qdrant-PayloadIndexParams)
@@ -48,6 +59,9 @@
     - [RemoteShardInfo](#qdrant-RemoteShardInfo)
     - [RenameAlias](#qdrant-RenameAlias)
     - [Replica](#qdrant-Replica)
+    - [ReplicateShard](#qdrant-ReplicateShard)
+    - [ReshardingInfo](#qdrant-ReshardingInfo)
+    - [RestartTransfer](#qdrant-RestartTransfer)
     - [ScalarQuantization](#qdrant-ScalarQuantization)
     - [ShardKey](#qdrant-ShardKey)
     - [ShardTransferInfo](#qdrant-ShardTransferInfo)
@@ -71,7 +85,10 @@
   
     - [CollectionStatus](#qdrant-CollectionStatus)
     - [CompressionRatio](#qdrant-CompressionRatio)
+    - [Datatype](#qdrant-Datatype)
     - [Distance](#qdrant-Distance)
+    - [Modifier](#qdrant-Modifier)
+    - [MultiVectorComparator](#qdrant-MultiVectorComparator)
     - [PayloadSchemaType](#qdrant-PayloadSchemaType)
     - [QuantizationType](#qdrant-QuantizationType)
     - [ReplicaState](#qdrant-ReplicaState)
@@ -103,16 +120,21 @@
     - [ClearPayloadPoints](#qdrant-ClearPayloadPoints)
     - [Condition](#qdrant-Condition)
     - [ContextExamplePair](#qdrant-ContextExamplePair)
+    - [ContextInput](#qdrant-ContextInput)
+    - [ContextInputPair](#qdrant-ContextInputPair)
     - [CountPoints](#qdrant-CountPoints)
     - [CountResponse](#qdrant-CountResponse)
     - [CountResult](#qdrant-CountResult)
     - [CreateFieldIndexCollection](#qdrant-CreateFieldIndexCollection)
+    - [DatetimeRange](#qdrant-DatetimeRange)
     - [DeleteFieldIndexCollection](#qdrant-DeleteFieldIndexCollection)
     - [DeletePayloadPoints](#qdrant-DeletePayloadPoints)
     - [DeletePointVectors](#qdrant-DeletePointVectors)
     - [DeletePoints](#qdrant-DeletePoints)
+    - [DenseVector](#qdrant-DenseVector)
     - [DiscoverBatchPoints](#qdrant-DiscoverBatchPoints)
     - [DiscoverBatchResponse](#qdrant-DiscoverBatchResponse)
+    - [DiscoverInput](#qdrant-DiscoverInput)
     - [DiscoverPoints](#qdrant-DiscoverPoints)
     - [DiscoverResponse](#qdrant-DiscoverResponse)
     - [FieldCondition](#qdrant-FieldCondition)
@@ -131,9 +153,13 @@
     - [IsNullCondition](#qdrant-IsNullCondition)
     - [LookupLocation](#qdrant-LookupLocation)
     - [Match](#qdrant-Match)
+    - [MinShould](#qdrant-MinShould)
+    - [MultiDenseVector](#qdrant-MultiDenseVector)
     - [NamedVectors](#qdrant-NamedVectors)
     - [NamedVectors.VectorsEntry](#qdrant-NamedVectors-VectorsEntry)
     - [NestedCondition](#qdrant-NestedCondition)
+    - [OrderBy](#qdrant-OrderBy)
+    - [OrderValue](#qdrant-OrderValue)
     - [PayloadExcludeSelector](#qdrant-PayloadExcludeSelector)
     - [PayloadIncludeSelector](#qdrant-PayloadIncludeSelector)
     - [PointGroup](#qdrant-PointGroup)
@@ -149,16 +175,25 @@
     - [PointsUpdateOperation.DeletePayload](#qdrant-PointsUpdateOperation-DeletePayload)
     - [PointsUpdateOperation.DeletePoints](#qdrant-PointsUpdateOperation-DeletePoints)
     - [PointsUpdateOperation.DeleteVectors](#qdrant-PointsUpdateOperation-DeleteVectors)
+    - [PointsUpdateOperation.OverwritePayload](#qdrant-PointsUpdateOperation-OverwritePayload)
+    - [PointsUpdateOperation.OverwritePayload.PayloadEntry](#qdrant-PointsUpdateOperation-OverwritePayload-PayloadEntry)
     - [PointsUpdateOperation.PointStructList](#qdrant-PointsUpdateOperation-PointStructList)
     - [PointsUpdateOperation.SetPayload](#qdrant-PointsUpdateOperation-SetPayload)
     - [PointsUpdateOperation.SetPayload.PayloadEntry](#qdrant-PointsUpdateOperation-SetPayload-PayloadEntry)
     - [PointsUpdateOperation.UpdateVectors](#qdrant-PointsUpdateOperation-UpdateVectors)
+    - [PrefetchQuery](#qdrant-PrefetchQuery)
     - [QuantizationSearchParams](#qdrant-QuantizationSearchParams)
+    - [Query](#qdrant-Query)
+    - [QueryBatchPoints](#qdrant-QueryBatchPoints)
+    - [QueryBatchResponse](#qdrant-QueryBatchResponse)
+    - [QueryPoints](#qdrant-QueryPoints)
+    - [QueryResponse](#qdrant-QueryResponse)
     - [Range](#qdrant-Range)
     - [ReadConsistency](#qdrant-ReadConsistency)
     - [RecommendBatchPoints](#qdrant-RecommendBatchPoints)
     - [RecommendBatchResponse](#qdrant-RecommendBatchResponse)
     - [RecommendGroupsResponse](#qdrant-RecommendGroupsResponse)
+    - [RecommendInput](#qdrant-RecommendInput)
     - [RecommendPointGroups](#qdrant-RecommendPointGroups)
     - [RecommendPoints](#qdrant-RecommendPoints)
     - [RecommendResponse](#qdrant-RecommendResponse)
@@ -181,6 +216,8 @@
     - [SetPayloadPoints.PayloadEntry](#qdrant-SetPayloadPoints-PayloadEntry)
     - [ShardKeySelector](#qdrant-ShardKeySelector)
     - [SparseIndices](#qdrant-SparseIndices)
+    - [SparseVector](#qdrant-SparseVector)
+    - [StartFrom](#qdrant-StartFrom)
     - [TargetVector](#qdrant-TargetVector)
     - [UpdateBatchPoints](#qdrant-UpdateBatchPoints)
     - [UpdateBatchResponse](#qdrant-UpdateBatchResponse)
@@ -190,6 +227,7 @@
     - [ValuesCount](#qdrant-ValuesCount)
     - [Vector](#qdrant-Vector)
     - [VectorExample](#qdrant-VectorExample)
+    - [VectorInput](#qdrant-VectorInput)
     - [Vectors](#qdrant-Vectors)
     - [VectorsSelector](#qdrant-VectorsSelector)
     - [WithLookup](#qdrant-WithLookup)
@@ -197,7 +235,9 @@
     - [WithVectorsSelector](#qdrant-WithVectorsSelector)
     - [WriteOrdering](#qdrant-WriteOrdering)
   
+    - [Direction](#qdrant-Direction)
     - [FieldType](#qdrant-FieldType)
+    - [Fusion](#qdrant-Fusion)
     - [ReadConsistencyType](#qdrant-ReadConsistencyType)
     - [RecommendStrategy](#qdrant-RecommendStrategy)
     - [UpdateStatus](#qdrant-UpdateStatus)
@@ -245,6 +285,24 @@
 
 
 
+<a name="qdrant-AbortShardTransfer"></a>
+
+### AbortShardTransfer
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| shard_id | [uint32](#uint32) |  | Local shard id |
+| to_shard_id | [uint32](#uint32) | optional |  |
+| from_peer_id | [uint64](#uint64) |  |  |
+| to_peer_id | [uint64](#uint64) |  |  |
+
+
+
+
+
+
 <a name="qdrant-AliasDescription"></a>
 
 ### AliasDescription
@@ -287,6 +345,16 @@
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | always_ram | [bool](#bool) | optional | If true - quantized vectors always will be stored in RAM, ignoring the config of main storage |
+
+
+
+
+
+
+<a name="qdrant-BoolIndexParams"></a>
+
+### BoolIndexParams
+
 
 
 
@@ -371,6 +439,52 @@
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | name | [string](#string) |  | Name of the collection |
+
+
+
+
+
+
+<a name="qdrant-CollectionExists"></a>
+
+### CollectionExists
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| exists | [bool](#bool) |  |  |
+
+
+
+
+
+
+<a name="qdrant-CollectionExistsRequest"></a>
+
+### CollectionExistsRequest
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| collection_name | [string](#string) |  |  |
+
+
+
+
+
+
+<a name="qdrant-CollectionExistsResponse"></a>
+
+### CollectionExistsResponse
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| result | [CollectionExists](#qdrant-CollectionExists) |  |  |
+| time | [double](#double) |  | Time spent to process |
 
 
 
@@ -565,6 +679,16 @@
 
 
 
+<a name="qdrant-DatetimeIndexParams"></a>
+
+### DatetimeIndexParams
+
+
+
+
+
+
+
 <a name="qdrant-DeleteAlias"></a>
 
 ### DeleteAlias
@@ -653,6 +777,26 @@
 
 
 
+<a name="qdrant-FloatIndexParams"></a>
+
+### FloatIndexParams
+
+
+
+
+
+
+
+<a name="qdrant-GeoIndexParams"></a>
+
+### GeoIndexParams
+
+
+
+
+
+
+
 <a name="qdrant-GetCollectionInfoRequest"></a>
 
 ### GetCollectionInfoRequest
@@ -695,9 +839,35 @@
 | m | [uint64](#uint64) | optional | Number of edges per node in the index graph. Larger the value - more accurate the search, more space required. |
 | ef_construct | [uint64](#uint64) | optional | Number of neighbours to consider during the index building. Larger the value - more accurate the search, more time required to build the index. |
 | full_scan_threshold | [uint64](#uint64) | optional | Minimal size (in KiloBytes) of vectors for additional payload-based indexing. If the payload chunk is smaller than `full_scan_threshold` additional indexing won&#39;t be used - in this case full-scan search should be preferred by query planner and additional indexing is not required. Note: 1 Kb = 1 vector of size 256 |
-| max_indexing_threads | [uint64](#uint64) | optional | Number of parallel threads used for background index building. If 0 - auto selection. |
+| max_indexing_threads | [uint64](#uint64) | optional | Number of parallel threads used for background index building. If 0 - automatically select from 8 to 16. Best to keep between 8 and 16 to prevent likelihood of building broken/inefficient HNSW graphs. On small CPUs, less threads are used. |
 | on_disk | [bool](#bool) | optional | Store HNSW index on disk. If set to false, the index will be stored in RAM. |
 | payload_m | [uint64](#uint64) | optional | Number of additional payload-aware links per node in the index graph. If not set - regular M parameter will be used. |
+
+
+
+
+
+
+<a name="qdrant-IntegerIndexParams"></a>
+
+### IntegerIndexParams
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| lookup | [bool](#bool) |  | If true - support direct lookups. |
+| range | [bool](#bool) |  | If true - support ranges filters. |
+
+
+
+
+
+
+<a name="qdrant-KeywordIndexParams"></a>
+
+### KeywordIndexParams
+
 
 
 
@@ -798,9 +968,25 @@
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | shard_id | [uint32](#uint32) |  | Local shard id |
+| to_shard_id | [uint32](#uint32) | optional |  |
 | from_peer_id | [uint64](#uint64) |  |  |
 | to_peer_id | [uint64](#uint64) |  |  |
 | method | [ShardTransferMethod](#qdrant-ShardTransferMethod) | optional |  |
+
+
+
+
+
+
+<a name="qdrant-MultiVectorConfig"></a>
+
+### MultiVectorConfig
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| comparator | [MultiVectorComparator](#qdrant-MultiVectorComparator) |  | Comparator for multi-vector search |
 
 
 
@@ -856,7 +1042,7 @@ To disable vector indexing, set to `0`.
 
 Note: 1kB = 1 vector of size 256. |
 | flush_interval_sec | [uint64](#uint64) | optional | Interval between forced flushes. |
-| max_optimization_threads | [uint64](#uint64) | optional | Max number of threads, which can be used for optimization. If 0 - `NUM_CPU - 1` will be used |
+| max_optimization_threads | [uint64](#uint64) | optional | Max number of threads (jobs) for running optimizations per shard. Note: each optimization job will also use `max_indexing_threads` threads by itself for index building. If null - have no limit and choose dynamically to saturate CPU. If 0 - no optimization threads, optimizations will be disabled. |
 
 
 
@@ -871,7 +1057,13 @@ Note: 1kB = 1 vector of size 256. |
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
+| keyword_index_params | [KeywordIndexParams](#qdrant-KeywordIndexParams) |  | Parameters for keyword index |
+| integer_index_params | [IntegerIndexParams](#qdrant-IntegerIndexParams) |  | Parameters for integer index |
+| float_index_params | [FloatIndexParams](#qdrant-FloatIndexParams) |  | Parameters for float index |
+| geo_index_params | [GeoIndexParams](#qdrant-GeoIndexParams) |  | Parameters for geo index |
 | text_index_params | [TextIndexParams](#qdrant-TextIndexParams) |  | Parameters for text index |
+| bool_index_params | [BoolIndexParams](#qdrant-BoolIndexParams) |  | Parameters for bool index |
+| datetime_index_params | [DatetimeIndexParams](#qdrant-DatetimeIndexParams) |  | Parameters for datetime index |
 
 
 
@@ -996,6 +1188,61 @@ Note: 1kB = 1 vector of size 256. |
 
 
 
+<a name="qdrant-ReplicateShard"></a>
+
+### ReplicateShard
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| shard_id | [uint32](#uint32) |  | Local shard id |
+| to_shard_id | [uint32](#uint32) | optional |  |
+| from_peer_id | [uint64](#uint64) |  |  |
+| to_peer_id | [uint64](#uint64) |  |  |
+| method | [ShardTransferMethod](#qdrant-ShardTransferMethod) | optional |  |
+
+
+
+
+
+
+<a name="qdrant-ReshardingInfo"></a>
+
+### ReshardingInfo
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| shard_id | [uint32](#uint32) |  |  |
+| peer_id | [uint64](#uint64) |  |  |
+| shard_key | [ShardKey](#qdrant-ShardKey) | optional |  |
+
+
+
+
+
+
+<a name="qdrant-RestartTransfer"></a>
+
+### RestartTransfer
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| shard_id | [uint32](#uint32) |  | Local shard id |
+| to_shard_id | [uint32](#uint32) | optional |  |
+| from_peer_id | [uint64](#uint64) |  |  |
+| to_peer_id | [uint64](#uint64) |  |  |
+| method | [ShardTransferMethod](#qdrant-ShardTransferMethod) |  |  |
+
+
+
+
+
+
 <a name="qdrant-ScalarQuantization"></a>
 
 ### ScalarQuantization
@@ -1038,6 +1285,7 @@ Note: 1kB = 1 vector of size 256. |
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | shard_id | [uint32](#uint32) |  | Local shard id |
+| to_shard_id | [uint32](#uint32) | optional |  |
 | from | [uint64](#uint64) |  |  |
 | to | [uint64](#uint64) |  |  |
 | sync | [bool](#bool) |  | If `true` transfer is a synchronization of a replicas; If `false` transfer is a moving of a shard from one peer to another |
@@ -1057,6 +1305,7 @@ Note: 1kB = 1 vector of size 256. |
 | ----- | ---- | ----- | ----------- |
 | full_scan_threshold | [uint64](#uint64) | optional | Prefer a full scan search upto (excluding) this number of vectors. Note: this is number of vectors, not KiloBytes. |
 | on_disk | [bool](#bool) | optional | Store inverted index on disk. If set to false, the index will be stored in RAM. |
+| datatype | [Datatype](#qdrant-Datatype) | optional | Datatype used to store weights in the index. |
 
 
 
@@ -1103,6 +1352,7 @@ Note: 1kB = 1 vector of size 256. |
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | index | [SparseIndexConfig](#qdrant-SparseIndexConfig) | optional | Configuration of sparse index |
+| modifier | [Modifier](#qdrant-Modifier) | optional | If set - apply modifier to the vector values |
 
 
 
@@ -1159,11 +1409,12 @@ Note: 1kB = 1 vector of size 256. |
 | ----- | ---- | ----- | ----------- |
 | collection_name | [string](#string) |  | Name of the collection |
 | move_shard | [MoveShard](#qdrant-MoveShard) |  |  |
-| replicate_shard | [MoveShard](#qdrant-MoveShard) |  |  |
-| abort_transfer | [MoveShard](#qdrant-MoveShard) |  |  |
+| replicate_shard | [ReplicateShard](#qdrant-ReplicateShard) |  |  |
+| abort_transfer | [AbortShardTransfer](#qdrant-AbortShardTransfer) |  |  |
 | drop_replica | [Replica](#qdrant-Replica) |  |  |
 | create_shard_key | [CreateShardKey](#qdrant-CreateShardKey) |  |  |
 | delete_shard_key | [DeleteShardKey](#qdrant-DeleteShardKey) |  |  |
+| restart_transfer | [RestartTransfer](#qdrant-RestartTransfer) |  |  |
 | timeout | [uint64](#uint64) | optional | Wait timeout for operation commit in seconds, if not specified - default value will be supplied |
 
 
@@ -1199,6 +1450,8 @@ Note: 1kB = 1 vector of size 256. |
 | hnsw_config | [HnswConfigDiff](#qdrant-HnswConfigDiff) | optional | Configuration of vector HNSW graph. If omitted - the collection configuration will be used |
 | quantization_config | [QuantizationConfig](#qdrant-QuantizationConfig) | optional | Configuration of vector quantization config. If omitted - the collection configuration will be used |
 | on_disk | [bool](#bool) | optional | If true - serve vectors from disk. If set to false, the vectors will be loaded in RAM. |
+| datatype | [Datatype](#qdrant-Datatype) | optional | Data type of the vectors |
+| multivector_config | [MultiVectorConfig](#qdrant-MultiVectorConfig) | optional | Configuration for multi-vector search |
 
 
 
@@ -1345,6 +1598,7 @@ Note: 1kB = 1 vector of size 256. |
 | Green | 1 | All segments are ready |
 | Yellow | 2 | Optimization in process |
 | Red | 3 | Something went wrong |
+| Grey | 4 | Optimization is pending |
 
 
 
@@ -1363,6 +1617,20 @@ Note: 1kB = 1 vector of size 256. |
 
 
 
+<a name="qdrant-Datatype"></a>
+
+### Datatype
+
+
+| Name | Number | Description |
+| ---- | ------ | ----------- |
+| Default | 0 |  |
+| Float32 | 1 |  |
+| Uint8 | 2 |  |
+| Float16 | 3 |  |
+
+
+
 <a name="qdrant-Distance"></a>
 
 ### Distance
@@ -1375,6 +1643,29 @@ Note: 1kB = 1 vector of size 256. |
 | Euclid | 2 |  |
 | Dot | 3 |  |
 | Manhattan | 4 |  |
+
+
+
+<a name="qdrant-Modifier"></a>
+
+### Modifier
+
+
+| Name | Number | Description |
+| ---- | ------ | ----------- |
+| None | 0 |  |
+| Idf | 1 | Apply Inverse Document Frequency |
+
+
+
+<a name="qdrant-MultiVectorComparator"></a>
+
+### MultiVectorComparator
+
+
+| Name | Number | Description |
+| ---- | ------ | ----------- |
+| MaxSim | 0 |  |
 
 
 
@@ -1392,6 +1683,7 @@ Note: 1kB = 1 vector of size 256. |
 | Geo | 4 |  |
 | Text | 5 |  |
 | Bool | 6 |  |
+| Datetime | 7 |  |
 
 
 
@@ -1419,7 +1711,9 @@ Note: 1kB = 1 vector of size 256. |
 | Partial | 2 | The shard is partially loaded and is currently receiving data from other shards |
 | Initializing | 3 | Collection is being created |
 | Listener | 4 | A shard which receives data, but is not used for search; Useful for backup shards |
-| PartialSnapshot | 5 | Snapshot shard transfer is in progress; Updates should not be sent to (and are ignored by) the shard |
+| PartialSnapshot | 5 | Deprecated: snapshot shard transfer is in progress; Updates should not be sent to (and are ignored by) the shard |
+| Recovery | 6 | Shard is undergoing recovered by an external node; Normally rejects updates, accepts updates if force is true |
+| Resharding | 7 | Points are being migrated to this shard as part of resharding |
 
 
 
@@ -1430,8 +1724,10 @@ Note: 1kB = 1 vector of size 256. |
 
 | Name | Number | Description |
 | ---- | ------ | ----------- |
-| StreamRecords | 0 |  |
-| Snapshot | 1 |  |
+| StreamRecords | 0 | Stream shard records in batches |
+| Snapshot | 1 | Snapshot the shard and recover it on the target peer |
+| WalDelta | 2 | Resolve WAL delta between peers and transfer the difference |
+| ReshardingStreamRecords | 3 | Stream shard records in batches for resharding |
 
 
 
@@ -1498,6 +1794,7 @@ Note: 1kB = 1 vector of size 256. |
 | ListCollectionAliases | [ListCollectionAliasesRequest](#qdrant-ListCollectionAliasesRequest) | [ListAliasesResponse](#qdrant-ListAliasesResponse) | Get list of all aliases for a collection |
 | ListAliases | [ListAliasesRequest](#qdrant-ListAliasesRequest) | [ListAliasesResponse](#qdrant-ListAliasesResponse) | Get list of all aliases for all existing collections |
 | CollectionClusterInfo | [CollectionClusterInfoRequest](#qdrant-CollectionClusterInfoRequest) | [CollectionClusterInfoResponse](#qdrant-CollectionClusterInfoResponse) | Get cluster information for a collection |
+| CollectionExists | [CollectionExistsRequest](#qdrant-CollectionExistsRequest) | [CollectionExistsResponse](#qdrant-CollectionExistsResponse) | Check the existence of a collection |
 | UpdateCollectionClusterSetup | [UpdateCollectionClusterSetupRequest](#qdrant-UpdateCollectionClusterSetupRequest) | [UpdateCollectionClusterSetupResponse](#qdrant-UpdateCollectionClusterSetupResponse) | Update cluster setup for a collection |
 | CreateShardKey | [CreateShardKeyRequest](#qdrant-CreateShardKeyRequest) | [CreateShardKeyResponse](#qdrant-CreateShardKeyResponse) | Create shard key |
 | DeleteShardKey | [DeleteShardKeyRequest](#qdrant-DeleteShardKeyRequest) | [DeleteShardKeyResponse](#qdrant-DeleteShardKeyResponse) | Delete shard key |
@@ -1764,6 +2061,37 @@ The JSON representation for `Value` is a JSON value.
 
 
 
+<a name="qdrant-ContextInput"></a>
+
+### ContextInput
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| pairs | [ContextInputPair](#qdrant-ContextInputPair) | repeated | Search space will be constrained by these pairs of vectors |
+
+
+
+
+
+
+<a name="qdrant-ContextInputPair"></a>
+
+### ContextInputPair
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| positive | [VectorInput](#qdrant-VectorInput) |  | A positive vector |
+| negative | [VectorInput](#qdrant-VectorInput) |  | Repel from this vector |
+
+
+
+
+
+
 <a name="qdrant-CountPoints"></a>
 
 ### CountPoints
@@ -1772,7 +2100,7 @@ The JSON representation for `Value` is a JSON value.
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| collection_name | [string](#string) |  | name of the collection |
+| collection_name | [string](#string) |  | Name of the collection |
 | filter | [Filter](#qdrant-Filter) |  | Filter conditions - return only those points that satisfy the specified conditions |
 | exact | [bool](#bool) | optional | If `true` - return exact count, if `false` - return approximate count |
 | read_consistency | [ReadConsistency](#qdrant-ReadConsistency) | optional | Options for specifying read consistency guarantees |
@@ -1828,6 +2156,24 @@ The JSON representation for `Value` is a JSON value.
 | field_type | [FieldType](#qdrant-FieldType) | optional | Field type. |
 | field_index_params | [PayloadIndexParams](#qdrant-PayloadIndexParams) | optional | Payload index params. |
 | ordering | [WriteOrdering](#qdrant-WriteOrdering) | optional | Write ordering guarantees |
+
+
+
+
+
+
+<a name="qdrant-DatetimeRange"></a>
+
+### DatetimeRange
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| lt | [google.protobuf.Timestamp](#google-protobuf-Timestamp) | optional |  |
+| gt | [google.protobuf.Timestamp](#google-protobuf-Timestamp) | optional |  |
+| gte | [google.protobuf.Timestamp](#google-protobuf-Timestamp) | optional |  |
+| lte | [google.protobuf.Timestamp](#google-protobuf-Timestamp) | optional |  |
 
 
 
@@ -1911,6 +2257,21 @@ The JSON representation for `Value` is a JSON value.
 
 
 
+<a name="qdrant-DenseVector"></a>
+
+### DenseVector
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| data | [float](#float) | repeated |  |
+
+
+
+
+
+
 <a name="qdrant-DiscoverBatchPoints"></a>
 
 ### DiscoverBatchPoints
@@ -1939,6 +2300,22 @@ The JSON representation for `Value` is a JSON value.
 | ----- | ---- | ----- | ----------- |
 | result | [BatchResult](#qdrant-BatchResult) | repeated |  |
 | time | [double](#double) |  | Time spent to process |
+
+
+
+
+
+
+<a name="qdrant-DiscoverInput"></a>
+
+### DiscoverInput
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| target | [VectorInput](#qdrant-VectorInput) |  | Use this as the primary search objective |
+| context | [ContextInput](#qdrant-ContextInput) |  | Search space will be constrained by these pairs of vectors |
 
 
 
@@ -2004,6 +2381,7 @@ The JSON representation for `Value` is a JSON value.
 | geo_radius | [GeoRadius](#qdrant-GeoRadius) |  | Check if geo point is within a given radius |
 | values_count | [ValuesCount](#qdrant-ValuesCount) |  | Check number of values for a specific field |
 | geo_polygon | [GeoPolygon](#qdrant-GeoPolygon) |  | Check if geo point is within a given polygon |
+| datetime_range | [DatetimeRange](#qdrant-DatetimeRange) |  | Check if datetime is within a given range |
 
 
 
@@ -2021,6 +2399,7 @@ The JSON representation for `Value` is a JSON value.
 | should | [Condition](#qdrant-Condition) | repeated | At least one of those conditions should match |
 | must | [Condition](#qdrant-Condition) | repeated | All conditions must match |
 | must_not | [Condition](#qdrant-Condition) | repeated | All conditions must NOT match |
+| min_should | [MinShould](#qdrant-MinShould) | optional | At least minimum amount of given conditions should match |
 
 
 
@@ -2259,6 +2638,37 @@ Additionally, the first and last points of each GeoLineString must be the same.
 
 
 
+<a name="qdrant-MinShould"></a>
+
+### MinShould
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| conditions | [Condition](#qdrant-Condition) | repeated |  |
+| min_count | [uint64](#uint64) |  |  |
+
+
+
+
+
+
+<a name="qdrant-MultiDenseVector"></a>
+
+### MultiDenseVector
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| vectors | [DenseVector](#qdrant-DenseVector) | repeated |  |
+
+
+
+
+
+
 <a name="qdrant-NamedVectors"></a>
 
 ### NamedVectors
@@ -2300,6 +2710,39 @@ Additionally, the first and last points of each GeoLineString must be the same.
 | ----- | ---- | ----- | ----------- |
 | key | [string](#string) |  | Path to nested object |
 | filter | [Filter](#qdrant-Filter) |  | Filter condition |
+
+
+
+
+
+
+<a name="qdrant-OrderBy"></a>
+
+### OrderBy
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| key | [string](#string) |  | Payload key to order by |
+| direction | [Direction](#qdrant-Direction) | optional | Ascending or descending order |
+| start_from | [StartFrom](#qdrant-StartFrom) | optional | Start from this value |
+
+
+
+
+
+
+<a name="qdrant-OrderValue"></a>
+
+### OrderValue
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| int | [int64](#int64) |  |  |
+| float | [double](#double) |  |  |
 
 
 
@@ -2476,7 +2919,7 @@ Additionally, the first and last points of each GeoLineString must be the same.
 | upsert | [PointsUpdateOperation.PointStructList](#qdrant-PointsUpdateOperation-PointStructList) |  |  |
 | delete_deprecated | [PointsSelector](#qdrant-PointsSelector) |  | **Deprecated.**  |
 | set_payload | [PointsUpdateOperation.SetPayload](#qdrant-PointsUpdateOperation-SetPayload) |  |  |
-| overwrite_payload | [PointsUpdateOperation.SetPayload](#qdrant-PointsUpdateOperation-SetPayload) |  |  |
+| overwrite_payload | [PointsUpdateOperation.OverwritePayload](#qdrant-PointsUpdateOperation-OverwritePayload) |  |  |
 | delete_payload | [PointsUpdateOperation.DeletePayload](#qdrant-PointsUpdateOperation-DeletePayload) |  |  |
 | clear_payload_deprecated | [PointsSelector](#qdrant-PointsSelector) |  | **Deprecated.**  |
 | update_vectors | [PointsUpdateOperation.UpdateVectors](#qdrant-PointsUpdateOperation-UpdateVectors) |  |  |
@@ -2555,6 +2998,40 @@ Additionally, the first and last points of each GeoLineString must be the same.
 
 
 
+<a name="qdrant-PointsUpdateOperation-OverwritePayload"></a>
+
+### PointsUpdateOperation.OverwritePayload
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| payload | [PointsUpdateOperation.OverwritePayload.PayloadEntry](#qdrant-PointsUpdateOperation-OverwritePayload-PayloadEntry) | repeated |  |
+| points_selector | [PointsSelector](#qdrant-PointsSelector) | optional | Affected points |
+| shard_key_selector | [ShardKeySelector](#qdrant-ShardKeySelector) | optional | Option for custom sharding to specify used shard keys |
+| key | [string](#string) | optional | Option for indicate property of payload |
+
+
+
+
+
+
+<a name="qdrant-PointsUpdateOperation-OverwritePayload-PayloadEntry"></a>
+
+### PointsUpdateOperation.OverwritePayload.PayloadEntry
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| key | [string](#string) |  |  |
+| value | [Value](#qdrant-Value) |  |  |
+
+
+
+
+
+
 <a name="qdrant-PointsUpdateOperation-PointStructList"></a>
 
 ### PointsUpdateOperation.PointStructList
@@ -2582,6 +3059,7 @@ Additionally, the first and last points of each GeoLineString must be the same.
 | payload | [PointsUpdateOperation.SetPayload.PayloadEntry](#qdrant-PointsUpdateOperation-SetPayload-PayloadEntry) | repeated |  |
 | points_selector | [PointsSelector](#qdrant-PointsSelector) | optional | Affected points |
 | shard_key_selector | [ShardKeySelector](#qdrant-ShardKeySelector) | optional | Option for custom sharding to specify used shard keys |
+| key | [string](#string) | optional | Option for indicate property of payload |
 
 
 
@@ -2620,6 +3098,28 @@ Additionally, the first and last points of each GeoLineString must be the same.
 
 
 
+<a name="qdrant-PrefetchQuery"></a>
+
+### PrefetchQuery
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| prefetch | [PrefetchQuery](#qdrant-PrefetchQuery) | repeated | Sub-requests to perform first. If present, the query will be performed on the results of the prefetches. |
+| query | [Query](#qdrant-Query) | optional | Query to perform. If missing, returns points ordered by their IDs. |
+| using | [string](#string) | optional | Define which vector to use for querying. If missing, the default vector is is used. |
+| filter | [Filter](#qdrant-Filter) | optional | Filter conditions - return only those points that satisfy the specified conditions. |
+| params | [SearchParams](#qdrant-SearchParams) | optional | Search params for when there is no prefetch. |
+| score_threshold | [float](#float) | optional | Return points with scores better than this threshold. |
+| limit | [uint64](#uint64) | optional | Max number of points. Default is 10 |
+| lookup_from | [LookupLocation](#qdrant-LookupLocation) | optional | The location to use for IDs lookup, if not specified - use the current collection and the &#39;using&#39; vector |
+
+
+
+
+
+
 <a name="qdrant-QuantizationSearchParams"></a>
 
 ### QuantizationSearchParams
@@ -2635,6 +3135,105 @@ Additionally, the first and last points of each GeoLineString must be the same.
 Defines how many extra vectors should be pre-selected using quantized index, and then re-scored using original vectors.
 
 For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will be pre-selected using quantized index, and then top-100 will be returned after re-scoring. |
+
+
+
+
+
+
+<a name="qdrant-Query"></a>
+
+### Query
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| nearest | [VectorInput](#qdrant-VectorInput) |  | Find the nearest neighbors to this vector. |
+| recommend | [RecommendInput](#qdrant-RecommendInput) |  | Use multiple positive and negative vectors to find the results. |
+| discover | [DiscoverInput](#qdrant-DiscoverInput) |  | Search for nearest points, but constrain the search space with context |
+| context | [ContextInput](#qdrant-ContextInput) |  | Return points that live in positive areas. |
+| order_by | [OrderBy](#qdrant-OrderBy) |  | Order the points by a payload field. |
+| fusion | [Fusion](#qdrant-Fusion) |  | Fuse the results of multiple prefetches. |
+
+
+
+
+
+
+<a name="qdrant-QueryBatchPoints"></a>
+
+### QueryBatchPoints
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| collection_name | [string](#string) |  |  |
+| query_points | [QueryPoints](#qdrant-QueryPoints) | repeated |  |
+| read_consistency | [ReadConsistency](#qdrant-ReadConsistency) | optional | Options for specifying read consistency guarantees |
+| timeout | [uint64](#uint64) | optional | If set, overrides global timeout setting for this request. Unit is seconds. |
+
+
+
+
+
+
+<a name="qdrant-QueryBatchResponse"></a>
+
+### QueryBatchResponse
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| result | [BatchResult](#qdrant-BatchResult) | repeated |  |
+| time | [double](#double) |  | Time spent to process |
+
+
+
+
+
+
+<a name="qdrant-QueryPoints"></a>
+
+### QueryPoints
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| collection_name | [string](#string) |  | Name of the collection |
+| prefetch | [PrefetchQuery](#qdrant-PrefetchQuery) | repeated | Sub-requests to perform first. If present, the query will be performed on the results of the prefetches. |
+| query | [Query](#qdrant-Query) | optional | Query to perform. If missing, returns points ordered by their IDs. |
+| using | [string](#string) | optional | Define which vector to use for querying. If missing, the default vector is used. |
+| filter | [Filter](#qdrant-Filter) | optional | Filter conditions - return only those points that satisfy the specified conditions. |
+| params | [SearchParams](#qdrant-SearchParams) | optional | Search params for when there is no prefetch. |
+| score_threshold | [float](#float) | optional | Return points with scores better than this threshold. |
+| limit | [uint64](#uint64) | optional | Max number of points. Default is 10. |
+| offset | [uint64](#uint64) | optional | Offset of the result. Skip this many points. Default is 0. |
+| with_vectors | [WithVectorsSelector](#qdrant-WithVectorsSelector) | optional | Options for specifying which vectors to include into the response. |
+| with_payload | [WithPayloadSelector](#qdrant-WithPayloadSelector) | optional | Options for specifying which payload to include or not. |
+| read_consistency | [ReadConsistency](#qdrant-ReadConsistency) | optional | Options for specifying read consistency guarantees. |
+| shard_key_selector | [ShardKeySelector](#qdrant-ShardKeySelector) | optional | Specify in which shards to look for the points, if not specified - look in all shards. |
+| lookup_from | [LookupLocation](#qdrant-LookupLocation) | optional | The location to use for IDs lookup, if not specified - use the current collection and the &#39;using&#39; vector |
+| timeout | [uint64](#uint64) | optional | If set, overrides global timeout setting for this request. Unit is seconds. |
+
+
+
+
+
+
+<a name="qdrant-QueryResponse"></a>
+
+### QueryResponse
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| result | [ScoredPoint](#qdrant-ScoredPoint) | repeated |  |
+| time | [double](#double) |  | Time spent to process |
 
 
 
@@ -2719,6 +3318,23 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 | ----- | ---- | ----- | ----------- |
 | result | [GroupsResult](#qdrant-GroupsResult) |  |  |
 | time | [double](#double) |  | Time spent to process |
+
+
+
+
+
+
+<a name="qdrant-RecommendInput"></a>
+
+### RecommendInput
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| positive | [VectorInput](#qdrant-VectorInput) | repeated | Look for vectors closest to the vectors from these points |
+| negative | [VectorInput](#qdrant-VectorInput) | repeated | Try to avoid vectors like the vector from these points |
+| strategy | [RecommendStrategy](#qdrant-RecommendStrategy) | optional | How to use the provided vectors to find the results |
 
 
 
@@ -2849,6 +3465,7 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 | payload | [RetrievedPoint.PayloadEntry](#qdrant-RetrievedPoint-PayloadEntry) | repeated |  |
 | vectors | [Vectors](#qdrant-Vectors) | optional |  |
 | shard_key | [ShardKey](#qdrant-ShardKey) | optional | Shard key |
+| order_value | [OrderValue](#qdrant-OrderValue) | optional | Order-by value |
 
 
 
@@ -2885,6 +3502,7 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 | version | [uint64](#uint64) |  | Last update operation applied to this point |
 | vectors | [Vectors](#qdrant-Vectors) | optional | Vectors to search |
 | shard_key | [ShardKey](#qdrant-ShardKey) | optional | Shard key |
+| order_value | [OrderValue](#qdrant-OrderValue) | optional | Order by value |
 
 
 
@@ -2923,6 +3541,7 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 | with_vectors | [WithVectorsSelector](#qdrant-WithVectorsSelector) | optional | Options for specifying which vectors to include into response |
 | read_consistency | [ReadConsistency](#qdrant-ReadConsistency) | optional | Options for specifying read consistency guarantees |
 | shard_key_selector | [ShardKeySelector](#qdrant-ShardKeySelector) | optional | Specify in which shards to look for the points, if not specified - look in all shards |
+| order_by | [OrderBy](#qdrant-OrderBy) | optional | Order the records by a payload field |
 
 
 
@@ -3102,6 +3721,7 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 | points_selector | [PointsSelector](#qdrant-PointsSelector) | optional | Affected points |
 | ordering | [WriteOrdering](#qdrant-WriteOrdering) | optional | Write ordering guarantees |
 | shard_key_selector | [ShardKeySelector](#qdrant-ShardKeySelector) | optional | Option for custom sharding to specify used shard keys |
+| key | [string](#string) | optional | Option for indicate property of payload |
 
 
 
@@ -3127,9 +3747,7 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 <a name="qdrant-ShardKeySelector"></a>
 
 ### ShardKeySelector
----------------------------------------------
------------------ ShardKeySelector ----------
----------------------------------------------
+
 
 
 | Field | Type | Label | Description |
@@ -3150,6 +3768,40 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | data | [uint32](#uint32) | repeated |  |
+
+
+
+
+
+
+<a name="qdrant-SparseVector"></a>
+
+### SparseVector
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| values | [float](#float) | repeated |  |
+| indices | [uint32](#uint32) | repeated |  |
+
+
+
+
+
+
+<a name="qdrant-StartFrom"></a>
+
+### StartFrom
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| float | [double](#double) |  |  |
+| integer | [int64](#int64) |  |  |
+| timestamp | [google.protobuf.Timestamp](#google-protobuf-Timestamp) |  |  |
+| datetime | [string](#string) |  |  |
 
 
 
@@ -3280,13 +3932,14 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 <a name="qdrant-Vector"></a>
 
 ### Vector
-
+Legacy vector format, which determines the vector type by the configuration of its fields.
 
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| data | [float](#float) | repeated |  |
-| indices | [SparseIndices](#qdrant-SparseIndices) | optional |  |
+| data | [float](#float) | repeated | Vector data (flatten for multi vectors) |
+| indices | [SparseIndices](#qdrant-SparseIndices) | optional | Sparse indices for sparse vectors |
+| vectors_count | [uint32](#uint32) | optional | Number of vectors per multi vector |
 
 
 
@@ -3303,6 +3956,24 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 | ----- | ---- | ----- | ----------- |
 | id | [PointId](#qdrant-PointId) |  |  |
 | vector | [Vector](#qdrant-Vector) |  |  |
+
+
+
+
+
+
+<a name="qdrant-VectorInput"></a>
+
+### VectorInput
+Vector type to be used in queries. Ids will be substituted with their corresponding vectors from the collection.
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| id | [PointId](#qdrant-PointId) |  |  |
+| dense | [DenseVector](#qdrant-DenseVector) |  |  |
+| sparse | [SparseVector](#qdrant-SparseVector) |  |  |
+| multi_dense | [MultiDenseVector](#qdrant-MultiDenseVector) |  |  |
 
 
 
@@ -3407,6 +4078,18 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
  
 
 
+<a name="qdrant-Direction"></a>
+
+### Direction
+
+
+| Name | Number | Description |
+| ---- | ------ | ----------- |
+| Asc | 0 |  |
+| Desc | 1 |  |
+
+
+
 <a name="qdrant-FieldType"></a>
 
 ### FieldType
@@ -3420,6 +4103,18 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 | FieldTypeGeo | 3 |  |
 | FieldTypeText | 4 |  |
 | FieldTypeBool | 5 |  |
+| FieldTypeDatetime | 6 |  |
+
+
+
+<a name="qdrant-Fusion"></a>
+
+### Fusion
+
+
+| Name | Number | Description |
+| ---- | ------ | ----------- |
+| RRF | 0 | Reciprocal Rank Fusion |
 
 
 
@@ -3439,7 +4134,7 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 <a name="qdrant-RecommendStrategy"></a>
 
 ### RecommendStrategy
-How to use positive and negative vectors to find the results, default is `AverageVector`:
+How to use positive and negative vectors to find the results, default is `AverageVector`.
 
 | Name | Number | Description |
 | ---- | ------ | ----------- |
@@ -3458,6 +4153,7 @@ How to use positive and negative vectors to find the results, default is `Averag
 | UnknownUpdateStatus | 0 |  |
 | Acknowledged | 1 | Update is received, but not processed yet |
 | Completed | 2 | Update is applied and ready for search |
+| ClockRejected | 3 | Internal: update is rejected due to an outdated clock |
 
 
 
@@ -3529,6 +4225,8 @@ When using target (with or without context), the score behaves a little differen
 | DiscoverBatch | [DiscoverBatchPoints](#qdrant-DiscoverBatchPoints) | [DiscoverBatchResponse](#qdrant-DiscoverBatchResponse) | Batch request points based on { positive, negative } pairs of examples, and/or a target |
 | Count | [CountPoints](#qdrant-CountPoints) | [CountResponse](#qdrant-CountResponse) | Count points in collection with given filtering conditions |
 | UpdateBatch | [UpdateBatchPoints](#qdrant-UpdateBatchPoints) | [UpdateBatchResponse](#qdrant-UpdateBatchResponse) | Perform multiple update operations in one request |
+| Query | [QueryPoints](#qdrant-QueryPoints) | [QueryResponse](#qdrant-QueryResponse) | Universally query points. This endpoint covers all capabilities of search, recommend, discover, filters. But also enables hybrid and multi-stage queries. |
+| QueryBatch | [QueryBatchPoints](#qdrant-QueryBatchPoints) | [QueryBatchResponse](#qdrant-QueryBatchResponse) | Universally query points in a batch fashion. This endpoint covers all capabilities of search, recommend, discover, filters. But also enables hybrid and multi-stage queries. |
 
  
 
@@ -3551,6 +4249,7 @@ When using target (with or without context), the score behaves a little differen
 | ----- | ---- | ----- | ----------- |
 | title | [string](#string) |  |  |
 | version | [string](#string) |  |  |
+| commit | [string](#string) | optional |  |
 
 
 
@@ -3817,6 +4516,7 @@ When using target (with or without context), the score behaves a little differen
 | name | [string](#string) |  | Name of the snapshot |
 | creation_time | [google.protobuf.Timestamp](#google-protobuf-Timestamp) |  | Creation time of the snapshot |
 | size | [int64](#int64) |  | Size of the snapshot in bytes |
+| checksum | [string](#string) | optional | SHA256 digest of the snapshot file |
 
 
 

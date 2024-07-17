@@ -19,7 +19,6 @@ use crate::index::hnsw_index::search_context::SearchContext;
 use crate::index::visited_pool::{VisitedListHandle, VisitedPool};
 
 pub type LinkContainer = Vec<PointOffsetType>;
-pub type LinkContainerRef<'a> = &'a [PointOffsetType];
 pub type LayersContainer = Vec<LinkContainer>;
 
 pub const HNSW_GRAPH_FILE: &str = "graph.bin";
@@ -451,7 +450,7 @@ mod tests {
 
         let top = 5;
         let query = random_vector(&mut rng, dim);
-        let processed_query = M::preprocess(query.clone());
+        let processed_query = <M as Metric<VectorElementType>>::preprocess(query.clone());
         let mut reference_top = FixedLengthPriorityQueue::new(top);
         for idx in 0..vector_holder.vectors.len() as PointOffsetType {
             let vec = &vector_holder.vectors.get(idx);

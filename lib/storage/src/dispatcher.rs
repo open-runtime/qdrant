@@ -1,13 +1,14 @@
 use std::num::NonZeroU32;
-use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use collection::config::ShardingMethod;
 use common::defaults::CONSENSUS_META_OP_WAIT;
+use segment::types::default_shard_number_per_node_const;
 
 use crate::content_manager::collection_meta_ops::AliasOperations;
 use crate::content_manager::shard_distribution::ShardDistributionProposal;
+use crate::rbac::Access;
 use crate::{
     ClusterStatus, CollectionMetaOperations, ConsensusOperations, ConsensusStateRef, StorageError,
     TableOfContent,
@@ -34,7 +35,10 @@ impl Dispatcher {
         }
     }
 
-    pub fn toc(&self) -> &Arc<TableOfContent> {
+    /// Get the table of content.
+    /// The `_access` parameter is not used, but it's required to verify caller's possession
+    /// of the [Access] object.
+    pub fn toc(&self, _access: &Access) -> &Arc<TableOfContent> {
         &self.toc
     }
 
@@ -47,8 +51,11 @@ impl Dispatcher {
     pub async fn submit_collection_meta_op(
         &self,
         operation: CollectionMetaOperations,
+        access: Access,
         wait_timeout: Option<Duration>,
     ) -> Result<bool, StorageError> {
+        access.check_collection_meta_operation(&operation)?;
+
         // if distributed deployment is enabled
         if let Some(state) = self.consensus_state.as_ref() {
             let start = Instant::now();
@@ -64,11 +71,22 @@ impl Dispatcher {
                             ShardingMethod::Auto => {
                                 // Suggest even distribution of shards across nodes
                                 let number_of_peers = state.0.peer_count();
+
+                                let shard_nr_per_node = self
+                                    .toc
+                                    .storage_config
+                                    .collection
+                                    .as_ref()
+                                    .map(|i| i.shard_number_per_node)
+                                    .unwrap_or(default_shard_number_per_node_const());
+
+                                let suggested_shard_nr = number_of_peers as u32 * shard_nr_per_node;
+
                                 let shard_distribution = self
                                     .toc
                                     .suggest_shard_distribution(
                                         &op,
-                                        NonZeroU32::new(number_of_peers as u32)
+                                        NonZeroU32::new(suggested_shard_nr)
                                             .expect("Peer count should be always >= 1"),
                                     )
                                     .await;
@@ -119,6 +137,7 @@ impl Dispatcher {
                 // Sync nodes after collection or shard key creation
                 CollectionMetaOperations::CreateCollection(_)
                 | CollectionMetaOperations::CreateShardKey(_) => true,
+
                 // Sync nodes when creating or renaming collection aliases
                 CollectionMetaOperations::ChangeAliases(changes) => {
                     changes.actions.iter().any(|change| match change {
@@ -126,6 +145,10 @@ impl Dispatcher {
                         AliasOperations::DeleteAlias(_) => false,
                     })
                 }
+
+                // TODO(resharding): Do we need/want to synchronize `Resharding` operations?
+                CollectionMetaOperations::Resharding(_, _) => false,
+
                 // No need to sync nodes for other operations
                 CollectionMetaOperations::UpdateCollection(_)
                 | CollectionMetaOperations::DeleteCollection(_)
@@ -207,13 +230,5 @@ impl Dispatcher {
         } else {
             Ok(())
         }
-    }
-}
-
-impl Deref for Dispatcher {
-    type Target = TableOfContent;
-
-    fn deref(&self) -> &Self::Target {
-        self.toc.deref()
     }
 }

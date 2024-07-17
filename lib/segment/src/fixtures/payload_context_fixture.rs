@@ -25,6 +25,7 @@ use crate::types::{PayloadSchemaType, PointIdType, SeqNumberType};
 /// Warn: Use for tests only
 ///
 /// This struct mimics the interface of `PointsIterator` and `IdTracker` only for basic cases
+#[derive(Debug)]
 pub struct FixtureIdTracker {
     ids: Vec<PointOffsetType>,
     deleted: BitVec,
@@ -155,6 +156,10 @@ impl IdTracker for FixtureIdTracker {
     fn deleted_point_bitslice(&self) -> &BitSlice {
         &self.deleted
     }
+
+    fn cleanup_versions(&mut self) -> OperationResult<()> {
+        Ok(())
+    }
 }
 
 /// Creates in-memory payload storage and fills it with random points
@@ -229,24 +234,22 @@ pub fn create_struct_payload_index(
     let mut index = StructPayloadIndex::open(payload_storage, id_tracker, path, true).unwrap();
 
     index
-        .set_indexed(STR_KEY, PayloadSchemaType::Keyword.into())
+        .set_indexed(&STR_KEY.parse().unwrap(), PayloadSchemaType::Keyword)
         .unwrap();
     index
-        .set_indexed(INT_KEY, PayloadSchemaType::Integer.into())
+        .set_indexed(&INT_KEY.parse().unwrap(), PayloadSchemaType::Integer)
         .unwrap();
     index
-        .set_indexed(FLT_KEY, PayloadSchemaType::Float.into())
+        .set_indexed(&FLT_KEY.parse().unwrap(), PayloadSchemaType::Float)
         .unwrap();
     index
-        .set_indexed(GEO_KEY, PayloadSchemaType::Geo.into())
+        .set_indexed(&GEO_KEY.parse().unwrap(), PayloadSchemaType::Geo)
         .unwrap();
-
     index
-        .set_indexed(TEXT_KEY, PayloadSchemaType::Text.into())
+        .set_indexed(&TEXT_KEY.parse().unwrap(), PayloadSchemaType::Text)
         .unwrap();
-
     index
-        .set_indexed(BOOL_KEY, PayloadSchemaType::Bool.into())
+        .set_indexed(&BOOL_KEY.parse().unwrap(), PayloadSchemaType::Bool)
         .unwrap();
 
     index

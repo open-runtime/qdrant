@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
+use common::types::TelemetryDetail;
 use parking_lot::Mutex;
 use schemars::JsonSchema;
 use segment::common::anonymize::Anonymize;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use storage::dispatcher::Dispatcher;
+use storage::rbac::Access;
 use uuid::Uuid;
 
 use crate::common::telemetry_ops::app_telemetry::{AppBuildTelemetry, AppBuildTelemetryCollector};
@@ -25,7 +27,7 @@ pub struct TelemetryCollector {
 }
 
 // Whole telemetry data
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Clone, Debug, JsonSchema)]
 pub struct TelemetryData {
     id: String,
     pub(crate) app: AppBuildTelemetry,
@@ -70,15 +72,17 @@ impl TelemetryCollector {
         }
     }
 
-    pub async fn prepare_data(&self, level: usize) -> TelemetryData {
+    pub async fn prepare_data(&self, access: &Access, detail: TelemetryDetail) -> TelemetryData {
         TelemetryData {
             id: self.process_id.to_string(),
-            collections: CollectionsTelemetry::collect(level, self.dispatcher.toc()).await,
-            app: AppBuildTelemetry::collect(level, &self.app_telemetry_collector, &self.settings),
-            cluster: ClusterTelemetry::collect(level, &self.dispatcher, &self.settings),
+            collections: CollectionsTelemetry::collect(detail, access, self.dispatcher.toc(access))
+                .await,
+            app: AppBuildTelemetry::collect(detail, &self.app_telemetry_collector, &self.settings),
+            cluster: ClusterTelemetry::collect(detail, &self.dispatcher, &self.settings),
             requests: RequestsTelemetry::collect(
                 &self.actix_telemetry_collector.lock(),
                 &self.tonic_telemetry_collector.lock(),
+                detail,
             ),
         }
     }

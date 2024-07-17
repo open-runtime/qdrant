@@ -1,6 +1,9 @@
+use std::sync::Arc;
 use std::time::Duration;
 
+use api::rest::{QueryGroupsRequestInternal, SearchGroupsRequestInternal, ShardKeySelector};
 use collection::common::batching::batch_requests;
+use collection::grouping::group_by::GroupRequest;
 use collection::operations::consistency_params::ReadConsistency;
 use collection::operations::payload_ops::{
     DeletePayload, DeletePayloadOp, PayloadOps, SetPayload, SetPayloadOp,
@@ -9,20 +12,22 @@ use collection::operations::point_ops::{
     FilterSelector, PointIdsList, PointInsertOperations, PointOperations, PointsSelector,
     WriteOrdering,
 };
-use collection::operations::shard_key_selector::ShardKeySelector;
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::types::{
     CoreSearchRequest, CoreSearchRequestBatch, CountRequestInternal, CountResult,
-    DiscoverRequestBatch, DiscoverRequestInternal, GroupsResult, PointRequestInternal,
-    RecommendGroupsRequestInternal, Record, ScrollRequestInternal, ScrollResult,
-    SearchGroupsRequestInternal, UpdateResult,
+    DiscoverRequestBatch, GroupsResult, PointRequestInternal, RecommendGroupsRequestInternal,
+    Record, ScrollRequestInternal, ScrollResult, UpdateResult,
 };
+use collection::operations::universal_query::collection_query::CollectionQueryRequest;
 use collection::operations::vector_ops::{
     DeleteVectors, UpdateVectors, UpdateVectorsOp, VectorOperations,
 };
-use collection::operations::{CollectionUpdateOperations, CreateIndex, FieldIndexOperations};
+use collection::operations::{
+    ClockTag, CollectionUpdateOperations, CreateIndex, FieldIndexOperations, OperationWithClockTag,
+};
 use collection::shards::shard::ShardId;
 use schemars::JsonSchema;
+use segment::json_path::JsonPath;
 use segment::types::{PayloadFieldSchema, PayloadKeyType, ScoredPoint};
 use serde::{Deserialize, Serialize};
 use storage::content_manager::collection_meta_ops::{
@@ -31,6 +36,7 @@ use storage::content_manager::collection_meta_ops::{
 use storage::content_manager::errors::StorageError;
 use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
+use storage::rbac::Access;
 use validator::Validate;
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate)]
@@ -153,13 +159,16 @@ fn get_shard_selector_for_update(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_upsert_points(
-    toc: &TableOfContent,
-    collection_name: &str,
+    toc: Arc<TableOfContent>,
+    collection_name: String,
     operation: PointInsertOperations,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
     wait: bool,
     ordering: WriteOrdering,
+    access: Access,
 ) -> Result<UpdateResult, StorageError> {
     let (shard_key, operation) = operation.decompose();
     let collection_operation =
@@ -168,22 +177,26 @@ pub async fn do_upsert_points(
     let shard_selector = get_shard_selector_for_update(shard_selection, shard_key);
 
     toc.update(
-        collection_name,
-        collection_operation,
+        &collection_name,
+        OperationWithClockTag::new(collection_operation, clock_tag),
         wait,
         ordering,
         shard_selector,
+        access,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_delete_points(
-    toc: &TableOfContent,
-    collection_name: &str,
+    toc: Arc<TableOfContent>,
+    collection_name: String,
     points: PointsSelector,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
     wait: bool,
     ordering: WriteOrdering,
+    access: Access,
 ) -> Result<UpdateResult, StorageError> {
     let (point_operation, shard_key) = match points {
         PointsSelector::PointIdsSelector(PointIdsList { points, shard_key }) => {
@@ -197,22 +210,26 @@ pub async fn do_delete_points(
     let shard_selector = get_shard_selector_for_update(shard_selection, shard_key);
 
     toc.update(
-        collection_name,
-        collection_operation,
+        &collection_name,
+        OperationWithClockTag::new(collection_operation, clock_tag),
         wait,
         ordering,
         shard_selector,
+        access,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_update_vectors(
-    toc: &TableOfContent,
-    collection_name: &str,
+    toc: Arc<TableOfContent>,
+    collection_name: String,
     operation: UpdateVectors,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
     wait: bool,
     ordering: WriteOrdering,
+    access: Access,
 ) -> Result<UpdateResult, StorageError> {
     let UpdateVectors { points, shard_key } = operation;
 
@@ -223,23 +240,29 @@ pub async fn do_update_vectors(
     let shard_selector = get_shard_selector_for_update(shard_selection, shard_key);
 
     toc.update(
-        collection_name,
-        collection_operation,
+        &collection_name,
+        OperationWithClockTag::new(collection_operation, clock_tag),
         wait,
         ordering,
         shard_selector,
+        access,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_delete_vectors(
-    toc: &TableOfContent,
-    collection_name: &str,
+    toc: Arc<TableOfContent>,
+    collection_name: String,
     operation: DeleteVectors,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
     wait: bool,
     ordering: WriteOrdering,
+    access: Access,
 ) -> Result<UpdateResult, StorageError> {
+    // TODO: Is this cancel safe!?
+
     let DeleteVectors {
         vector,
         filter,
@@ -248,22 +271,24 @@ pub async fn do_delete_vectors(
     } = operation;
 
     let vector_names: Vec<_> = vector.into_iter().collect();
+    let shard_selector = get_shard_selector_for_update(shard_selection, shard_key);
 
     let mut result = None;
-
-    let shard_selector = get_shard_selector_for_update(shard_selection, shard_key);
 
     if let Some(filter) = filter {
         let vectors_operation =
             VectorOperations::DeleteVectorsByFilter(filter, vector_names.clone());
+
         let collection_operation = CollectionUpdateOperations::VectorOperation(vectors_operation);
+
         result = Some(
             toc.update(
-                collection_name,
-                collection_operation,
+                &collection_name,
+                OperationWithClockTag::new(collection_operation, clock_tag),
                 wait,
                 ordering,
                 shard_selector.clone(),
+                access.clone(),
             )
             .await?,
         );
@@ -274,11 +299,12 @@ pub async fn do_delete_vectors(
         let collection_operation = CollectionUpdateOperations::VectorOperation(vectors_operation);
         result = Some(
             toc.update(
-                collection_name,
-                collection_operation,
+                &collection_name,
+                OperationWithClockTag::new(collection_operation, clock_tag),
                 wait,
                 ordering,
                 shard_selector,
+                access,
             )
             .await?,
         );
@@ -287,19 +313,23 @@ pub async fn do_delete_vectors(
     result.ok_or_else(|| StorageError::bad_request("No filter or points provided"))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_set_payload(
-    toc: &TableOfContent,
-    collection_name: &str,
+    toc: Arc<TableOfContent>,
+    collection_name: String,
     operation: SetPayload,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
     wait: bool,
     ordering: WriteOrdering,
+    access: Access,
 ) -> Result<UpdateResult, StorageError> {
     let SetPayload {
         points,
         payload,
         filter,
         shard_key,
+        key,
     } = operation;
 
     let collection_operation =
@@ -307,33 +337,39 @@ pub async fn do_set_payload(
             payload,
             points,
             filter,
+            key,
         }));
 
     let shard_selector = get_shard_selector_for_update(shard_selection, shard_key);
 
     toc.update(
-        collection_name,
-        collection_operation,
+        &collection_name,
+        OperationWithClockTag::new(collection_operation, clock_tag),
         wait,
         ordering,
         shard_selector,
+        access,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_overwrite_payload(
-    toc: &TableOfContent,
-    collection_name: &str,
+    toc: Arc<TableOfContent>,
+    collection_name: String,
     operation: SetPayload,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
     wait: bool,
     ordering: WriteOrdering,
+    access: Access,
 ) -> Result<UpdateResult, StorageError> {
     let SetPayload {
         points,
         payload,
         filter,
         shard_key,
+        ..
     } = operation;
 
     let collection_operation =
@@ -341,27 +377,33 @@ pub async fn do_overwrite_payload(
             payload,
             points,
             filter,
+            // overwrite operation doesn't support payload selector
+            key: None,
         }));
 
     let shard_selector = get_shard_selector_for_update(shard_selection, shard_key);
 
     toc.update(
-        collection_name,
-        collection_operation,
+        &collection_name,
+        OperationWithClockTag::new(collection_operation, clock_tag),
         wait,
         ordering,
         shard_selector,
+        access,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_delete_payload(
-    toc: &TableOfContent,
-    collection_name: &str,
+    toc: Arc<TableOfContent>,
+    collection_name: String,
     operation: DeletePayload,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
     wait: bool,
     ordering: WriteOrdering,
+    access: Access,
 ) -> Result<UpdateResult, StorageError> {
     let DeletePayload {
         keys,
@@ -380,22 +422,26 @@ pub async fn do_delete_payload(
     let shard_selector = get_shard_selector_for_update(shard_selection, shard_key);
 
     toc.update(
-        collection_name,
-        collection_operation,
+        &collection_name,
+        OperationWithClockTag::new(collection_operation, clock_tag),
         wait,
         ordering,
         shard_selector,
+        access,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_clear_payload(
-    toc: &TableOfContent,
-    collection_name: &str,
+    toc: Arc<TableOfContent>,
+    collection_name: String,
     points: PointsSelector,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
     wait: bool,
     ordering: WriteOrdering,
+    access: Access,
 ) -> Result<UpdateResult, StorageError> {
     let (point_operation, shard_key) = match points {
         PointsSelector::PointIdsSelector(PointIdsList { points, shard_key }) => {
@@ -411,111 +457,131 @@ pub async fn do_clear_payload(
     let shard_selector = get_shard_selector_for_update(shard_selection, shard_key);
 
     toc.update(
-        collection_name,
-        collection_operation,
+        &collection_name,
+        OperationWithClockTag::new(collection_operation, clock_tag),
         wait,
         ordering,
         shard_selector,
+        access,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_batch_update_points(
-    toc: &TableOfContent,
-    collection_name: &str,
+    toc: Arc<TableOfContent>,
+    collection_name: String,
     operations: Vec<UpdateOperation>,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
     wait: bool,
     ordering: WriteOrdering,
+    access: Access,
 ) -> Result<Vec<UpdateResult>, StorageError> {
     let mut results = Vec::with_capacity(operations.len());
     for operation in operations {
         let result = match operation {
             UpdateOperation::Upsert(operation) => {
                 do_upsert_points(
-                    toc,
-                    collection_name,
+                    toc.clone(),
+                    collection_name.clone(),
                     operation.upsert,
+                    clock_tag,
                     shard_selection,
                     wait,
                     ordering,
+                    access.clone(),
                 )
                 .await
             }
             UpdateOperation::Delete(operation) => {
                 do_delete_points(
-                    toc,
-                    collection_name,
+                    toc.clone(),
+                    collection_name.clone(),
                     operation.delete,
+                    clock_tag,
                     shard_selection,
                     wait,
                     ordering,
+                    access.clone(),
                 )
                 .await
             }
             UpdateOperation::SetPayload(operation) => {
                 do_set_payload(
-                    toc,
-                    collection_name,
+                    toc.clone(),
+                    collection_name.clone(),
                     operation.set_payload,
+                    clock_tag,
                     shard_selection,
                     wait,
                     ordering,
+                    access.clone(),
                 )
                 .await
             }
             UpdateOperation::OverwritePayload(operation) => {
                 do_overwrite_payload(
-                    toc,
-                    collection_name,
+                    toc.clone(),
+                    collection_name.clone(),
                     operation.overwrite_payload,
+                    clock_tag,
                     shard_selection,
                     wait,
                     ordering,
+                    access.clone(),
                 )
                 .await
             }
             UpdateOperation::DeletePayload(operation) => {
                 do_delete_payload(
-                    toc,
-                    collection_name,
+                    toc.clone(),
+                    collection_name.clone(),
                     operation.delete_payload,
+                    clock_tag,
                     shard_selection,
                     wait,
                     ordering,
+                    access.clone(),
                 )
                 .await
             }
             UpdateOperation::ClearPayload(operation) => {
                 do_clear_payload(
-                    toc,
-                    collection_name,
+                    toc.clone(),
+                    collection_name.clone(),
                     operation.clear_payload,
+                    clock_tag,
                     shard_selection,
                     wait,
                     ordering,
+                    access.clone(),
                 )
                 .await
             }
             UpdateOperation::UpdateVectors(operation) => {
                 do_update_vectors(
-                    toc,
-                    collection_name,
+                    toc.clone(),
+                    collection_name.clone(),
                     operation.update_vectors,
+                    clock_tag,
                     shard_selection,
                     wait,
                     ordering,
+                    access.clone(),
                 )
                 .await
             }
             UpdateOperation::DeleteVectors(operation) => {
                 do_delete_vectors(
-                    toc,
-                    collection_name,
+                    toc.clone(),
+                    collection_name.clone(),
                     operation.delete_vectors,
+                    clock_tag,
                     shard_selection,
                     wait,
                     ordering,
+                    access.clone(),
                 )
                 .await
             }
@@ -525,11 +591,13 @@ pub async fn do_batch_update_points(
     Ok(results)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_create_index_internal(
-    toc: &TableOfContent,
-    collection_name: &str,
+    toc: Arc<TableOfContent>,
+    collection_name: String,
     field_name: PayloadKeyType,
     field_schema: Option<PayloadFieldSchema>,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
     wait: bool,
     ordering: WriteOrdering,
@@ -548,23 +616,29 @@ pub async fn do_create_index_internal(
     };
 
     toc.update(
-        collection_name,
-        collection_operation,
+        &collection_name,
+        OperationWithClockTag::new(collection_operation, clock_tag),
         wait,
         ordering,
         shard_selector,
+        Access::full("Internal API"),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_create_index(
-    dispatcher: &Dispatcher,
-    collection_name: &str,
+    dispatcher: Arc<Dispatcher>,
+    collection_name: String,
     operation: CreateFieldIndex,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
     wait: bool,
     ordering: WriteOrdering,
+    access: Access,
 ) -> Result<UpdateResult, StorageError> {
+    // TODO: Is this cancel safe!?
+
     let Some(field_schema) = operation.field_schema else {
         return Err(StorageError::bad_request(
             "Can't auto-detect field type, please specify `field_schema` in the request",
@@ -580,8 +654,11 @@ pub async fn do_create_index(
     // Default consensus timeout will be used
     let wait_timeout = None; // ToDo: make it configurable
 
+    let toc = dispatcher.toc(&access).clone();
+
+    // TODO: Is `submit_collection_meta_op` cancel-safe!? Should be, I think?.. 🤔
     dispatcher
-        .submit_collection_meta_op(consensus_op, wait_timeout)
+        .submit_collection_meta_op(consensus_op, access, wait_timeout)
         .await?;
 
     // This function is required as long as we want to maintain interface compatibility
@@ -589,10 +666,11 @@ pub async fn do_create_index(
     // The idea is to migrate from the point-like interface to consensus-like interface in the next few versions
 
     do_create_index_internal(
-        dispatcher.toc(),
+        toc,
         collection_name,
         operation.field_name,
         Some(field_schema),
+        clock_tag,
         shard_selection,
         wait,
         ordering,
@@ -600,10 +678,12 @@ pub async fn do_create_index(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_delete_index_internal(
-    toc: &TableOfContent,
-    collection_name: &str,
-    index_name: String,
+    toc: Arc<TableOfContent>,
+    collection_name: String,
+    index_name: JsonPath,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
     wait: bool,
     ordering: WriteOrdering,
@@ -619,23 +699,29 @@ pub async fn do_delete_index_internal(
     };
 
     toc.update(
-        collection_name,
-        collection_operation,
+        &collection_name,
+        OperationWithClockTag::new(collection_operation, clock_tag),
         wait,
         ordering,
         shard_selector,
+        Access::full("Internal API"),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_delete_index(
-    dispatcher: &Dispatcher,
-    collection_name: &str,
-    index_name: String,
+    dispatcher: Arc<Dispatcher>,
+    collection_name: String,
+    index_name: JsonPath,
+    clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
     wait: bool,
     ordering: WriteOrdering,
+    access: Access,
 ) -> Result<UpdateResult, StorageError> {
+    // TODO: Is this cancel safe!?
+
     let consensus_op = CollectionMetaOperations::DropPayloadIndex(DropPayloadIndex {
         collection_name: collection_name.to_string(),
         field_name: index_name.clone(),
@@ -644,14 +730,18 @@ pub async fn do_delete_index(
     // Default consensus timeout will be used
     let wait_timeout = None; // ToDo: make it configurable
 
+    let toc = dispatcher.toc(&access).clone();
+
+    // TODO: Is `submit_collection_meta_op` cancel-safe!? Should be, I think?.. 🤔
     dispatcher
-        .submit_collection_meta_op(consensus_op, wait_timeout)
+        .submit_collection_meta_op(consensus_op, access, wait_timeout)
         .await?;
 
     do_delete_index_internal(
-        dispatcher.toc(),
+        toc,
         collection_name,
         index_name,
+        clock_tag,
         shard_selection,
         wait,
         ordering,
@@ -665,6 +755,7 @@ pub async fn do_core_search_points(
     request: CoreSearchRequest,
     read_consistency: Option<ReadConsistency>,
     shard_selection: ShardSelectorInternal,
+    access: Access,
     timeout: Option<Duration>,
 ) -> Result<Vec<ScoredPoint>, StorageError> {
     let batch_res = do_core_search_batch_points(
@@ -675,6 +766,7 @@ pub async fn do_core_search_points(
         },
         read_consistency,
         shard_selection,
+        access,
         timeout,
     )
     .await?;
@@ -689,6 +781,7 @@ pub async fn do_search_batch_points(
     collection_name: &str,
     requests: Vec<(CoreSearchRequest, ShardSelectorInternal)>,
     read_consistency: Option<ReadConsistency>,
+    access: Access,
     timeout: Option<Duration>,
 ) -> Result<Vec<Vec<ScoredPoint>>, StorageError> {
     let requests = batch_requests::<
@@ -717,6 +810,7 @@ pub async fn do_search_batch_points(
                 core_batch,
                 read_consistency,
                 shard_selector,
+                access.clone(),
                 timeout,
             );
             res.push(req);
@@ -735,6 +829,7 @@ pub async fn do_core_search_batch_points(
     request: CoreSearchRequestBatch,
     read_consistency: Option<ReadConsistency>,
     shard_selection: ShardSelectorInternal,
+    access: Access,
     timeout: Option<Duration>,
 ) -> Result<Vec<Vec<ScoredPoint>>, StorageError> {
     toc.core_search_batch(
@@ -742,6 +837,7 @@ pub async fn do_core_search_batch_points(
         request,
         read_consistency,
         shard_selection,
+        access,
         timeout,
     )
     .await
@@ -753,13 +849,15 @@ pub async fn do_search_point_groups(
     request: SearchGroupsRequestInternal,
     read_consistency: Option<ReadConsistency>,
     shard_selection: ShardSelectorInternal,
+    access: Access,
     timeout: Option<Duration>,
 ) -> Result<GroupsResult, StorageError> {
     toc.group(
         collection_name,
-        request.into(),
+        GroupRequest::from(request),
         read_consistency,
         shard_selection,
+        access,
         timeout,
     )
     .await
@@ -771,31 +869,15 @@ pub async fn do_recommend_point_groups(
     request: RecommendGroupsRequestInternal,
     read_consistency: Option<ReadConsistency>,
     shard_selection: ShardSelectorInternal,
+    access: Access,
     timeout: Option<Duration>,
 ) -> Result<GroupsResult, StorageError> {
     toc.group(
         collection_name,
-        request.into(),
+        GroupRequest::from(request),
         read_consistency,
         shard_selection,
-        timeout,
-    )
-    .await
-}
-
-pub async fn do_discover_points(
-    toc: &TableOfContent,
-    collection_name: &str,
-    request: DiscoverRequestInternal,
-    read_consistency: Option<ReadConsistency>,
-    shard_selector: ShardSelectorInternal,
-    timeout: Option<Duration>,
-) -> Result<Vec<ScoredPoint>, StorageError> {
-    toc.discover(
-        collection_name,
-        request,
-        read_consistency,
-        shard_selector,
+        access,
         timeout,
     )
     .await
@@ -806,6 +888,7 @@ pub async fn do_discover_batch_points(
     collection_name: &str,
     request: DiscoverRequestBatch,
     read_consistency: Option<ReadConsistency>,
+    access: Access,
     timeout: Option<Duration>,
 ) -> Result<Vec<Vec<ScoredPoint>>, StorageError> {
     let requests = request
@@ -821,7 +904,7 @@ pub async fn do_discover_batch_points(
         })
         .collect();
 
-    toc.discover_batch(collection_name, requests, read_consistency, timeout)
+    toc.discover_batch(collection_name, requests, read_consistency, access, timeout)
         .await
 }
 
@@ -831,9 +914,16 @@ pub async fn do_count_points(
     request: CountRequestInternal,
     read_consistency: Option<ReadConsistency>,
     shard_selection: ShardSelectorInternal,
+    access: Access,
 ) -> Result<CountResult, StorageError> {
-    toc.count(collection_name, request, read_consistency, shard_selection)
-        .await
+    toc.count(
+        collection_name,
+        request,
+        read_consistency,
+        shard_selection,
+        access,
+    )
+    .await
 }
 
 pub async fn do_get_points(
@@ -842,9 +932,16 @@ pub async fn do_get_points(
     request: PointRequestInternal,
     read_consistency: Option<ReadConsistency>,
     shard_selection: ShardSelectorInternal,
+    access: Access,
 ) -> Result<Vec<Record>, StorageError> {
-    toc.retrieve(collection_name, request, read_consistency, shard_selection)
-        .await
+    toc.retrieve(
+        collection_name,
+        request,
+        read_consistency,
+        shard_selection,
+        access,
+    )
+    .await
 }
 
 pub async fn do_scroll_points(
@@ -853,7 +950,65 @@ pub async fn do_scroll_points(
     request: ScrollRequestInternal,
     read_consistency: Option<ReadConsistency>,
     shard_selection: ShardSelectorInternal,
+    access: Access,
 ) -> Result<ScrollResult, StorageError> {
-    toc.scroll(collection_name, request, read_consistency, shard_selection)
+    toc.scroll(
+        collection_name,
+        request,
+        read_consistency,
+        shard_selection,
+        access,
+    )
+    .await
+}
+
+pub async fn do_query_points(
+    toc: &TableOfContent,
+    collection_name: &str,
+    request: CollectionQueryRequest,
+    read_consistency: Option<ReadConsistency>,
+    shard_selection: ShardSelectorInternal,
+    access: Access,
+    timeout: Option<Duration>,
+) -> Result<Vec<ScoredPoint>, StorageError> {
+    let requests = vec![(request, shard_selection)];
+    let batch_res = toc
+        .query_batch(collection_name, requests, read_consistency, access, timeout)
+        .await?;
+    batch_res
+        .into_iter()
+        .next()
+        .ok_or_else(|| StorageError::service_error("Empty query result"))
+}
+
+pub async fn do_query_batch_points(
+    toc: &TableOfContent,
+    collection_name: &str,
+    requests: Vec<(CollectionQueryRequest, ShardSelectorInternal)>,
+    read_consistency: Option<ReadConsistency>,
+    access: Access,
+    timeout: Option<Duration>,
+) -> Result<Vec<Vec<ScoredPoint>>, StorageError> {
+    toc.query_batch(collection_name, requests, read_consistency, access, timeout)
         .await
+}
+
+pub async fn do_query_point_groups(
+    toc: &TableOfContent,
+    collection_name: &str,
+    request: QueryGroupsRequestInternal,
+    read_consistency: Option<ReadConsistency>,
+    shard_selection: ShardSelectorInternal,
+    access: Access,
+    timeout: Option<Duration>,
+) -> Result<GroupsResult, StorageError> {
+    toc.group(
+        collection_name,
+        GroupRequest::from(request),
+        read_consistency,
+        shard_selection,
+        access,
+        timeout,
+    )
+    .await
 }

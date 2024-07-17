@@ -1,6 +1,6 @@
 use std::num::NonZeroU32;
 
-use common::validation::validate_move_shard_different_peers;
+use common::validation::validate_shard_different_peers;
 use schemars::JsonSchema;
 use segment::types::ShardKey;
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,16 @@ pub enum ClusterOperations {
     CreateShardingKey(CreateShardingKeyOperation),
     /// Drop a custom shard partition for a given key
     DropShardingKey(DropShardingKeyOperation),
+    /// Restart transfer
+    RestartTransfer(RestartTransferOperation),
+    /// Start resharding
+    // TODO(resharding): expose when releasing resharding
+    #[schemars(skip)]
+    StartResharding(StartReshardingOperation),
+    /// Abort resharding
+    // TODO(resharding): expose when releasing resharding
+    #[schemars(skip)]
+    AbortResharding(AbortReshardingOperation),
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone)]
@@ -36,6 +46,12 @@ pub struct CreateShardingKeyOperation {
 #[serde(rename_all = "snake_case")]
 pub struct DropShardingKeyOperation {
     pub drop_sharding_key: DropShardingKey,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct RestartTransferOperation {
+    pub restart_transfer: RestartTransfer,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone)]
@@ -60,6 +76,18 @@ pub struct DropShardingKey {
     pub shard_key: ShardKey,
 }
 
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct RestartTransfer {
+    pub shard_id: ShardId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)] // TODO(resharding): expose once we release resharding
+    pub to_shard_id: Option<ShardId>,
+    pub from_peer_id: PeerId,
+    pub to_peer_id: PeerId,
+    pub method: ShardTransferMethod,
+}
+
 impl Validate for ClusterOperations {
     fn validate(&self) -> Result<(), validator::ValidationErrors> {
         match self {
@@ -69,6 +97,9 @@ impl Validate for ClusterOperations {
             ClusterOperations::DropReplica(op) => op.validate(),
             ClusterOperations::CreateShardingKey(op) => op.validate(),
             ClusterOperations::DropShardingKey(op) => op.validate(),
+            ClusterOperations::RestartTransfer(op) => op.validate(),
+            ClusterOperations::StartResharding(op) => op.validate(),
+            ClusterOperations::AbortResharding(op) => op.validate(),
         }
     }
 }
@@ -84,7 +115,7 @@ pub struct MoveShardOperation {
 #[serde(rename_all = "snake_case")]
 pub struct ReplicateShardOperation {
     #[validate]
-    pub replicate_shard: MoveShard,
+    pub replicate_shard: ReplicateShard,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone)]
@@ -98,13 +129,49 @@ pub struct DropReplicaOperation {
 #[serde(rename_all = "snake_case")]
 pub struct AbortTransferOperation {
     #[validate]
-    pub abort_transfer: MoveShard,
+    pub abort_transfer: AbortShardTransfer,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, Validate)]
+#[serde(rename_all = "snake_case")]
+pub struct StartReshardingOperation {
+    #[validate]
+    pub start_resharding: StartResharding,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, Validate)]
+#[serde(rename_all = "snake_case")]
+pub struct AbortReshardingOperation {
+    #[validate]
+    pub abort_resharding: AbortResharding,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct ReplicateShard {
+    pub shard_id: ShardId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)] // TODO(resharding): expose once we release resharding
+    pub to_shard_id: Option<ShardId>,
+    pub to_peer_id: PeerId,
+    pub from_peer_id: PeerId,
+    /// Method for transferring the shard from one node to another
+    pub method: Option<ShardTransferMethod>,
+}
+
+impl Validate for ReplicateShard {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        validate_shard_different_peers(self.from_peer_id, self.to_peer_id)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct MoveShard {
     pub shard_id: ShardId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)] // TODO(resharding): expose once we release resharding
+    pub to_shard_id: Option<ShardId>,
     pub to_peer_id: PeerId,
     pub from_peer_id: PeerId,
     /// Method for transferring the shard from one node to another
@@ -113,7 +180,13 @@ pub struct MoveShard {
 
 impl Validate for MoveShard {
     fn validate(&self) -> Result<(), ValidationErrors> {
-        validate_move_shard_different_peers(self.from_peer_id, self.to_peer_id)
+        validate_shard_different_peers(self.from_peer_id, self.to_peer_id)
+    }
+}
+
+impl Validate for AbortShardTransfer {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        validate_shard_different_peers(self.from_peer_id, self.to_peer_id)
     }
 }
 
@@ -123,3 +196,25 @@ pub struct Replica {
     pub shard_id: ShardId,
     pub peer_id: PeerId,
 }
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct AbortShardTransfer {
+    pub shard_id: ShardId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)] // TODO(resharding): expose once we release resharding
+    pub to_shard_id: Option<ShardId>,
+    pub to_peer_id: PeerId,
+    pub from_peer_id: PeerId,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, Validate)]
+#[serde(rename_all = "snake_case")]
+pub struct StartResharding {
+    pub peer_id: Option<PeerId>,
+    pub shard_key: Option<ShardKey>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, Validate)]
+#[serde(rename_all = "snake_case")]
+pub struct AbortResharding {}

@@ -1,15 +1,14 @@
 use collection::collection::Collection;
 use collection::grouping::group_by::{GroupRequest, SourceRequest};
 use collection::operations::point_ops::{Batch, WriteOrdering};
-use collection::operations::types::{
-    RecommendRequestInternal, SearchRequestInternal, UpdateStatus,
-};
+use collection::operations::types::{RecommendRequestInternal, UpdateStatus};
 use collection::operations::CollectionUpdateOperations;
 use itertools::Itertools;
 use rand::distributions::Uniform;
 use rand::rngs::ThreadRng;
 use rand::Rng;
 use segment::data_types::vectors::DenseVector;
+use segment::json_path::JsonPath;
 use segment::types::{Filter, Payload, WithPayloadInterface, WithVector};
 use serde_json::json;
 
@@ -20,7 +19,9 @@ fn rand_dense_vector(rng: &mut ThreadRng, size: usize) -> DenseVector {
 }
 
 mod group_by {
+    use api::rest::SearchRequestInternal;
     use collection::grouping::GroupBy;
+    use segment::data_types::vectors::BatchVectorStructInternal;
 
     use super::*;
 
@@ -43,7 +44,7 @@ mod group_by {
             score_threshold: None,
         });
 
-        let request = GroupRequest::with_limit_from_request(source, "docId".to_string(), 3);
+        let request = GroupRequest::with_limit_from_request(source, JsonPath::new("docId"), 3);
 
         let collection_dir = tempfile::Builder::new()
             .prefix("collection")
@@ -55,10 +56,12 @@ mod group_by {
         let insert_points = CollectionUpdateOperations::PointOperation(
             Batch {
                 ids: (0..docs * chunks).map(|x| x.into()).collect_vec(),
-                vectors: (0..docs * chunks)
-                    .map(|_| rand_dense_vector(&mut rng, 4))
-                    .collect_vec()
-                    .into(),
+                vectors: BatchVectorStructInternal::from(
+                    (0..docs * chunks)
+                        .map(|_| rand_dense_vector(&mut rng, 4))
+                        .collect_vec(),
+                )
+                .into(),
                 payloads: (0..docs)
                     .flat_map(|x| {
                         (0..chunks).map(move |_| {
@@ -140,7 +143,7 @@ mod group_by {
                 using: None,
                 lookup_from: None,
             }),
-            "docId".to_string(),
+            JsonPath::new("docId"),
             2,
         );
 
@@ -200,7 +203,7 @@ mod group_by {
                 with_vector: None,
                 score_threshold: None,
             }),
-            "docId".to_string(),
+            JsonPath::new("docId"),
             3,
         );
 
@@ -232,7 +235,7 @@ mod group_by {
                 with_vector: Some(WithVector::Bool(true)),
                 score_threshold: None,
             }),
-            "docId".to_string(),
+            JsonPath::new("docId"),
             3,
         );
 
@@ -270,7 +273,7 @@ mod group_by {
                 with_vector: Some(WithVector::Bool(true)),
                 score_threshold: None,
             }),
-            "other_stuff".to_string(),
+            JsonPath::new("other_stuff"),
             3,
         );
 
@@ -306,7 +309,7 @@ mod group_by {
                 with_vector: None,
                 score_threshold: None,
             }),
-            "docId".to_string(),
+            JsonPath::new("docId"),
             0,
         );
 
@@ -338,7 +341,7 @@ mod group_by {
                 with_vector: None,
                 score_threshold: None,
             }),
-            "docId".to_string(),
+            JsonPath::new("docId"),
             3,
         );
 
@@ -370,7 +373,7 @@ mod group_by {
                 with_vector: None,
                 score_threshold: None,
             }),
-            "docId".to_string(),
+            JsonPath::new("docId"),
             3,
         );
 
@@ -406,7 +409,7 @@ mod group_by {
                 with_vector: None,
                 score_threshold: None,
             }),
-            "docId".to_string(),
+            JsonPath::new("docId"),
             400,
         );
 
@@ -431,9 +434,12 @@ mod group_by {
 /// Tests out the different features working together. The individual features are already tested in other places.
 mod group_by_builder {
 
+    use api::rest::SearchRequestInternal;
     use collection::grouping::GroupBy;
     use collection::lookup::types::PseudoId;
     use collection::lookup::WithLookup;
+    use segment::data_types::vectors::BatchVectorStructInternal;
+    use segment::json_path::JsonPath;
     use tokio::sync::RwLock;
 
     use super::*;
@@ -461,7 +467,8 @@ mod group_by_builder {
             score_threshold: None,
         });
 
-        let request = GroupRequest::with_limit_from_request(source_request, "docId".to_string(), 3);
+        let request =
+            GroupRequest::with_limit_from_request(source_request, JsonPath::new("docId"), 3);
 
         let collection_dir = tempfile::Builder::new().prefix("chunks").tempdir().unwrap();
         let collection = simple_collection_fixture(collection_dir.path(), 1).await;
@@ -471,10 +478,12 @@ mod group_by_builder {
             let insert_points = CollectionUpdateOperations::PointOperation(
                 Batch {
                     ids: (0..docs * chunks_per_doc).map(|x| x.into()).collect_vec(),
-                    vectors: (0..docs * chunks_per_doc)
-                        .map(|_| rand_dense_vector(&mut rng, 4))
-                        .collect_vec()
-                        .into(),
+                    vectors: BatchVectorStructInternal::from(
+                        (0..docs * chunks_per_doc)
+                            .map(|_| rand_dense_vector(&mut rng, 4))
+                            .collect_vec(),
+                    )
+                    .into(),
                     payloads: (0..docs)
                         .flat_map(|x| {
                             (0..chunks_per_doc)
@@ -502,10 +511,12 @@ mod group_by_builder {
             let insert_points = CollectionUpdateOperations::PointOperation(
                 Batch {
                     ids: (0..docs).map(|x| x.into()).collect_vec(),
-                    vectors: (0..docs)
-                        .map(|_| rand_dense_vector(&mut rng, 4))
-                        .collect_vec()
-                        .into(),
+                    vectors: BatchVectorStructInternal::from(
+                        (0..docs)
+                            .map(|_| rand_dense_vector(&mut rng, 4))
+                            .collect_vec(),
+                    )
+                    .into(),
                     payloads: (0..docs)
                         .map(|x| {
                             Some(Payload::from(

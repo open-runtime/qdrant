@@ -1,18 +1,20 @@
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use atomic_refcell::AtomicRefCell;
-use common::types::{PointOffsetType, ScoredPointOffset};
+use bitvec::prelude::BitVec;
+use common::types::{PointOffsetType, ScoredPointOffset, TelemetryDetail};
 use io::file_operations::{atomic_save_json, read_json};
+use io::storage_version::{StorageVersion, VERSION_FILE};
+use itertools::Either;
 use memory::mmap_ops;
 use parking_lot::{Mutex, RwLock};
 use rocksdb::DB;
-use sparse::common::sparse_vector::SparseVector;
 use tar::Builder;
 use uuid::Uuid;
 
@@ -20,18 +22,20 @@ use crate::common::operation_error::OperationError::TypeInferenceError;
 use crate::common::operation_error::{
     get_service_error, OperationError, OperationResult, SegmentFailedState,
 };
-use crate::common::version::{StorageVersion, VERSION_FILE};
-use crate::common::{
-    check_named_vectors, check_query_vectors, check_stopped, check_vector, check_vector_name,
-};
+use crate::common::validate_snapshot_archive::open_snapshot_archive_with_validation;
+use crate::common::{check_named_vectors, check_query_vectors, check_stopped, check_vector_name};
 use crate::data_types::named_vectors::NamedVectors;
+use crate::data_types::order_by::{Direction, OrderBy, OrderValue};
+use crate::data_types::query_context::{QueryContext, SegmentQueryContext};
 use crate::data_types::vectors::{QueryVector, Vector};
 use crate::entry::entry_point::SegmentEntry;
 use crate::id_tracker::IdTrackerSS;
+use crate::index::field_index::numeric_index::StreamRange;
 use crate::index::field_index::CardinalityEstimation;
 use crate::index::struct_payload_index::StructPayloadIndex;
 use crate::index::{PayloadIndex, VectorIndex, VectorIndexEnum};
-use crate::spaces::tools::peek_top_smallest_iterable;
+use crate::json_path::JsonPath;
+use crate::spaces::tools::{peek_top_largest_iterable, peek_top_smallest_iterable};
 use crate::telemetry::SegmentTelemetry;
 use crate::types::{
     Filter, Payload, PayloadFieldSchema, PayloadIndexInfo, PayloadKeyType, PayloadKeyTypeRef,
@@ -55,8 +59,8 @@ const SNAPSHOT_FILES_PATH: &str = "files";
 pub struct SegmentVersion;
 
 impl StorageVersion for SegmentVersion {
-    fn current() -> String {
-        env!("CARGO_PKG_VERSION").to_string()
+    fn current_raw() -> &'static str {
+        env!("CARGO_PKG_VERSION")
     }
 }
 
@@ -66,6 +70,7 @@ impl StorageVersion for SegmentVersion {
 /// - Keeps track of point versions
 /// - Persists data
 /// - Keeps track of occurred errors
+#[derive(Debug)]
 pub struct Segment {
     /// Latest update operation number, applied to this segment
     /// If None, there were no updates and segment is empty
@@ -96,6 +101,12 @@ pub struct VectorData {
     pub quantized_vectors: Arc<AtomicRefCell<Option<QuantizedVectors>>>,
 }
 
+impl fmt::Debug for VectorData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VectorData").finish_non_exhaustive()
+    }
+}
+
 impl VectorData {
     pub fn prefault_mmap_pages(&self) -> impl Iterator<Item = mmap_ops::PrefaultMmapPages> {
         let index_task = match &*self.vector_index.borrow() {
@@ -104,7 +115,7 @@ impl VectorData {
         };
 
         let storage_task = match &*self.vector_storage.borrow() {
-            VectorStorageEnum::Memmap(storage) => storage.prefault_mmap_pages(),
+            VectorStorageEnum::DenseMemmap(storage) => storage.prefault_mmap_pages(),
             _ => None,
         };
 
@@ -135,19 +146,8 @@ impl Segment {
         check_named_vectors(&vectors, &self.segment_config)?;
         for (vector_name, vector_data) in self.vector_data.iter_mut() {
             let vector = vectors.get(vector_name);
-            match vector {
-                Some(vector) => {
-                    let mut vector_storage = vector_data.vector_storage.borrow_mut();
-                    vector_storage.insert_vector(internal_id, vector)?;
-                    let mut vector_index = vector_data.vector_index.borrow_mut();
-                    vector_index.update_vector(internal_id, vector)?;
-                }
-                None => {
-                    // No vector provided, so we remove it
-                    let mut vector_storage = vector_data.vector_storage.borrow_mut();
-                    vector_storage.delete_vector(internal_id)?;
-                }
-            }
+            let mut vector_index = vector_data.vector_index.borrow_mut();
+            vector_index.update_vector(internal_id, vector)?;
         }
         Ok(())
     }
@@ -174,15 +174,8 @@ impl Segment {
         check_named_vectors(&vectors, &self.segment_config)?;
         for (vector_name, new_vector) in vectors {
             let vector_data = &self.vector_data[vector_name.as_ref()];
-            let new_vector = new_vector.as_vec_ref();
-            vector_data
-                .vector_storage
-                .borrow_mut()
-                .insert_vector(internal_id, new_vector)?;
-            vector_data
-                .vector_index
-                .borrow_mut()
-                .update_vector(internal_id, new_vector)?;
+            let mut vector_index = vector_data.vector_index.borrow_mut();
+            vector_index.update_vector(internal_id, Some(new_vector.as_vec_ref()))?;
         }
         Ok(())
     }
@@ -202,48 +195,80 @@ impl Segment {
         let new_index = self.id_tracker.borrow().total_point_count() as PointOffsetType;
         for (vector_name, vector_data) in self.vector_data.iter_mut() {
             let vector_opt = vectors.get(vector_name);
-            let mut vector_storage = vector_data.vector_storage.borrow_mut();
             let mut vector_index = vector_data.vector_index.borrow_mut();
-            match vector_opt {
-                None => {
-                    let dim = vector_storage.vector_dim();
-                    let vector: Vector = match *vector_storage {
-                        VectorStorageEnum::DenseSimple(_)
-                        | VectorStorageEnum::Memmap(_)
-                        | VectorStorageEnum::AppendableMemmap(_) => vec![1.0; dim].into(),
-                        VectorStorageEnum::SparseSimple(_) => SparseVector::default().into(),
-                    };
-                    vector_storage.insert_vector(new_index, vector.to_vec_ref())?;
-                    vector_storage.delete_vector(new_index)?;
-                    vector_index.update_vector(new_index, vector.to_vec_ref())?;
-                }
-                Some(vec) => {
-                    vector_storage.insert_vector(new_index, vec)?;
-                    vector_index.update_vector(new_index, vec)?;
-                }
-            }
+            vector_index.update_vector(new_index, vector_opt)?;
         }
         self.id_tracker.borrow_mut().set_link(point_id, new_index)?;
         Ok(new_index)
     }
 
-    /// Operation wrapped, which handles previous and new errors in the segment,
-    /// automatically updates versions and skips operations if version is too old
+    /// Operation wrapped, which handles previous and new errors in the segment, automatically
+    /// updates versions and skips operations if the segment version is too old
     ///
     /// # Arguments
     ///
     /// * `op_num` - sequential operation of the current operation
-    /// * `op_point_offset` - if operation is point-related, specify this point offset.
-    ///     If point offset is specified, handler will use point version for comparison.
-    ///     Otherwise, it will use global storage version
     /// * `op` - operation to be wrapped. Should return `OperationResult` of bool (which is returned outside)
     ///     and optionally new offset of the changed point.
     ///
     /// # Result
     ///
     /// Propagates `OperationResult` of bool (which is returned in the `op` closure)
+    fn handle_segment_version_and_failure<F>(
+        &mut self,
+        op_num: SeqNumberType,
+        operation: F,
+    ) -> OperationResult<bool>
+    where
+        F: FnOnce(&mut Segment) -> OperationResult<bool>,
+    {
+        if let Some(SegmentFailedState {
+            version: failed_version,
+            point_id: _failed_point_id,
+            error,
+        }) = &self.error_status
+        {
+            // Failed operations should not be skipped,
+            // fail if newer operation is attempted before proper recovery
+            if *failed_version < op_num {
+                return Err(OperationError::service_error(format!(
+                    "Not recovered from previous error: {error}"
+                )));
+            } // else: Re-try operation
+        }
+
+        let res = self.handle_segment_version(op_num, operation);
+
+        if let Some(error) = get_service_error(&res) {
+            // ToDo: Recover previous segment state
+            log::error!(
+                "Segment {:?} operation error: {error}",
+                self.current_path.as_path(),
+            );
+            self.error_status = Some(SegmentFailedState {
+                version: op_num,
+                point_id: None,
+                error,
+            });
+        }
+        res
+    }
+
+    /// Operation wrapped, which handles previous and new errors in the segment, automatically
+    /// updates versions and skips operations if the point version is too old
     ///
-    fn handle_version_and_failure<F>(
+    /// # Arguments
+    ///
+    /// * `op_num` - sequential operation of the current operation
+    /// * `op_point_offset` - If point offset is specified, handler will use point version for comparison.
+    ///     Otherwise, it will be applied without version checks.
+    /// * `op` - operation to be wrapped. Should return `OperationResult` of bool (which is returned outside)
+    ///     and optionally new offset of the changed point.
+    ///
+    /// # Result
+    ///
+    /// Propagates `OperationResult` of bool (which is returned in the `op` closure)
+    fn handle_point_version_and_failure<F>(
         &mut self,
         op_num: SeqNumberType,
         op_point_offset: Option<PointOffsetType>,
@@ -267,7 +292,7 @@ impl Segment {
             } // else: Re-try operation
         }
 
-        let res = self.handle_version(op_num, op_point_offset, operation);
+        let res = self.handle_point_version(op_num, op_point_offset, operation);
 
         match get_service_error(&res) {
             None => {
@@ -289,9 +314,8 @@ impl Segment {
             Some(error) => {
                 // ToDo: Recover previous segment state
                 log::error!(
-                    "Segment {:?} operation error: {}",
+                    "Segment {:?} operation error: {error}",
                     self.current_path.as_path(),
-                    error
                 );
                 let point_id = op_point_offset
                     .and_then(|point_offset| self.id_tracker.borrow().external_id(point_offset));
@@ -305,10 +329,33 @@ impl Segment {
         res
     }
 
-    /// Manage segment version checking
+    /// Manage segment version checking, for segment level operations
+    ///
     /// If current version if higher than operation version - do not perform the operation
     /// Update current version if operation successfully executed
-    fn handle_version<F>(
+    fn handle_segment_version<F>(
+        &mut self,
+        op_num: SeqNumberType,
+        operation: F,
+    ) -> OperationResult<bool>
+    where
+        F: FnOnce(&mut Segment) -> OperationResult<bool>,
+    {
+        // Global version to check if operation has already been applied, then skip without execution
+        if self.version.unwrap_or(0) > op_num {
+            return Ok(false);
+        }
+
+        let applied = operation(self)?;
+        self.bump_segment_version(op_num);
+        Ok(applied)
+    }
+
+    /// Manage point version checking inside this segment, for point level operations
+    ///
+    /// If current version if higher than operation version - do not perform the operation
+    /// Update current version if operation successfully executed
+    fn handle_point_version<F>(
         &mut self,
         op_num: SeqNumberType,
         op_point_offset: Option<PointOffsetType>,
@@ -317,31 +364,21 @@ impl Segment {
     where
         F: FnOnce(&mut Segment) -> OperationResult<(bool, Option<PointOffsetType>)>,
     {
-        match op_point_offset {
-            None => {
-                // Not a point operation *or* point does not exist.
-                // Use global version to check if operation has been already applied.
-                if self.version.unwrap_or(0) > op_num {
-                    return Ok(false); // Skip without execution
-                }
-            }
-            Some(point_offset) => {
-                // Check if point not exists or have lower version
-                if self
-                    .id_tracker
-                    .borrow()
-                    .internal_version(point_offset)
-                    .map_or(false, |current_version| current_version > op_num)
-                {
-                    return Ok(false);
-                }
+        // Check if point not exists or have lower version
+        if let Some(point_offset) = op_point_offset {
+            if self
+                .id_tracker
+                .borrow()
+                .internal_version(point_offset)
+                .map_or(false, |current_version| current_version > op_num)
+            {
+                return Ok(false);
             }
         }
 
         let (applied, point_id) = operation(self)?;
 
-        self.version = Some(max(op_num, self.version.unwrap_or(0)));
-
+        self.bump_segment_version(op_num);
         if let Some(point_id) = point_id {
             self.id_tracker
                 .borrow_mut()
@@ -349,6 +386,18 @@ impl Segment {
         }
 
         Ok(applied)
+    }
+
+    fn bump_segment_version(&mut self, op_num: SeqNumberType) {
+        self.version = Some(max(op_num, self.version.unwrap_or(0)));
+    }
+
+    pub fn get_internal_id(&self, point_id: PointIdType) -> Option<PointOffsetType> {
+        self.id_tracker.borrow().internal_id(point_id)
+    }
+
+    pub fn get_deleted_points_bitvec(&self) -> BitVec {
+        BitVec::from(self.id_tracker.borrow().deleted_point_bitslice())
     }
 
     fn lookup_internal_id(&self, point_id: PointIdType) -> OperationResult<PointOffsetType> {
@@ -410,7 +459,8 @@ impl Segment {
                 // Without this check, the service will panic on the `get_vector` call.
                 Err(OperationError::InconsistentStorage {
                     description: format!(
-                        "Vector storage is inconsistent, total_vector_count: {}, point_offset: {}",
+                        "Vector storage '{}' is inconsistent, total_vector_count: {}, point_offset: {}",
+                        vector_name,
                         vector_storage.total_vector_count(),
                         point_offset
                     ),
@@ -438,7 +488,7 @@ impl Segment {
                 let vector = vector_storage
                     .get_vector(point_offset)
                     .as_vec_ref()
-                    .to_vec();
+                    .to_owned();
                 vectors.insert(vector_name.clone(), vector);
             }
         }
@@ -466,19 +516,13 @@ impl Segment {
     pub fn restore_snapshot(snapshot_path: &Path, segment_id: &str) -> OperationResult<()> {
         let segment_path = snapshot_path.parent().unwrap().join(segment_id);
 
-        let archive_file = File::open(snapshot_path).map_err(|err| {
+        let mut archive = open_snapshot_archive_with_validation(snapshot_path)?;
+
+        archive.unpack(&segment_path).map_err(|err| {
             OperationError::service_error(format!(
-                "failed to open segment snapshot archive {snapshot_path:?}: {err}"
+                "failed to unpack segment snapshot archive {snapshot_path:?}: {err}"
             ))
         })?;
-
-        tar::Archive::new(archive_file)
-            .unpack(&segment_path)
-            .map_err(|err| {
-                OperationError::service_error(format!(
-                    "failed to unpack segment snapshot archive {snapshot_path:?}: {err}"
-                ))
-            })?;
 
         let snapshot_path = segment_path.join(SNAPSHOT_PATH);
 
@@ -613,8 +657,65 @@ impl Segment {
                     payload,
                     vector,
                     shard_key: None,
+                    order_value: None,
                 })
             })
+            .collect()
+    }
+
+    /// Estimates how many checks it would need for getting `limit` amount of points by streaming and then
+    /// filtering, versus getting all filtered points from the index and then sorting them afterwards.
+    ///
+    /// If the filter is restrictive enough to yield fewer points than the amount of points a streaming
+    /// approach would need to advance, it returns true.
+    fn should_pre_filter(&self, filter: &Filter, limit: Option<usize>) -> bool {
+        let query_cardinality = {
+            let payload_index = self.payload_index.borrow();
+            payload_index.estimate_cardinality(filter)
+        };
+
+        // ToDo: Add telemetry for this heuristics
+
+        // Calculate expected number of condition checks required for
+        // this scroll request with is stream strategy.
+        // Example:
+        //  - cardinality = 1000
+        //  - limit = 10
+        //  - total = 10000
+        //  - point filter prob = 1000 / 10000 = 0.1
+        //  - expected_checks = 10 / 0.1  = 100
+        //  -------------------------------
+        //  - cardinality = 10
+        //  - limit = 10
+        //  - total = 10000
+        //  - point filter prob = 10 / 10000 = 0.001
+        //  - expected_checks = 10 / 0.001  = 10000
+
+        let available_points = self.available_point_count() + 1 /* + 1 for division-by-zero */;
+        // Expected number of successful checks per point
+        let check_probability =
+            (query_cardinality.exp as f64 + 1.0/* protect from zero */) / available_points as f64;
+        let exp_stream_checks =
+            (limit.unwrap_or(available_points) as f64 / check_probability) as usize;
+
+        // Assume it would require about `query cardinality` checks.
+        // We are interested in approximate number of checks, so we can
+        // use `query cardinality` as a starting point.
+        let exp_index_checks = query_cardinality.max;
+
+        exp_stream_checks > exp_index_checks
+    }
+
+    fn read_by_id_stream(
+        &self,
+        offset: Option<PointIdType>,
+        limit: Option<usize>,
+    ) -> Vec<PointIdType> {
+        self.id_tracker
+            .borrow()
+            .iter_from(offset)
+            .map(|x| x.0)
+            .take(limit.unwrap_or(usize::MAX))
             .collect()
     }
 
@@ -645,8 +746,71 @@ impl Segment {
             Some(limit) => peek_top_smallest_iterable(ids_iterator, limit),
             None => ids_iterator.collect(),
         };
+
         page.sort_unstable();
+
         page
+    }
+
+    pub fn filtered_read_by_index_ordered(
+        &self,
+        order_by: &OrderBy,
+        limit: Option<usize>,
+        condition: &Filter,
+    ) -> OperationResult<Vec<(OrderValue, PointIdType)>> {
+        let payload_index = self.payload_index.borrow();
+        let id_tracker = self.id_tracker.borrow();
+
+        let numeric_index = payload_index
+            .field_indexes
+            .get(&order_by.key)
+            .and_then(|indexes| indexes.iter().find_map(|index| index.as_numeric()))
+            .ok_or_else(|| OperationError::MissingRangeIndexForOrderBy {
+                key: order_by.key.to_string(),
+            })?;
+
+        let start_from = order_by.start_from();
+
+        let values_ids_iterator = payload_index
+            .query_points(condition)
+            .into_iter()
+            .flat_map(|internal_id| {
+                // Repeat a point for as many values as it has
+                numeric_index
+                    .get_ordering_values(internal_id)
+                    // But only those which start from `start_from` 😛
+                    .filter(|value| match order_by.direction() {
+                        Direction::Asc => value >= &start_from,
+                        Direction::Desc => value <= &start_from,
+                    })
+                    .map(move |ordering_value| (ordering_value, internal_id))
+            })
+            .filter_map(|(value, internal_id)| {
+                id_tracker
+                    .external_id(internal_id)
+                    .map(|external_id| (value, external_id))
+            });
+
+        let page = match order_by.direction() {
+            Direction::Asc => {
+                let mut page = match limit {
+                    Some(limit) => peek_top_smallest_iterable(values_ids_iterator, limit),
+                    None => values_ids_iterator.collect(),
+                };
+                page.sort_unstable_by(|(value_a, _), (value_b, _)| value_a.cmp(value_b));
+                page
+            }
+            Direction::Desc => {
+                let mut page = match limit {
+                    Some(limit) => peek_top_largest_iterable(values_ids_iterator, limit),
+                    None => values_ids_iterator.collect(),
+                };
+                page.sort_unstable_by(|(value_a, _), (value_b, _)| value_b.cmp(value_a));
+                page
+            }
+        };
+
+        Ok(page)
     }
 
     pub fn filtered_read_by_id_stream(
@@ -664,6 +828,54 @@ impl Segment {
             .map(|(external_id, _)| external_id)
             .take(limit.unwrap_or(usize::MAX))
             .collect()
+    }
+
+    pub fn filtered_read_by_value_stream(
+        &self,
+        order_by: &OrderBy,
+        limit: Option<usize>,
+        filter: Option<&Filter>,
+    ) -> OperationResult<Vec<(OrderValue, PointIdType)>> {
+        let payload_index = self.payload_index.borrow();
+
+        let numeric_index = payload_index
+            .field_indexes
+            .get(&order_by.key)
+            .and_then(|indexes| indexes.iter().find_map(|index| index.as_numeric()))
+            .ok_or_else(|| OperationError::MissingRangeIndexForOrderBy {
+                key: order_by.key.to_string(),
+            })?;
+
+        let range_iter = numeric_index.stream_range(&order_by.as_range());
+
+        let directed_range_iter = match order_by.direction() {
+            Direction::Asc => Either::Left(range_iter),
+            Direction::Desc => Either::Right(range_iter.rev()),
+        };
+
+        let id_tracker = self.id_tracker.borrow();
+
+        let filtered_iter = match filter {
+            None => Either::Left(directed_range_iter),
+            Some(filter) => {
+                let filter_context = payload_index.filter_context(filter);
+
+                Either::Right(
+                    directed_range_iter
+                        .filter(move |(_, internal_id)| filter_context.check(*internal_id)),
+                )
+            }
+        };
+
+        let reads = filtered_iter
+            .filter_map(|(value, internal_id)| {
+                id_tracker
+                    .external_id(internal_id)
+                    .map(|external_id| (value, external_id))
+            })
+            .take(limit.unwrap_or(usize::MAX))
+            .collect();
+        Ok(reads)
     }
 
     /// Check consistency of the segment's data and repair it if possible.
@@ -702,9 +914,125 @@ impl Segment {
 
         // Flush entire segment if needed
         if !internal_ids_to_delete.is_empty() {
-            self.flush(true)?;
+            self.flush(true, true)?;
         }
         Ok(())
+    }
+
+    /// Update all payload/field indices to match `desired_schemas`
+    ///
+    /// Missing payload indices are created. Incorrectly configured payload indices are recreated.
+    /// Extra payload indices are NOT deleted.
+    ///
+    /// This does nothing if the current payload indices state matches `desired_schemas` exactly.
+    pub fn update_all_field_indices(
+        &mut self,
+        desired_schemas: &HashMap<PayloadKeyType, PayloadFieldSchema>,
+    ) -> OperationResult<()> {
+        let schema_applied = self.payload_index.borrow().indexed_fields();
+        let schema_config = desired_schemas;
+
+        // Create or update payload indices if they don't match configuration
+        for (key, schema) in schema_config {
+            match schema_applied.get(key) {
+                Some(existing_schema) if existing_schema == schema => continue,
+                Some(existing_schema) => log::warn!("Segment has incorrect payload index for{key}, recreating it now (current: {:?}, configured: {:?})",
+                    existing_schema.name(),
+                    schema.name(),
+                ),
+                None => log::warn!(
+                    "Segment is missing a {} payload index for {key}, creating it now",
+                    schema.name(),
+                ),
+            }
+
+            let created = self.create_field_index(self.version(), key, Some(schema))?;
+            if !created {
+                log::warn!("Failed to create payload index for {key} in segment");
+            }
+        }
+
+        // Do not delete extra payload indices, because collection-level information about
+        // the payload indices might be incomplete due to migrations from older versions.
+
+        Ok(())
+    }
+
+    /// Check data consistency of the segment
+    /// - internal id without external id
+    /// - external id without internal
+    /// - internal id without version
+    /// - internal id without vector
+    ///
+    /// Returns an error if any inconsistency is found
+    pub fn check_data_consistency(&self) -> OperationResult<()> {
+        let id_tracker = self.id_tracker.borrow();
+
+        // dangling internal ids
+        let mut has_dangling_internal_ids = false;
+        for internal_id in id_tracker.iter_ids() {
+            if id_tracker.external_id(internal_id).is_none() {
+                log::error!("Internal id {} without external id", internal_id);
+                has_dangling_internal_ids = true
+            }
+        }
+
+        // dangling external ids
+        let mut has_dangling_external_ids = false;
+        for external_id in id_tracker.iter_external() {
+            if id_tracker.internal_id(external_id).is_none() {
+                log::error!("External id {} without internal id", external_id);
+                has_dangling_external_ids = true;
+            }
+        }
+
+        // checking internal id without version
+        let mut has_internal_ids_without_version = false;
+        for internal_id in id_tracker.iter_ids() {
+            if id_tracker.internal_version(internal_id).is_none() {
+                log::error!("Internal id {} without version", internal_id);
+                has_internal_ids_without_version = true;
+            }
+        }
+
+        // check that non deleted points exist in vector storage
+        let mut has_internal_ids_without_vector = false;
+        for internal_id in id_tracker.iter_ids() {
+            for (vector_name, vector_data) in &self.vector_data {
+                let vector_storage = vector_data.vector_storage.borrow();
+                let is_vector_deleted_storage = vector_storage.is_deleted_vector(internal_id);
+                let is_vector_deleted_tracker = id_tracker.is_deleted_point(internal_id);
+                let vector_stored = vector_storage.get_vector_opt(internal_id);
+                if !is_vector_deleted_storage
+                    && !is_vector_deleted_tracker
+                    && vector_stored.is_none()
+                {
+                    let point_id = id_tracker.external_id(internal_id);
+                    let point_version = id_tracker.internal_version(internal_id);
+                    log::error!(
+                        "Vector storage '{}' is missing point {:?} point_offset: {} version: {:?}",
+                        vector_name,
+                        point_id,
+                        internal_id,
+                        point_version
+                    );
+                    has_internal_ids_without_vector = true;
+                }
+            }
+        }
+
+        let is_inconsistent = has_dangling_internal_ids
+            || has_dangling_external_ids
+            || has_internal_ids_without_version
+            || has_internal_ids_without_vector;
+
+        if is_inconsistent {
+            Err(OperationError::service_error(
+                "Inconsistent segment data detected",
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     pub fn available_vector_count(&self, vector_name: &str) -> OperationResult<usize> {
@@ -733,6 +1061,37 @@ impl Segment {
             ))
             .spawn(move || tasks.iter().for_each(mmap_ops::PrefaultMmapPages::exec));
     }
+
+    /// This function is a simplified version of `search_batch` intended for testing purposes.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "testing")]
+    pub fn search(
+        &self,
+        vector_name: &str,
+        vector: &QueryVector,
+        with_payload: &WithPayload,
+        with_vector: &WithVector,
+        filter: Option<&Filter>,
+        top: usize,
+        params: Option<&SearchParams>,
+    ) -> OperationResult<Vec<ScoredPoint>> {
+        let result = self.search_batch(
+            vector_name,
+            &[vector],
+            with_payload,
+            with_vector,
+            filter,
+            top,
+            params,
+            Default::default(),
+        )?;
+
+        Ok(result.into_iter().next().unwrap())
+    }
+
+    pub fn cleanup_versions(&mut self) -> OperationResult<()> {
+        self.id_tracker.borrow_mut().cleanup_versions()
+    }
 }
 
 /// This is a basic implementation of `SegmentEntry`,
@@ -749,31 +1108,6 @@ impl SegmentEntry for Segment {
             .and_then(|internal_id| id_tracker.internal_version(internal_id))
     }
 
-    fn search(
-        &self,
-        vector_name: &str,
-        vector: &QueryVector,
-        with_payload: &WithPayload,
-        with_vector: &WithVector,
-        filter: Option<&Filter>,
-        top: usize,
-        params: Option<&SearchParams>,
-        is_stopped: &AtomicBool,
-    ) -> OperationResult<Vec<ScoredPoint>> {
-        check_vector(vector_name, vector, &self.segment_config)?;
-        let vector_data = &self.vector_data[vector_name];
-        let internal_result = &vector_data.vector_index.borrow().search(
-            &[vector],
-            filter,
-            top,
-            params,
-            is_stopped,
-        )?[0];
-
-        check_stopped(is_stopped)?;
-        self.process_search_result(internal_result, with_payload, with_vector)
-    }
-
     fn search_batch(
         &self,
         vector_name: &str,
@@ -783,19 +1117,20 @@ impl SegmentEntry for Segment {
         filter: Option<&Filter>,
         top: usize,
         params: Option<&SearchParams>,
-        is_stopped: &AtomicBool,
+        query_context: SegmentQueryContext,
     ) -> OperationResult<Vec<Vec<ScoredPoint>>> {
         check_query_vectors(vector_name, query_vectors, &self.segment_config)?;
         let vector_data = &self.vector_data[vector_name];
+        let vector_query_context = query_context.get_vector_context(vector_name);
         let internal_results = vector_data.vector_index.borrow().search(
             query_vectors,
             filter,
             top,
             params,
-            is_stopped,
+            &vector_query_context,
         )?;
 
-        check_stopped(is_stopped)?;
+        check_stopped(&vector_query_context.is_stopped())?;
 
         let res = internal_results
             .iter()
@@ -815,9 +1150,9 @@ impl SegmentEntry for Segment {
     ) -> OperationResult<bool> {
         debug_assert!(self.is_appendable());
         check_named_vectors(&vectors, &self.segment_config)?;
-        vectors.preprocess(|name| self.segment_config.distance(name).unwrap());
+        vectors.preprocess(|name| self.config().vector_data.get(name).unwrap());
         let stored_internal_point = self.id_tracker.borrow().internal_id(point_id);
-        self.handle_version_and_failure(op_num, stored_internal_point, |segment| {
+        self.handle_point_version_and_failure(op_num, stored_internal_point, |segment| {
             if let Some(existing_internal_id) = stored_internal_point {
                 segment.replace_all_vectors(existing_internal_id, vectors)?;
                 Ok((true, Some(existing_internal_id)))
@@ -838,7 +1173,7 @@ impl SegmentEntry for Segment {
             // Point does already not exist anymore
             None => Ok(false),
             Some(internal_id) => {
-                self.handle_version_and_failure(op_num, Some(internal_id), |segment| {
+                self.handle_point_version_and_failure(op_num, Some(internal_id), |segment| {
                     // Mark point as deleted, drop mapping
                     segment.payload_index.borrow_mut().drop(internal_id)?;
                     segment.id_tracker.borrow_mut().drop(point_id)?;
@@ -868,14 +1203,14 @@ impl SegmentEntry for Segment {
         mut vectors: NamedVectors,
     ) -> OperationResult<bool> {
         check_named_vectors(&vectors, &self.segment_config)?;
-        vectors.preprocess(|name| self.segment_config.distance(name).unwrap());
+        vectors.preprocess(|name| self.config().vector_data.get(name).unwrap());
         let internal_id = self.id_tracker.borrow().internal_id(point_id);
         match internal_id {
             None => Err(OperationError::PointIdError {
                 missed_point_id: point_id,
             }),
             Some(internal_id) => {
-                self.handle_version_and_failure(op_num, Some(internal_id), |segment| {
+                self.handle_point_version_and_failure(op_num, Some(internal_id), |segment| {
                     segment.update_vectors(internal_id, vectors)?;
                     Ok((true, Some(internal_id)))
                 })
@@ -896,7 +1231,7 @@ impl SegmentEntry for Segment {
                 missed_point_id: point_id,
             }),
             Some(internal_id) => {
-                self.handle_version_and_failure(op_num, Some(internal_id), |segment| {
+                self.handle_point_version_and_failure(op_num, Some(internal_id), |segment| {
                     let vector_data = segment.vector_data.get(vector_name).ok_or(
                         OperationError::VectorNameNotExists {
                             received_name: vector_name.to_string(),
@@ -917,7 +1252,7 @@ impl SegmentEntry for Segment {
         full_payload: &Payload,
     ) -> OperationResult<bool> {
         let internal_id = self.id_tracker.borrow().internal_id(point_id);
-        self.handle_version_and_failure(op_num, internal_id, |segment| match internal_id {
+        self.handle_point_version_and_failure(op_num, internal_id, |segment| match internal_id {
             Some(internal_id) => {
                 segment
                     .payload_index
@@ -936,14 +1271,15 @@ impl SegmentEntry for Segment {
         op_num: SeqNumberType,
         point_id: PointIdType,
         payload: &Payload,
+        key: &Option<JsonPath>,
     ) -> OperationResult<bool> {
         let internal_id = self.id_tracker.borrow().internal_id(point_id);
-        self.handle_version_and_failure(op_num, internal_id, |segment| match internal_id {
+        self.handle_point_version_and_failure(op_num, internal_id, |segment| match internal_id {
             Some(internal_id) => {
                 segment
                     .payload_index
                     .borrow_mut()
-                    .assign(internal_id, payload)?;
+                    .assign(internal_id, payload, key)?;
                 Ok((true, Some(internal_id)))
             }
             None => Err(OperationError::PointIdError {
@@ -959,7 +1295,7 @@ impl SegmentEntry for Segment {
         key: PayloadKeyTypeRef,
     ) -> OperationResult<bool> {
         let internal_id = self.id_tracker.borrow().internal_id(point_id);
-        self.handle_version_and_failure(op_num, internal_id, |segment| match internal_id {
+        self.handle_point_version_and_failure(op_num, internal_id, |segment| match internal_id {
             Some(internal_id) => {
                 segment
                     .payload_index
@@ -979,7 +1315,7 @@ impl SegmentEntry for Segment {
         point_id: PointIdType,
     ) -> OperationResult<bool> {
         let internal_id = self.id_tracker.borrow().internal_id(point_id);
-        self.handle_version_and_failure(op_num, internal_id, |segment| match internal_id {
+        self.handle_point_version_and_failure(op_num, internal_id, |segment| match internal_id {
             Some(internal_id) => {
                 segment.payload_index.borrow_mut().drop(internal_id)?;
                 Ok((true, Some(internal_id)))
@@ -1027,52 +1363,30 @@ impl SegmentEntry for Segment {
         filter: Option<&'a Filter>,
     ) -> Vec<PointIdType> {
         match filter {
-            None => self
-                .id_tracker
-                .borrow()
-                .iter_from(offset)
-                .map(|x| x.0)
-                .take(limit.unwrap_or(usize::MAX))
-                .collect(),
+            None => self.read_by_id_stream(offset, limit),
             Some(condition) => {
-                let query_cardinality = {
-                    let payload_index = self.payload_index.borrow();
-                    payload_index.estimate_cardinality(condition)
-                };
-
-                // ToDo: Add telemetry for this heuristics
-
-                // Calculate expected number of condition checks required for
-                // this scroll request with is stream strategy.
-                // Example:
-                //  - cardinality = 1000
-                //  - limit = 10
-                //  - total = 10000
-                //  - point filter prob = 1000 / 10000 = 0.1
-                //  - expected_checks = 10 / 0.1  = 100
-                //  -------------------------------
-                //  - cardinality = 10
-                //  - limit = 10
-                //  - total = 10000
-                //  - point filter prob = 10 / 10000 = 0.001
-                //  - expected_checks = 10 / 0.001  = 10000
-
-                let available_points = self.available_point_count() + 1 /* + 1 for division-by-zero */;
-                // Expected number of successful checks per point
-                let check_probability = (query_cardinality.exp as f64 + 1.0/* protect from zero */)
-                    / available_points as f64;
-                let exp_stream_checks =
-                    (limit.unwrap_or(available_points) as f64 / check_probability) as usize;
-
-                // Assume it would require about `query cardinality` checks.
-                // We are interested in approximate number of checks, so we can
-                // use `query cardinality` as a starting point.
-                let exp_index_checks = query_cardinality.max;
-
-                if exp_stream_checks > exp_index_checks {
+                if self.should_pre_filter(condition, limit) {
                     self.filtered_read_by_index(offset, limit, condition)
                 } else {
                     self.filtered_read_by_id_stream(offset, limit, condition)
+                }
+            }
+        }
+    }
+
+    fn read_ordered_filtered<'a>(
+        &'a self,
+        limit: Option<usize>,
+        filter: Option<&'a Filter>,
+        order_by: &'a OrderBy,
+    ) -> OperationResult<Vec<(OrderValue, PointIdType)>> {
+        match filter {
+            None => self.filtered_read_by_value_stream(order_by, limit, None),
+            Some(filter) => {
+                if self.should_pre_filter(filter, limit) {
+                    self.filtered_read_by_index_ordered(order_by, limit, filter)
+                } else {
+                    self.filtered_read_by_value_stream(order_by, limit, Some(filter))
                 }
             }
         }
@@ -1097,6 +1411,14 @@ impl SegmentEntry for Segment {
 
     fn deleted_point_count(&self) -> usize {
         self.id_tracker.borrow().deleted_point_count()
+    }
+
+    fn available_vectors_size_in_bytes(&self, vector_name: &str) -> OperationResult<usize> {
+        check_vector_name(vector_name, &self.segment_config)?;
+        Ok(self.vector_data[vector_name]
+            .vector_storage
+            .borrow()
+            .available_size_in_bytes())
     }
 
     fn estimate_point_count<'a>(&'a self, filter: Option<&'a Filter>) -> CardinalityEstimation {
@@ -1190,7 +1512,7 @@ impl SegmentEntry for Segment {
         self.appendable_flag
     }
 
-    fn flush(&self, sync: bool) -> OperationResult<SeqNumberType> {
+    fn flush(&self, sync: bool, force: bool) -> OperationResult<SeqNumberType> {
         let current_persisted_version: Option<SeqNumberType> = *self.persisted_version.lock();
         if !sync && self.is_background_flushing() {
             return Ok(current_persisted_version.unwrap_or(0));
@@ -1203,7 +1525,7 @@ impl SegmentEntry for Segment {
                 return Ok(current_persisted_version.unwrap_or(0));
             }
             (Some(version), Some(persisted_version)) => {
-                if version == persisted_version {
+                if !force && version == persisted_version {
                     // Segment is already flushed
                     return Ok(persisted_version);
                 }
@@ -1225,7 +1547,7 @@ impl SegmentEntry for Segment {
 
         // Flush order is important:
         //
-        // 1. Flush id mapping. So during recovery the point will be recovered er in proper segment.
+        // 1. Flush id mapping. So during recovery the point will be recovered in proper segment.
         // 2. Flush vectors and payloads.
         // 3. Flush id versions last. So presence of version indicates that all other data is up-to-date.
         //
@@ -1334,9 +1656,9 @@ impl SegmentEntry for Segment {
     }
 
     fn delete_field_index(&mut self, op_num: u64, key: PayloadKeyTypeRef) -> OperationResult<bool> {
-        self.handle_version_and_failure(op_num, None, |segment| {
+        self.handle_segment_version_and_failure(op_num, |segment| {
             segment.payload_index.borrow_mut().drop_index(key)?;
-            Ok((true, None))
+            Ok(true)
         })
     }
 
@@ -1346,24 +1668,24 @@ impl SegmentEntry for Segment {
         key: PayloadKeyTypeRef,
         field_type: Option<&PayloadFieldSchema>,
     ) -> OperationResult<bool> {
-        self.handle_version_and_failure(op_num, None, |segment| match field_type {
+        self.handle_segment_version_and_failure(op_num, |segment| match field_type {
             Some(schema) => {
                 segment
                     .payload_index
                     .borrow_mut()
                     .set_indexed(key, schema.clone())?;
-                Ok((true, None))
+                Ok(true)
             }
             None => match segment.infer_from_payload_data(key)? {
                 None => Err(TypeInferenceError {
-                    field_name: key.to_string(),
+                    field_name: key.clone(),
                 }),
                 Some(schema_type) => {
                     segment
                         .payload_index
                         .borrow_mut()
-                        .set_indexed(key, schema_type.into())?;
-                    Ok((true, None))
+                        .set_indexed(key, schema_type)?;
+                    Ok(true)
                 }
             },
         })
@@ -1390,24 +1712,8 @@ impl SegmentEntry for Segment {
         Ok(deleted_points)
     }
 
-    fn vector_dim(&self, vector_name: &str) -> OperationResult<usize> {
-        check_vector_name(vector_name, &self.segment_config)?;
-        Ok(self.vector_data[vector_name]
-            .vector_storage
-            .borrow()
-            .vector_dim())
-    }
-
-    fn vector_dims(&self) -> HashMap<String, usize> {
-        self.vector_data
-            .iter()
-            .map(|(vector_name, vector_data)| {
-                (
-                    vector_name.clone(),
-                    vector_data.vector_storage.borrow().vector_dim(),
-                )
-            })
-            .collect()
+    fn vector_names(&self) -> HashSet<String> {
+        self.vector_data.keys().cloned().collect()
     }
 
     fn take_snapshot(
@@ -1416,9 +1722,8 @@ impl SegmentEntry for Segment {
         snapshot_dir_path: &Path,
     ) -> OperationResult<PathBuf> {
         log::debug!(
-            "Taking snapshot of segment {:?} into {:?}",
+            "Taking snapshot of segment {:?} into {snapshot_dir_path:?}",
             self.current_path,
-            snapshot_dir_path,
         );
 
         if !snapshot_dir_path.exists() {
@@ -1434,7 +1739,7 @@ impl SegmentEntry for Segment {
         }
 
         // flush segment to capture latest state
-        self.flush(true)?;
+        self.flush(true, false)?;
 
         // use temp_path for intermediary files
         let temp_path = temp_path.join(format!("segment-{}", Uuid::new_v4()));
@@ -1532,9 +1837,8 @@ impl SegmentEntry for Segment {
             let res = fs::remove_dir_all(&temp_path);
             if let Err(err) = res {
                 log::error!(
-                    "Failed to remove tmp directory at {}: {:?}",
+                    "Failed to remove tmp directory at {}: {err:?}",
                     temp_path.display(),
-                    err
                 );
             }
         });
@@ -1542,12 +1846,12 @@ impl SegmentEntry for Segment {
         Ok(archive_path)
     }
 
-    fn get_telemetry_data(&self) -> SegmentTelemetry {
+    fn get_telemetry_data(&self, detail: TelemetryDetail) -> SegmentTelemetry {
         let vector_index_searches: Vec<_> = self
             .vector_data
             .iter()
             .map(|(k, v)| {
-                let mut telemetry = v.vector_index.borrow().get_telemetry_data();
+                let mut telemetry = v.vector_index.borrow().get_telemetry_data(detail);
                 telemetry.index_name = Some(k.clone());
                 telemetry
             })
@@ -1560,57 +1864,38 @@ impl SegmentEntry for Segment {
             payload_field_indices: self.payload_index.borrow().get_telemetry_data(),
         }
     }
+
+    fn fill_query_context(&self, query_context: &mut QueryContext) {
+        query_context.add_available_point_count(self.available_point_count());
+
+        for (vector_name, idf) in query_context.mut_idf().iter_mut() {
+            if let Some(vector_data) = self.vector_data.get(vector_name) {
+                vector_data.vector_index.borrow().fill_idf_statistics(idf);
+            }
+        }
+    }
 }
 
 impl Drop for Segment {
     fn drop(&mut self) {
-        let _lock = self.lock_flushing();
+        if let Err(flushing_err) = self.lock_flushing() {
+            log::error!("Failed to flush segment during drop: {flushing_err}");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use tempfile::Builder;
 
     use super::*;
+    use crate::common::check_vector;
     use crate::common::operation_error::OperationError::PointIdError;
     use crate::data_types::vectors::{only_default_vector, DEFAULT_VECTOR_NAME};
     use crate::segment_constructor::{build_segment, load_segment};
     use crate::types::{Distance, Indexes, SegmentConfig, VectorDataConfig, VectorStorageType};
-
-    // no longer valid since users are now allowed to store arbitrary json objects.
-    // TODO(gvelo): add tests for invalid payload types on indexed fields.
-    // #[test]
-    // fn test_set_invalid_payload_from_json() {
-    //     let data1 = r#"
-    //     {
-    //         "invalid_data"
-    //     }"#;
-    //     let data2 = r#"
-    //     {
-    //         "array": [1, "hello"],
-    //     }"#;
-    //
-    //     let dir = Builder::new().prefix("payload_dir").tempdir().unwrap();
-    //     let dim = 2;
-    //     let config = SegmentConfig {
-    //         vector_size: dim,
-    //         index: Indexes::Plain {},
-    //         payload_index: Some(PayloadIndexType::Plain),
-    //         storage_type: StorageType::InMemory,
-    //         distance: Distance::Dot,
-    //     };
-    //
-    //     let mut segment =
-    //         build_segment(dir.path(), &config, Arc::new(SchemaStorage::new())).unwrap();
-    //     segment.upsert_point(0, 0.into(), &[1.0, 1.0]).unwrap();
-    //
-    //     let result1 = segment.set_full_payload_with_json(0, 0.into(), &data1.to_string());
-    //     assert!(result1.is_err());
-    //
-    //     let result2 = segment.set_full_payload_with_json(0, 0.into(), &data2.to_string());
-    //     assert!(result2.is_err());
-    // }
 
     #[test]
     fn test_search_batch_equivalence_single() {
@@ -1625,6 +1910,8 @@ mod tests {
                     storage_type: VectorStorageType::Memory,
                     index: Indexes::Plain {},
                     quantization_config: None,
+                    multivector_config: None,
+                    datatype: None,
                 },
             )]),
             sparse_vector_data: Default::default(),
@@ -1652,7 +1939,6 @@ mod tests {
                 None,
                 10,
                 None,
-                &false.into(),
             )
             .unwrap();
         eprintln!("search_result = {search_result:#?}");
@@ -1666,7 +1952,7 @@ mod tests {
                 None,
                 10,
                 None,
-                &false.into(),
+                Default::default(),
             )
             .unwrap();
         eprintln!("search_batch_result = {search_batch_result:#?}");
@@ -1698,6 +1984,8 @@ mod tests {
                     storage_type: VectorStorageType::Memory,
                     index: Indexes::Plain {},
                     quantization_config: None,
+                    multivector_config: None,
+                    datatype: None,
                 },
             )]),
             sparse_vector_data: Default::default(),
@@ -1748,7 +2036,6 @@ mod tests {
                 Some(&filter_valid),
                 1,
                 None,
-                &false.into(),
             )
             .unwrap();
         assert_eq!(results_with_valid_filter.len(), 1);
@@ -1762,7 +2049,6 @@ mod tests {
                 Some(&filter_invalid),
                 1,
                 None,
-                &false.into(),
             )
             .unwrap();
         assert!(results_with_invalid_filter.is_empty());
@@ -1790,6 +2076,8 @@ mod tests {
                     storage_type: VectorStorageType::Memory,
                     index: Indexes::Plain {},
                     quantization_config: None,
+                    multivector_config: None,
+                    datatype: None,
                 },
             )]),
             sparse_vector_data: Default::default(),
@@ -1830,12 +2118,14 @@ mod tests {
         // restore snapshot
         Segment::restore_snapshot(&archive, segment_id).unwrap();
 
-        let restored_segment = load_segment(&snapshot_dir.path().join(segment_id))
-            .unwrap()
-            .unwrap();
+        let restored_segment = load_segment(
+            &snapshot_dir.path().join(segment_id),
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .unwrap();
 
         // validate restored snapshot is the same as original segment
-        assert_eq!(segment.vector_dims(), restored_segment.vector_dims());
         assert_eq!(
             segment.total_point_count(),
             restored_segment.total_point_count(),
@@ -1882,6 +2172,8 @@ mod tests {
                     storage_type: VectorStorageType::Memory,
                     index: Indexes::Plain {},
                     quantization_config: None,
+                    multivector_config: None,
+                    datatype: None,
                 },
             )]),
             sparse_vector_data: Default::default(),
@@ -1895,10 +2187,10 @@ mod tests {
 
         let payload: Payload = serde_json::from_str(data).unwrap();
         segment.set_full_payload(0, 0.into(), &payload).unwrap();
-        segment.flush(false).unwrap();
+        segment.flush(false, false).unwrap();
 
         // call flush second time to check that background flush finished successful
-        segment.flush(true).unwrap();
+        segment.flush(true, false).unwrap();
     }
 
     #[test]
@@ -1914,6 +2206,8 @@ mod tests {
                     storage_type: VectorStorageType::Memory,
                     index: Indexes::Plain {},
                     quantization_config: None,
+                    multivector_config: None,
+                    datatype: None,
                 },
             )]),
             sparse_vector_data: Default::default(),
@@ -1943,7 +2237,6 @@ mod tests {
                 None,
                 10,
                 None,
-                &false.into(),
             )
             .unwrap();
 
@@ -1967,7 +2260,6 @@ mod tests {
                 None,
                 10,
                 None,
-                &false.into(),
             )
             .unwrap();
 
@@ -2009,6 +2301,8 @@ mod tests {
                     storage_type: VectorStorageType::Memory,
                     index: Indexes::Plain {},
                     quantization_config: None,
+                    multivector_config: None,
+                    datatype: None,
                 },
             )]),
             sparse_vector_data: Default::default(),
@@ -2062,6 +2356,8 @@ mod tests {
                         storage_type: VectorStorageType::Memory,
                         index: Indexes::Plain {},
                         quantization_config: None,
+                        multivector_config: None,
+                        datatype: None,
                     },
                 ),
                 (
@@ -2072,6 +2368,8 @@ mod tests {
                         storage_type: VectorStorageType::Memory,
                         index: Indexes::Plain {},
                         quantization_config: None,
+                        multivector_config: None,
+                        datatype: None,
                     },
                 ),
             ]),
@@ -2085,24 +2383,28 @@ mod tests {
             .upsert_point(
                 100,
                 4.into(),
-                NamedVectors::from([("a".into(), vec![0.4]), ("b".into(), vec![0.5])]),
+                NamedVectors::from_pairs([("a".into(), vec![0.4]), ("b".into(), vec![0.5])]),
             )
             .unwrap();
         segment
             .upsert_point(
                 101,
                 6.into(),
-                NamedVectors::from([("a".into(), vec![0.6]), ("b".into(), vec![0.7])]),
+                NamedVectors::from_pairs([("a".into(), vec![0.6]), ("b".into(), vec![0.7])]),
             )
             .unwrap();
         segment
-            .upsert_point(102, 8.into(), NamedVectors::from([("a".into(), vec![0.0])]))
+            .upsert_point(
+                102,
+                8.into(),
+                NamedVectors::from_pairs([("a".into(), vec![0.0])]),
+            )
             .unwrap();
         segment
             .upsert_point(
                 103,
                 10.into(),
-                NamedVectors::from([("b".into(), vec![1.0])]),
+                NamedVectors::from_pairs([("b".into(), vec![1.0])]),
             )
             .unwrap();
         let segment_info = segment.info();
@@ -2136,7 +2438,10 @@ mod tests {
         // Replace vector 'a' for point 8, counts should remain the same
         let internal_8 = segment.lookup_internal_id(8.into()).unwrap();
         segment
-            .replace_all_vectors(internal_8, NamedVectors::from([("a".into(), vec![0.1])]))
+            .replace_all_vectors(
+                internal_8,
+                NamedVectors::from_pairs([("a".into(), vec![0.1])]),
+            )
             .unwrap();
         let segment_info = segment.info();
         assert_eq!(segment_info.num_points, 3);
@@ -2146,7 +2451,7 @@ mod tests {
         segment
             .replace_all_vectors(
                 internal_8,
-                NamedVectors::from([("a".into(), vec![0.1]), ("b".into(), vec![0.1])]),
+                NamedVectors::from_pairs([("a".into(), vec![0.1]), ("b".into(), vec![0.1])]),
             )
             .unwrap();
         let segment_info = segment.info();
@@ -2168,6 +2473,8 @@ mod tests {
                         storage_type: VectorStorageType::Memory,
                         index: Indexes::Plain {},
                         quantization_config: None,
+                        multivector_config: None,
+                        datatype: None,
                     },
                 ),
                 (
@@ -2178,6 +2485,8 @@ mod tests {
                         storage_type: VectorStorageType::Memory,
                         index: Indexes::Plain {},
                         quantization_config: None,
+                        multivector_config: None,
+                        datatype: None,
                     },
                 ),
             ]),
@@ -2192,7 +2501,7 @@ mod tests {
             .upsert_point(
                 100,
                 point_id,
-                NamedVectors::from([
+                NamedVectors::from_pairs([
                     ("a".into(), vec![0.1, 0.2, 0.3, 0.4]),
                     ("b".into(), vec![1.0, 0.9]),
                 ]),
@@ -2221,22 +2530,22 @@ mod tests {
             NamedVectors::from_ref("b", [].as_slice().into()),
             NamedVectors::from_ref("b", [0.5].as_slice().into()),
             NamedVectors::from_ref("b", [0.0, 0.1, 0.2, 0.3].as_slice().into()),
-            NamedVectors::from([
+            NamedVectors::from_pairs([
                 ("a".into(), vec![0.1, 0.2, 0.3]),
                 ("b".into(), vec![1.0, 0.9]),
             ]),
-            NamedVectors::from([
+            NamedVectors::from_pairs([
                 ("a".into(), vec![0.1, 0.2, 0.3, 0.4]),
                 ("b".into(), vec![1.0, 0.9, 0.0]),
             ]),
             // Incorrect names
             NamedVectors::from_ref("aa", [0.0, 0.1, 0.2, 0.3].as_slice().into()),
             NamedVectors::from_ref("bb", [0.0, 0.1].as_slice().into()),
-            NamedVectors::from([
+            NamedVectors::from_pairs([
                 ("aa".into(), vec![0.1, 0.2, 0.3, 0.4]),
                 ("b".into(), vec![1.0, 0.9]),
             ]),
-            NamedVectors::from([
+            NamedVectors::from_pairs([
                 ("a".into(), vec![0.1, 0.2, 0.3, 0.4]),
                 ("bb".into(), vec![1.0, 0.9]),
             ]),
@@ -2260,7 +2569,6 @@ mod tests {
                     None,
                     1,
                     None,
-                    &false.into(),
                 )
                 .err()
                 .unwrap();
@@ -2276,7 +2584,7 @@ mod tests {
                     None,
                     1,
                     None,
-                    &false.into(),
+                    Default::default(),
                 )
                 .err()
                 .unwrap();
@@ -2305,7 +2613,6 @@ mod tests {
         for wrong_name in wrong_names {
             check_vector_name(wrong_name, &config).err().unwrap();
             segment.vector(wrong_name, point_id).err().unwrap();
-            segment.vector_dim(wrong_name).err().unwrap();
             segment
                 .delete_vector(101, point_id, wrong_name)
                 .err()
@@ -2316,5 +2623,72 @@ mod tests {
                 .err()
                 .unwrap();
         }
+    }
+
+    /// Test handling point versions
+    ///
+    /// Apply if the point version is equal or higher. Always apply if the point does not exist
+    /// yet.
+    ///
+    /// Before <https://github.com/qdrant/qdrant/pull/4060> this function would reject operations
+    /// on non-existent points if the operation ID was lower than the current segment version. That
+    /// should not happen, and this test asserts correct behavior.
+    #[test]
+    fn test_handle_point_version() {
+        // Create base segment with a single point
+        let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+        let dim = 4;
+        let config = SegmentConfig {
+            vector_data: HashMap::from([(
+                DEFAULT_VECTOR_NAME.to_owned(),
+                VectorDataConfig {
+                    size: dim,
+                    distance: Distance::Dot,
+                    storage_type: VectorStorageType::Memory,
+                    index: Indexes::Plain {},
+                    quantization_config: None,
+                    multivector_config: None,
+                    datatype: None,
+                },
+            )]),
+            sparse_vector_data: Default::default(),
+            payload_storage_type: Default::default(),
+        };
+        let mut segment = build_segment(dir.path(), &config, true).unwrap();
+        segment
+            .upsert_point(100, 1.into(), only_default_vector(&[1.1, 1.0, 0.0, 1.0]))
+            .unwrap();
+
+        // Do not handle operation on existing point when providing an old version
+        let applied = segment
+            .handle_point_version(99, Some(0), |_segment| Ok((true, None)))
+            .unwrap();
+        assert!(!applied);
+
+        // Do handle operation on existing point when providing the current version
+        let applied = segment
+            .handle_point_version(100, Some(0), |_segment| Ok((true, None)))
+            .unwrap();
+        assert!(applied);
+
+        // Do handle operation on existing point when providing a newer version
+        let applied = segment
+            .handle_point_version(101, Some(0), |_segment| Ok((true, None)))
+            .unwrap();
+        assert!(applied);
+
+        // Always handle operations on non-existent points
+        let applied = segment
+            .handle_point_version(99, None, |_segment| Ok((true, None)))
+            .unwrap();
+        assert!(applied);
+        let applied = segment
+            .handle_point_version(100, None, |_segment| Ok((true, None)))
+            .unwrap();
+        assert!(applied);
+        let applied = segment
+            .handle_point_version(101, None, |_segment| Ok((true, None)))
+            .unwrap();
+        assert!(applied);
     }
 }

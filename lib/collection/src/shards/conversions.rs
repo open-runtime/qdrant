@@ -9,7 +9,9 @@ use api::grpc::qdrant::{
     SyncPointsInternal, UpdatePointVectors, UpdateVectorsInternal, UpsertPoints,
     UpsertPointsInternal, VectorsSelector,
 };
-use segment::types::{Filter, PayloadFieldSchema, PayloadSchemaParams, PointIdType, ScoredPoint};
+use segment::data_types::vectors::VectorStructInternal;
+use segment::json_path::JsonPath;
+use segment::types::{Filter, PayloadFieldSchema, PointIdType, ScoredPoint};
 use tonic::Status;
 
 use crate::operations::conversions::write_ordering_to_proto;
@@ -19,11 +21,12 @@ use crate::operations::point_ops::{
 };
 use crate::operations::types::CollectionResult;
 use crate::operations::vector_ops::UpdateVectorsOp;
-use crate::operations::CreateIndex;
+use crate::operations::{ClockTag, CreateIndex};
 use crate::shards::shard::ShardId;
 
 pub fn internal_sync_points(
     shard_id: Option<ShardId>,
+    clock_tag: Option<ClockTag>,
     collection_name: String,
     points_sync_operation: PointSyncOperation,
     wait: bool,
@@ -31,6 +34,7 @@ pub fn internal_sync_points(
 ) -> CollectionResult<SyncPointsInternal> {
     Ok(SyncPointsInternal {
         shard_id,
+        clock_tag: clock_tag.map(Into::into),
         sync_points: Some(SyncPoints {
             collection_name,
             wait: Some(wait),
@@ -48,6 +52,7 @@ pub fn internal_sync_points(
 
 pub fn internal_upsert_points(
     shard_id: Option<ShardId>,
+    clock_tag: Option<ClockTag>,
     collection_name: String,
     point_insert_operations: PointInsertOperationsInternal,
     wait: bool,
@@ -55,6 +60,7 @@ pub fn internal_upsert_points(
 ) -> CollectionResult<UpsertPointsInternal> {
     Ok(UpsertPointsInternal {
         shard_id,
+        clock_tag: clock_tag.map(Into::into),
         upsert_points: Some(UpsertPoints {
             collection_name,
             wait: Some(wait),
@@ -73,6 +79,7 @@ pub fn internal_upsert_points(
 
 pub fn internal_delete_points(
     shard_id: Option<ShardId>,
+    clock_tag: Option<ClockTag>,
     collection_name: String,
     ids: Vec<PointIdType>,
     wait: bool,
@@ -80,6 +87,7 @@ pub fn internal_delete_points(
 ) -> DeletePointsInternal {
     DeletePointsInternal {
         shard_id,
+        clock_tag: clock_tag.map(Into::into),
         delete_points: Some(DeletePoints {
             collection_name,
             wait: Some(wait),
@@ -96,6 +104,7 @@ pub fn internal_delete_points(
 
 pub fn internal_delete_points_by_filter(
     shard_id: Option<ShardId>,
+    clock_tag: Option<ClockTag>,
     collection_name: String,
     filter: Filter,
     wait: bool,
@@ -103,6 +112,7 @@ pub fn internal_delete_points_by_filter(
 ) -> DeletePointsInternal {
     DeletePointsInternal {
         shard_id,
+        clock_tag: clock_tag.map(Into::into),
         delete_points: Some(DeletePoints {
             collection_name,
             wait: Some(wait),
@@ -117,6 +127,7 @@ pub fn internal_delete_points_by_filter(
 
 pub fn internal_update_vectors(
     shard_id: Option<ShardId>,
+    clock_tag: Option<ClockTag>,
     collection_name: String,
     update_vectors: UpdateVectorsOp,
     wait: bool,
@@ -124,6 +135,7 @@ pub fn internal_update_vectors(
 ) -> UpdateVectorsInternal {
     UpdateVectorsInternal {
         shard_id,
+        clock_tag: clock_tag.map(Into::into),
         update_vectors: Some(UpdatePointVectors {
             collection_name,
             wait: Some(wait),
@@ -132,7 +144,7 @@ pub fn internal_update_vectors(
                 .into_iter()
                 .map(|point| PointVectors {
                     id: Some(point.id.into()),
-                    vectors: Some(point.vector.into()),
+                    vectors: Some(VectorStructInternal::from(point.vector).into()),
                 })
                 .collect(),
             ordering: ordering.map(write_ordering_to_proto),
@@ -143,6 +155,7 @@ pub fn internal_update_vectors(
 
 pub fn internal_delete_vectors(
     shard_id: Option<ShardId>,
+    clock_tag: Option<ClockTag>,
     collection_name: String,
     ids: Vec<PointIdType>,
     vector_names: Vec<String>,
@@ -151,6 +164,7 @@ pub fn internal_delete_vectors(
 ) -> DeleteVectorsInternal {
     DeleteVectorsInternal {
         shard_id,
+        clock_tag: clock_tag.map(Into::into),
         delete_vectors: Some(DeletePointVectors {
             collection_name,
             wait: Some(wait),
@@ -170,6 +184,7 @@ pub fn internal_delete_vectors(
 
 pub fn internal_delete_vectors_by_filter(
     shard_id: Option<ShardId>,
+    clock_tag: Option<ClockTag>,
     collection_name: String,
     filter: Filter,
     vector_names: Vec<String>,
@@ -178,6 +193,7 @@ pub fn internal_delete_vectors_by_filter(
 ) -> DeleteVectorsInternal {
     DeleteVectorsInternal {
         shard_id,
+        clock_tag: clock_tag.map(Into::into),
         delete_vectors: Some(DeletePointVectors {
             collection_name,
             wait: Some(wait),
@@ -195,6 +211,7 @@ pub fn internal_delete_vectors_by_filter(
 
 pub fn internal_set_payload(
     shard_id: Option<ShardId>,
+    clock_tag: Option<ClockTag>,
     collection_name: String,
     set_payload: SetPayloadOp,
     wait: bool,
@@ -214,6 +231,7 @@ pub fn internal_set_payload(
 
     SetPayloadPointsInternal {
         shard_id,
+        clock_tag: clock_tag.map(Into::into),
         set_payload_points: Some(SetPayloadPoints {
             collection_name,
             wait: Some(wait),
@@ -221,12 +239,14 @@ pub fn internal_set_payload(
             points_selector,
             ordering: ordering.map(write_ordering_to_proto),
             shard_key_selector: None,
+            key: set_payload.key.map(|key| key.to_string()),
         }),
     }
 }
 
 pub fn internal_delete_payload(
     shard_id: Option<ShardId>,
+    clock_tag: Option<ClockTag>,
     collection_name: String,
     delete_payload: DeletePayloadOp,
     wait: bool,
@@ -246,10 +266,15 @@ pub fn internal_delete_payload(
 
     DeletePayloadPointsInternal {
         shard_id,
+        clock_tag: clock_tag.map(Into::into),
         delete_payload_points: Some(DeletePayloadPoints {
             collection_name,
             wait: Some(wait),
-            keys: delete_payload.keys,
+            keys: delete_payload
+                .keys
+                .into_iter()
+                .map(|key| key.to_string())
+                .collect(),
             points_selector,
             ordering: ordering.map(write_ordering_to_proto),
             shard_key_selector: None,
@@ -259,6 +284,7 @@ pub fn internal_delete_payload(
 
 pub fn internal_clear_payload(
     shard_id: Option<ShardId>,
+    clock_tag: Option<ClockTag>,
     collection_name: String,
     points: Vec<PointIdType>,
     wait: bool,
@@ -266,6 +292,7 @@ pub fn internal_clear_payload(
 ) -> ClearPayloadPointsInternal {
     ClearPayloadPointsInternal {
         shard_id,
+        clock_tag: clock_tag.map(Into::into),
         clear_payload_points: Some(ClearPayloadPoints {
             collection_name,
             wait: Some(wait),
@@ -282,6 +309,7 @@ pub fn internal_clear_payload(
 
 pub fn internal_clear_payload_by_filter(
     shard_id: Option<ShardId>,
+    clock_tag: Option<ClockTag>,
     collection_name: String,
     filter: Filter,
     wait: bool,
@@ -289,6 +317,7 @@ pub fn internal_clear_payload_by_filter(
 ) -> ClearPayloadPointsInternal {
     ClearPayloadPointsInternal {
         shard_id,
+        clock_tag: clock_tag.map(Into::into),
         clear_payload_points: Some(ClearPayloadPoints {
             collection_name,
             wait: Some(wait),
@@ -303,6 +332,7 @@ pub fn internal_clear_payload_by_filter(
 
 pub fn internal_create_index(
     shard_id: Option<ShardId>,
+    clock_tag: Option<ClockTag>,
     collection_name: String,
     create_index: CreateIndex,
     wait: bool,
@@ -311,45 +341,24 @@ pub fn internal_create_index(
     let (field_type, field_index_params) = create_index
         .field_schema
         .map(|field_schema| match field_schema {
-            PayloadFieldSchema::FieldType(field_type) => (
-                match field_type {
-                    segment::types::PayloadSchemaType::Keyword => {
-                        api::grpc::qdrant::FieldType::Keyword as i32
-                    }
-                    segment::types::PayloadSchemaType::Integer => {
-                        api::grpc::qdrant::FieldType::Integer as i32
-                    }
-                    segment::types::PayloadSchemaType::Float => {
-                        api::grpc::qdrant::FieldType::Float as i32
-                    }
-                    segment::types::PayloadSchemaType::Geo => {
-                        api::grpc::qdrant::FieldType::Geo as i32
-                    }
-                    segment::types::PayloadSchemaType::Text => {
-                        api::grpc::qdrant::FieldType::Text as i32
-                    }
-                    segment::types::PayloadSchemaType::Bool => {
-                        api::grpc::qdrant::FieldType::Bool as i32
-                    }
-                },
-                None,
+            PayloadFieldSchema::FieldType(field_type) => {
+                (api::grpc::qdrant::FieldType::from(field_type) as i32, None)
+            }
+            PayloadFieldSchema::FieldParams(field_params) => (
+                api::grpc::qdrant::FieldType::from(field_params.kind()) as i32,
+                Some(field_params.into()),
             ),
-            PayloadFieldSchema::FieldParams(field_params) => match field_params {
-                PayloadSchemaParams::Text(text_index_params) => (
-                    api::grpc::qdrant::FieldType::Text as i32,
-                    Some(text_index_params.into()),
-                ),
-            },
         })
         .map(|(field_type, field_params)| (Some(field_type), field_params))
         .unwrap_or((None, None));
 
     CreateFieldIndexCollectionInternal {
         shard_id,
+        clock_tag: clock_tag.map(Into::into),
         create_field_index_collection: Some(CreateFieldIndexCollection {
             collection_name,
             wait: Some(wait),
-            field_name: create_index.field_name,
+            field_name: create_index.field_name.to_string(),
             field_type,
             field_index_params,
             ordering: ordering.map(write_ordering_to_proto),
@@ -359,17 +368,19 @@ pub fn internal_create_index(
 
 pub fn internal_delete_index(
     shard_id: Option<ShardId>,
+    clock_tag: Option<ClockTag>,
     collection_name: String,
-    delete_index: String,
+    delete_index: JsonPath,
     wait: bool,
     ordering: Option<WriteOrdering>,
 ) -> DeleteFieldIndexCollectionInternal {
     DeleteFieldIndexCollectionInternal {
         shard_id,
+        clock_tag: clock_tag.map(Into::into),
         delete_field_index_collection: Some(DeleteFieldIndexCollection {
             collection_name,
             wait: Some(wait),
-            field_name: delete_index,
+            field_name: delete_index.to_string(),
             ordering: ordering.map(write_ordering_to_proto),
         }),
     }
@@ -403,5 +414,6 @@ pub fn try_scored_point_from_grpc(
         payload,
         vector,
         shard_key: convert_shard_key_from_grpc_opt(point.shard_key),
+        order_value: point.order_value.map(TryFrom::try_from).transpose()?,
     })
 }

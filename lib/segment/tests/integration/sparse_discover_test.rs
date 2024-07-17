@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 
+use common::types::TelemetryDetail;
 use itertools::Itertools;
 use rand::prelude::StdRng;
 use rand::{Rng, SeedableRng};
@@ -9,17 +10,15 @@ use segment::data_types::vectors::{QueryVector, VectorElementType};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::random_vector;
 use segment::index::sparse_index::sparse_index_config::{SparseIndexConfig, SparseIndexType};
-use segment::index::sparse_index::sparse_vector_index::SparseVectorIndex;
+use segment::index::sparse_index::sparse_vector_index::SparseVectorIndexOpenArgs;
 use segment::index::VectorIndex;
-use segment::segment_constructor::build_segment;
+use segment::segment_constructor::{build_segment, create_sparse_vector_index_test};
 use segment::types::{
     Distance, Indexes, SegmentConfig, SeqNumberType, SparseVectorDataConfig, VectorDataConfig,
-    VectorStorageType, DEFAULT_SPARSE_FULL_SCAN_THRESHOLD,
+    VectorStorageDatatype, VectorStorageType, DEFAULT_SPARSE_FULL_SCAN_THRESHOLD,
 };
-use segment::vector_storage::query::context_query::ContextPair;
-use segment::vector_storage::query::discovery_query::DiscoveryQuery;
+use segment::vector_storage::query::{ContextPair, DiscoveryQuery};
 use sparse::common::sparse_vector::SparseVector;
-use sparse::index::inverted_index::inverted_index_ram::InvertedIndexRam;
 use tempfile::Builder;
 
 const MAX_EXAMPLE_PAIRS: usize = 3;
@@ -120,6 +119,7 @@ fn sparse_index_discover_test() {
                 index: SparseIndexConfig {
                     full_scan_threshold: Some(DEFAULT_SPARSE_FULL_SCAN_THRESHOLD),
                     index_type: SparseIndexType::MutableRam,
+                    datatype: Some(VectorStorageDatatype::Float32),
                 },
             },
         )]),
@@ -134,6 +134,8 @@ fn sparse_index_discover_test() {
                 storage_type: VectorStorageType::Memory,
                 index: Indexes::Plain {},
                 quantization_config: None,
+                multivector_config: None,
+                datatype: None,
             },
         )]),
         payload_storage_type: Default::default(),
@@ -158,19 +160,20 @@ fn sparse_index_discover_test() {
     let payload_index_ptr = sparse_segment.payload_index.clone();
 
     let vector_storage = &sparse_segment.vector_data[SPARSE_VECTOR_NAME].vector_storage;
-    let mut sparse_index = SparseVectorIndex::<InvertedIndexRam>::open(
-        SparseIndexConfig {
+    let sparse_index = create_sparse_vector_index_test(SparseVectorIndexOpenArgs {
+        config: SparseIndexConfig {
             full_scan_threshold: Some(DEFAULT_SPARSE_FULL_SCAN_THRESHOLD),
             index_type: SparseIndexType::ImmutableRam,
+            datatype: Some(VectorStorageDatatype::Float32),
         },
-        sparse_segment.id_tracker.clone(),
-        vector_storage.clone(),
-        payload_index_ptr.clone(),
-        index_dir.path(),
-    )
+        id_tracker: sparse_segment.id_tracker.clone(),
+        vector_storage: vector_storage.clone(),
+        payload_index: payload_index_ptr.clone(),
+        path: index_dir.path(),
+        stopped: &stopped,
+        tick_progress: || (),
+    })
     .unwrap();
-
-    sparse_index.build_index(&stopped).unwrap();
 
     let top = 3;
     let attempts = 100;
@@ -179,13 +182,13 @@ fn sparse_index_discover_test() {
         let (sparse_query, dense_query) = random_discovery_query(&mut rnd, dim);
 
         let sparse_discovery_result = sparse_index
-            .search(&[&sparse_query], None, top, None, &false.into())
+            .search(&[&sparse_query], None, top, None, &Default::default())
             .unwrap();
 
         let dense_discovery_result = dense_segment.vector_data[SPARSE_VECTOR_NAME]
             .vector_index
             .borrow()
-            .search(&[&dense_query], None, top, None, &false.into())
+            .search(&[&dense_query], None, top, None, &Default::default())
             .unwrap();
 
         // check id only because scores can be epsilon-size different
@@ -203,17 +206,17 @@ fn sparse_index_discover_test() {
         // do regular nearest search
         let (sparse_query, dense_query) = random_nearest_query(&mut rnd, dim);
         let sparse_search_result = sparse_index
-            .search(&[&sparse_query], None, top, None, &false.into())
+            .search(&[&sparse_query], None, top, None, &Default::default())
             .unwrap();
 
         let dense_search_result = dense_segment.vector_data[SPARSE_VECTOR_NAME]
             .vector_index
             .borrow()
-            .search(&[&dense_query], None, top, None, &false.into())
+            .search(&[&dense_query], None, top, None, &Default::default())
             .unwrap();
 
         // check that nearest search uses sparse index
-        let telemetry = sparse_index.get_telemetry_data();
+        let telemetry = sparse_index.get_telemetry_data(TelemetryDetail::default());
         assert_eq!(telemetry.unfiltered_sparse.count, i + 1);
 
         // check id only because scores can be epsilon-size different

@@ -1,11 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+
+use common::types::TelemetryDetail;
 
 use crate::common::operation_error::{OperationResult, SegmentFailedState};
 use crate::data_types::named_vectors::NamedVectors;
+use crate::data_types::order_by::{OrderBy, OrderValue};
+use crate::data_types::query_context::{QueryContext, SegmentQueryContext};
 use crate::data_types::vectors::{QueryVector, Vector};
 use crate::index::field_index::CardinalityEstimation;
+use crate::json_path::JsonPath;
 use crate::telemetry::SegmentTelemetry;
 use crate::types::{
     Filter, Payload, PayloadFieldSchema, PayloadKeyType, PayloadKeyTypeRef, PointIdType,
@@ -25,19 +29,6 @@ pub trait SegmentEntry {
     fn point_version(&self, point_id: PointIdType) -> Option<SeqNumberType>;
 
     #[allow(clippy::too_many_arguments)]
-    fn search(
-        &self,
-        vector_name: &str,
-        query_vector: &QueryVector,
-        with_payload: &WithPayload,
-        with_vector: &WithVector,
-        filter: Option<&Filter>,
-        top: usize,
-        params: Option<&SearchParams>,
-        is_stopped: &AtomicBool,
-    ) -> OperationResult<Vec<ScoredPoint>>;
-
-    #[allow(clippy::too_many_arguments)]
     fn search_batch(
         &self,
         vector_name: &str,
@@ -47,7 +38,7 @@ pub trait SegmentEntry {
         filter: Option<&Filter>,
         top: usize,
         params: Option<&SearchParams>,
-        is_stopped: &AtomicBool,
+        query_context: SegmentQueryContext,
     ) -> OperationResult<Vec<Vec<ScoredPoint>>>;
 
     fn upsert_point(
@@ -82,6 +73,7 @@ pub trait SegmentEntry {
         op_num: SeqNumberType,
         point_id: PointIdType,
         payload: &Payload,
+        key: &Option<JsonPath>,
     ) -> OperationResult<bool>;
 
     fn set_full_payload(
@@ -108,6 +100,8 @@ pub trait SegmentEntry {
 
     fn all_vectors(&self, point_id: PointIdType) -> OperationResult<NamedVectors>;
 
+    /// Retrieve payload for the point
+    /// If not found, return empty payload
     fn payload(&self, point_id: PointIdType) -> OperationResult<Payload>;
 
     /// Iterator over all points in segment in ascending order.
@@ -121,6 +115,17 @@ pub trait SegmentEntry {
         filter: Option<&'a Filter>,
     ) -> Vec<PointIdType>;
 
+    /// Return points which satisfies filtering condition ordered by the `order_by.key` field,
+    /// starting with `order_by.start_from` value including.
+    ///
+    /// Will fail if there is no index for the order_by key.
+    fn read_ordered_filtered<'a>(
+        &'a self,
+        limit: Option<usize>,
+        filter: Option<&'a Filter>,
+        order_by: &'a OrderBy,
+    ) -> OperationResult<Vec<(OrderValue, PointIdType)>>;
+
     /// Read points in [from; to) range
     fn read_range(&self, from: Option<PointIdType>, to: Option<PointIdType>) -> Vec<PointIdType>;
 
@@ -130,9 +135,7 @@ pub trait SegmentEntry {
     /// Estimate available point count in this segment for given filter.
     fn estimate_point_count<'a>(&'a self, filter: Option<&'a Filter>) -> CardinalityEstimation;
 
-    fn vector_dim(&self, vector_name: &str) -> OperationResult<usize>;
-
-    fn vector_dims(&self) -> HashMap<String, usize>;
+    fn vector_names(&self) -> HashSet<String>;
 
     /// Number of available points
     ///
@@ -141,6 +144,18 @@ pub trait SegmentEntry {
 
     /// Number of deleted points
     fn deleted_point_count(&self) -> usize;
+
+    /// Size of all available vectors in storage
+    fn available_vectors_size_in_bytes(&self, vector_name: &str) -> OperationResult<usize>;
+
+    /// Max value from all `available_vectors_size_in_bytes`
+    fn max_available_vectors_size_in_bytes(&self) -> OperationResult<usize> {
+        self.vector_names()
+            .into_iter()
+            .map(|vector_name| self.available_vectors_size_in_bytes(&vector_name))
+            .collect::<OperationResult<Vec<_>>>()
+            .map(|sizes| sizes.into_iter().max().unwrap_or_default())
+    }
 
     /// Get segment type
     fn segment_type(&self) -> SegmentType;
@@ -158,7 +173,7 @@ pub trait SegmentEntry {
     /// if sync == true, block current thread while flushing
     ///
     /// Returns maximum version number which is guaranteed to be persisted.
-    fn flush(&self, sync: bool) -> OperationResult<SeqNumberType>;
+    fn flush(&self, sync: bool, force: bool) -> OperationResult<SeqNumberType>;
 
     /// Removes all persisted data and forces to destroy segment
     fn drop_data(self) -> OperationResult<()>;
@@ -202,5 +217,7 @@ pub trait SegmentEntry {
         -> OperationResult<PathBuf>;
 
     // Get collected telemetry data of segment
-    fn get_telemetry_data(&self) -> SegmentTelemetry;
+    fn get_telemetry_data(&self, detail: TelemetryDetail) -> SegmentTelemetry;
+
+    fn fill_query_context(&self, query_context: &mut QueryContext);
 }

@@ -1,4 +1,7 @@
-use api::grpc::models::CollectionsResponse;
+use api::grpc::models::{CollectionsResponse, VersionInfo};
+use api::rest::{
+    QueryGroupsRequest, QueryRequest, QueryRequestBatch, QueryResponse, Record, ScoredPoint,
+};
 use collection::operations::cluster_ops::ClusterOperations;
 use collection::operations::consistency_params::ReadConsistency;
 use collection::operations::payload_ops::{DeletePayload, SetPayload};
@@ -7,17 +10,16 @@ use collection::operations::snapshot_ops::{
     ShardSnapshotRecover, SnapshotDescription, SnapshotRecover,
 };
 use collection::operations::types::{
-    AliasDescription, CollectionClusterInfo, CollectionInfo, CollectionsAliasesResponse,
-    CountRequest, CountResult, DiscoverRequest, DiscoverRequestBatch, GroupsResult, PointGroup,
-    PointRequest, RecommendGroupsRequest, RecommendRequest, RecommendRequestBatch, Record,
-    ScrollRequest, ScrollResult, SearchGroupsRequest, SearchRequest, SearchRequestBatch,
-    UpdateResult,
+    AliasDescription, CollectionClusterInfo, CollectionExistence, CollectionInfo,
+    CollectionsAliasesResponse, CountRequest, CountResult, DiscoverRequest, DiscoverRequestBatch,
+    GroupsResult, PointGroup, PointRequest, RecommendGroupsRequest, RecommendRequest,
+    RecommendRequestBatch, ScrollRequest, ScrollResult, SearchGroupsRequest, SearchRequest,
+    SearchRequestBatch, UpdateResult,
 };
 use collection::operations::vector_ops::{DeleteVectors, UpdateVectors};
 use schemars::gen::SchemaSettings;
 use schemars::JsonSchema;
-use segment::types::ScoredPoint;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use storage::content_manager::collection_meta_ops::{
     ChangeAliasesOperation, CreateCollection, UpdateCollection,
 };
@@ -30,8 +32,9 @@ use crate::common::telemetry::TelemetryData;
 mod actix;
 mod common;
 mod settings;
+mod tracing;
 
-#[derive(Deserialize, Serialize, JsonSchema)]
+#[derive(Serialize, JsonSchema)]
 struct AllDefinitions {
     a1: CollectionsResponse,
     a2: CollectionInfo,
@@ -78,6 +81,12 @@ struct AllDefinitions {
     b9: ShardSnapshotRecover,
     ba: DiscoverRequest,
     bb: DiscoverRequestBatch,
+    bc: VersionInfo,
+    bd: CollectionExistence,
+    be: QueryRequest,
+    bf: QueryRequestBatch,
+    bg: QueryResponse,
+    bh: QueryGroupsRequest,
 }
 
 fn save_schema<T: JsonSchema>() {

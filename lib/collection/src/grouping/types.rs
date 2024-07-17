@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 
 use segment::data_types::groups::GroupId;
+use segment::json_path::JsonPath;
 use segment::types::{PointIdType, ScoredPoint};
 
 use crate::lookup::WithLookup;
-use crate::operations::types::{CoreSearchRequest, PointGroup};
+use crate::operations::types::PointGroup;
+use crate::operations::universal_query::shard_query::ShardQueryRequest;
 
 #[derive(PartialEq, Debug)]
 pub(super) enum AggregatorError {
@@ -21,8 +23,8 @@ impl Group {
     pub(super) fn hydrate_from(&mut self, map: &HashMap<PointIdType, ScoredPoint>) {
         self.hits.iter_mut().for_each(|hit| {
             if let Some(point) = map.get(&hit.id) {
-                hit.payload = point.payload.clone();
-                hit.vector = point.vector.clone();
+                hit.payload.clone_from(&point.payload);
+                hit.vector.clone_from(&point.vector);
             }
         });
     }
@@ -31,7 +33,11 @@ impl Group {
 impl From<Group> for PointGroup {
     fn from(group: Group) -> Self {
         Self {
-            hits: group.hits,
+            hits: group
+                .hits
+                .into_iter()
+                .map(api::rest::ScoredPoint::from)
+                .collect(),
             id: group.key,
             lookup: None,
         }
@@ -39,12 +45,12 @@ impl From<Group> for PointGroup {
 }
 
 #[derive(Clone)]
-pub struct CoreGroupRequest {
-    /// Core request to use
-    pub source: CoreSearchRequest,
+pub struct QueryGroupRequest {
+    /// Query request to use
+    pub source: ShardQueryRequest,
 
     /// Path to the field to group by
-    pub group_by: String,
+    pub group_by: JsonPath,
 
     /// Limit of points to return per group
     pub group_size: usize,

@@ -1,6 +1,6 @@
-use std::num::NonZeroU64;
 use std::sync::Arc;
 
+use api::rest::SearchRequestInternal;
 use collection::collection::Collection;
 use collection::config::{CollectionConfig, CollectionParams, WalConfig};
 use collection::operations::point_ops::{
@@ -8,11 +8,14 @@ use collection::operations::point_ops::{
 };
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::shared_storage_config::SharedStorageConfig;
-use collection::operations::types::{NodeType, SearchRequestInternal, VectorParams, VectorsConfig};
+use collection::operations::types::{NodeType, VectorsConfig};
+use collection::operations::vector_params_builder::VectorParamsBuilder;
 use collection::operations::CollectionUpdateOperations;
 use collection::shards::channel_service::ChannelService;
 use collection::shards::collection_shard_distribution::CollectionShardDistribution;
 use collection::shards::replica_set::ReplicaState;
+use common::cpu::CpuBudget;
+use segment::data_types::vectors::VectorStructInternal;
 use segment::types::{Distance, WithPayloadInterface, WithVector};
 use tempfile::Builder;
 
@@ -28,13 +31,7 @@ async fn _test_snapshot_and_recover_collection(node_type: NodeType) {
     };
 
     let collection_params = CollectionParams {
-        vectors: VectorsConfig::Single(VectorParams {
-            size: NonZeroU64::new(4).unwrap(),
-            distance: Distance::Dot,
-            hnsw_config: None,
-            quantization_config: None,
-            on_disk: None,
-        }),
+        vectors: VectorsConfig::Single(VectorParamsBuilder::new(4, Distance::Dot).build()),
         ..CollectionParams::empty()
     };
 
@@ -74,11 +71,13 @@ async fn _test_snapshot_and_recover_collection(node_type: NodeType) {
         &config,
         Arc::new(storage_config),
         shard_distribution,
-        ChannelService::new(REST_PORT),
+        ChannelService::new(REST_PORT, None),
         dummy_on_replica_failure(),
         dummy_request_shard_transfer(),
         dummy_abort_shard_transfer(),
         None,
+        None,
+        CpuBudget::default(),
         None,
     )
     .await
@@ -97,7 +96,7 @@ async fn _test_snapshot_and_recover_collection(node_type: NodeType) {
     for i in 0..100 {
         points.push(PointStruct {
             id: i.into(),
-            vector: vec![i as f32, 0.0, 0.0, 0.0].into(),
+            vector: VectorStructInternal::from(vec![i as f32, 0.0, 0.0, 0.0]).into(),
             payload: Some(serde_json::from_str(r#"{"number": "John Doe"}"#).unwrap()),
         });
     }
@@ -131,11 +130,13 @@ async fn _test_snapshot_and_recover_collection(node_type: NodeType) {
         recover_dir.path(),
         snapshots_path.path(),
         Default::default(),
-        ChannelService::new(REST_PORT),
+        ChannelService::new(REST_PORT, None),
         dummy_on_replica_failure(),
         dummy_request_shard_transfer(),
         dummy_abort_shard_transfer(),
         None,
+        None,
+        CpuBudget::default(),
         None,
     )
     .await;

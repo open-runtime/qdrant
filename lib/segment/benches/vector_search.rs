@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use atomic_refcell::AtomicRefCell;
@@ -7,18 +8,18 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use rand::distributions::Standard;
 use rand::Rng;
 use segment::common::rocksdb_wrapper::{open_db, DB_VECTOR_CF};
-use segment::data_types::vectors::{Vector, VectorElementType};
+use segment::data_types::vectors::{DenseVector, Vector, VectorRef};
 use segment::fixtures::payload_context_fixture::FixtureIdTracker;
 use segment::id_tracker::IdTrackerSS;
 use segment::types::Distance;
-use segment::vector_storage::simple_dense_vector_storage::open_simple_vector_storage;
+use segment::vector_storage::dense::simple_dense_vector_storage::open_simple_dense_vector_storage;
 use segment::vector_storage::{new_raw_scorer, VectorStorage, VectorStorageEnum};
 use tempfile::Builder;
 
 const NUM_VECTORS: usize = 100000;
 const DIM: usize = 1024; // Larger dimensionality - greater the SIMD advantage
 
-fn random_vector(size: usize) -> Vec<VectorElementType> {
+fn random_vector(size: usize) -> DenseVector {
     let rng = rand::thread_rng();
 
     rng.sample_iter(Standard).take(size).collect()
@@ -29,19 +30,17 @@ fn init_vector_storage(
     dim: usize,
     num: usize,
     dist: Distance,
-) -> (
-    Arc<AtomicRefCell<VectorStorageEnum>>,
-    Arc<AtomicRefCell<IdTrackerSS>>,
-) {
+) -> (VectorStorageEnum, Arc<AtomicRefCell<IdTrackerSS>>) {
     let db = open_db(path, &[DB_VECTOR_CF]).unwrap();
     let id_tracker = Arc::new(AtomicRefCell::new(FixtureIdTracker::new(num)));
-    let storage = open_simple_vector_storage(db, DB_VECTOR_CF, dim, dist).unwrap();
+    let mut storage =
+        open_simple_dense_vector_storage(db, DB_VECTOR_CF, dim, dist, &AtomicBool::new(false))
+            .unwrap();
     {
-        let mut borrowed_storage = storage.borrow_mut();
         for i in 0..num {
             let vector: Vector = random_vector(dim).into();
-            borrowed_storage
-                .insert_vector(i as PointOffsetType, vector.to_vec_ref())
+            storage
+                .insert_vector(i as PointOffsetType, VectorRef::from(&vector))
                 .unwrap();
         }
     }
@@ -54,7 +53,6 @@ fn benchmark_naive(c: &mut Criterion) {
 
     let dist = Distance::Dot;
     let (storage, id_tracker) = init_vector_storage(dir.path(), DIM, NUM_VECTORS, dist);
-    let borrowed_storage = storage.borrow();
     let borrowed_id_tracker = id_tracker.borrow();
 
     let mut group = c.benchmark_group("storage-score-all");
@@ -65,7 +63,7 @@ fn benchmark_naive(c: &mut Criterion) {
             let vector = vector.as_slice().into();
             new_raw_scorer(
                 vector,
-                &borrowed_storage,
+                &storage,
                 borrowed_id_tracker.deleted_point_bitslice(),
             )
             .unwrap()
@@ -79,7 +77,6 @@ fn random_access_benchmark(c: &mut Criterion) {
 
     let dist = Distance::Dot;
     let (storage, id_tracker) = init_vector_storage(dir.path(), DIM, NUM_VECTORS, dist);
-    let borrowed_storage = storage.borrow();
     let borrowed_id_tracker = id_tracker.borrow();
 
     let mut group = c.benchmark_group("storage-score-random");
@@ -89,7 +86,7 @@ fn random_access_benchmark(c: &mut Criterion) {
 
     let scorer = new_raw_scorer(
         vector,
-        &borrowed_storage,
+        &storage,
         borrowed_id_tracker.deleted_point_bitslice(),
     )
     .unwrap();

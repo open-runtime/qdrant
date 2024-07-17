@@ -168,6 +168,31 @@
         }
       }
     },
+    "/": {
+      "get": {
+        "summary": "Returns information about the running Qdrant instance",
+        "description": "Returns information about the running Qdrant instance like version and commit id",
+        "operationId": "root",
+        "tags": [
+          "service"
+        ],
+        "responses": {
+          "200": {
+            "description": "Qdrant server version information",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VersionInfo"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "error"
+          }
+        }
+      }
+    },
     "/telemetry": {
       "get": {
         "summary": "Collect telemetry data",
@@ -457,6 +482,54 @@
                 "schema": {
                   "type": "string",
                   "example": "healthz check passed"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "error"
+          }
+        }
+      }
+    },
+    "/issues": {
+      "get": {
+        "summary": "Get issues",
+        "description": "Get a report of performance issues and configuration suggestions",
+        "operationId": "get_issues",
+        "tags": [
+          "beta"
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "error"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Clear issues",
+        "description": "Removes all issues reported so far",
+        "operationId": "clear_issues",
+        "tags": [
+          "beta"
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "boolean"
                 }
               }
             }
@@ -1176,6 +1249,72 @@
         }
       }
     },
+    "/collections/{collection_name}/exists": {
+      "get": {
+        "tags": [
+          "collections"
+        ],
+        "summary": "Check the existence of a collection",
+        "description": "Returns \"true\" if the given collection name exists, and \"false\" otherwise",
+        "operationId": "collection_exists",
+        "parameters": [
+          {
+            "name": "collection_name",
+            "in": "path",
+            "description": "Name of the collection",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "time": {
+                      "type": "number",
+                      "format": "float",
+                      "description": "Time spent to process this request"
+                    },
+                    "status": {
+                      "type": "string"
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/CollectionExistence"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/collections/{collection_name}/index/{field_name}": {
       "delete": {
         "tags": [
@@ -1574,6 +1713,15 @@
             "required": false,
             "schema": {
               "$ref": "#/components/schemas/SnapshotPriority"
+            }
+          },
+          {
+            "name": "checksum",
+            "in": "query",
+            "description": "Optional SHA256 checksum to verify snapshot integrity before recovery.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -2430,6 +2578,15 @@
             "required": false,
             "schema": {
               "$ref": "#/components/schemas/SnapshotPriority"
+            }
+          },
+          {
+            "name": "checksum",
+            "in": "query",
+            "description": "Optional SHA256 checksum to verify snapshot integrity before recovery.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -4962,6 +5119,294 @@
           }
         }
       }
+    },
+    "/collections/{collection_name}/points/query": {
+      "post": {
+        "tags": [
+          "points"
+        ],
+        "summary": "Query points",
+        "description": "Universally query points. This endpoint covers all capabilities of search, recommend, discover, filters. But also enables hybrid and multi-stage queries.",
+        "operationId": "query_points",
+        "requestBody": {
+          "description": "Describes the query to make to the collection",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueryRequest"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "collection_name",
+            "in": "path",
+            "description": "Name of the collection to query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "consistency",
+            "in": "query",
+            "description": "Define read consistency guarantees for the operation",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ReadConsistency"
+            }
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "description": "If set, overrides global timeout for this request. Unit is seconds.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "time": {
+                      "type": "number",
+                      "format": "float",
+                      "description": "Time spent to process this request"
+                    },
+                    "status": {
+                      "type": "string"
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/QueryResponse"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/collections/{collection_name}/points/query/batch": {
+      "post": {
+        "tags": [
+          "points"
+        ],
+        "summary": "Query points in batch",
+        "description": "Universally query points in batch. This endpoint covers all capabilities of search, recommend, discover, filters. But also enables hybrid and multi-stage queries.",
+        "operationId": "query_batch_points",
+        "requestBody": {
+          "description": "Describes the queries to make to the collection",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueryRequestBatch"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "collection_name",
+            "in": "path",
+            "description": "Name of the collection to query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "consistency",
+            "in": "query",
+            "description": "Define read consistency guarantees for the operation",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ReadConsistency"
+            }
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "description": "If set, overrides global timeout for this request. Unit is seconds.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "time": {
+                      "type": "number",
+                      "format": "float",
+                      "description": "Time spent to process this request"
+                    },
+                    "status": {
+                      "type": "string"
+                    },
+                    "result": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/QueryResponse"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/collections/{collection_name}/points/query/groups": {
+      "post": {
+        "tags": [
+          "points"
+        ],
+        "summary": "Query points, grouped by a given payload field",
+        "description": "Universally query points, grouped by a given payload field",
+        "operationId": "query_points_groups",
+        "requestBody": {
+          "description": "Describes the query to make to the collection",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueryGroupsRequest"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "collection_name",
+            "in": "path",
+            "description": "Name of the collection to query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "consistency",
+            "in": "query",
+            "description": "Define read consistency guarantees for the operation",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ReadConsistency"
+            }
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "description": "If set, overrides global timeout for this request. Unit is seconds.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "time": {
+                      "type": "number",
+                      "format": "float",
+                      "description": "Time spent to process this request"
+                    },
+                    "status": {
+                      "type": "string"
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/GroupsResult"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "openapi": "3.0.1",
@@ -4976,7 +5421,7 @@
   ],
   "info": {
     "title": "Qdrant API",
-    "description": "API description for Qdrant vector search engine.\n\nThis document describes CRUD and search operations on collections of points (vectors with payload).\n\nQdrant supports any combinations of `should`, `must` and `must_not` conditions, which makes it possible to use in applications when object could not be described solely by vector. It could be location features, availability flags, and other custom properties businesses should take into account.\n## Examples\nThis examples cover the most basic use-cases - collection creation and basic vector search.\n### Create collection\nFirst - let's create a collection with dot-production metric.\n```\ncurl -X PUT 'http://localhost:6333/collections/test_collection' \\\n  -H 'Content-Type: application/json' \\\n  --data-raw '{\n    \"vectors\": {\n      \"size\": 4,\n      \"distance\": \"Dot\"\n    }\n  }'\n\n```\nExpected response:\n```\n{\n    \"result\": true,\n    \"status\": \"ok\",\n    \"time\": 0.031095451\n}\n```\nWe can ensure that collection was created:\n```\ncurl 'http://localhost:6333/collections/test_collection'\n```\nExpected response:\n```\n{\n  \"result\": {\n    \"status\": \"green\",\n    \"vectors_count\": 0,\n    \"segments_count\": 5,\n    \"disk_data_size\": 0,\n    \"ram_data_size\": 0,\n    \"config\": {\n      \"params\": {\n        \"vectors\": {\n          \"size\": 4,\n          \"distance\": \"Dot\"\n        }\n      },\n      \"hnsw_config\": {\n        \"m\": 16,\n        \"ef_construct\": 100,\n        \"full_scan_threshold\": 10000\n      },\n      \"optimizer_config\": {\n        \"deleted_threshold\": 0.2,\n        \"vacuum_min_vector_number\": 1000,\n        \"max_segment_number\": 5,\n        \"memmap_threshold\": 50000,\n        \"indexing_threshold\": 20000,\n        \"flush_interval_sec\": 1\n      },\n      \"wal_config\": {\n        \"wal_capacity_mb\": 32,\n        \"wal_segments_ahead\": 0\n      }\n    }\n  },\n  \"status\": \"ok\",\n  \"time\": 2.1199e-05\n}\n```\n\n### Add points\nLet's now add vectors with some payload:\n```\ncurl -L -X PUT 'http://localhost:6333/collections/test_collection/points?wait=true' \\ -H 'Content-Type: application/json' \\ --data-raw '{\n  \"points\": [\n    {\"id\": 1, \"vector\": [0.05, 0.61, 0.76, 0.74], \"payload\": {\"city\": \"Berlin\"}},\n    {\"id\": 2, \"vector\": [0.19, 0.81, 0.75, 0.11], \"payload\": {\"city\": [\"Berlin\", \"London\"] }},\n    {\"id\": 3, \"vector\": [0.36, 0.55, 0.47, 0.94], \"payload\": {\"city\": [\"Berlin\", \"Moscow\"] }},\n    {\"id\": 4, \"vector\": [0.18, 0.01, 0.85, 0.80], \"payload\": {\"city\": [\"London\", \"Moscow\"] }},\n    {\"id\": 5, \"vector\": [0.24, 0.18, 0.22, 0.44], \"payload\": {\"count\": [0]}},\n    {\"id\": 6, \"vector\": [0.35, 0.08, 0.11, 0.44]}\n  ]\n}'\n```\nExpected response:\n```\n{\n    \"result\": {\n        \"operation_id\": 0,\n        \"status\": \"completed\"\n    },\n    \"status\": \"ok\",\n    \"time\": 0.000206061\n}\n```\n### Search with filtering\nLet's start with a basic request:\n```\ncurl -L -X POST 'http://localhost:6333/collections/test_collection/points/search' \\ -H 'Content-Type: application/json' \\ --data-raw '{\n    \"vector\": [0.2,0.1,0.9,0.7],\n    \"top\": 3\n}'\n```\nExpected response:\n```\n{\n    \"result\": [\n        { \"id\": 4, \"score\": 1.362, \"payload\": null, \"version\": 0 },\n        { \"id\": 1, \"score\": 1.273, \"payload\": null, \"version\": 0 },\n        { \"id\": 3, \"score\": 1.208, \"payload\": null, \"version\": 0 }\n    ],\n    \"status\": \"ok\",\n    \"time\": 0.000055785\n}\n```\nBut result is different if we add a filter:\n```\ncurl -L -X POST 'http://localhost:6333/collections/test_collection/points/search' \\ -H 'Content-Type: application/json' \\ --data-raw '{\n    \"filter\": {\n        \"should\": [\n            {\n                \"key\": \"city\",\n                \"match\": {\n                    \"value\": \"London\"\n                }\n            }\n        ]\n    },\n    \"vector\": [0.2, 0.1, 0.9, 0.7],\n    \"top\": 3\n}'\n```\nExpected response:\n```\n{\n    \"result\": [\n        { \"id\": 4, \"score\": 1.362, \"payload\": null, \"version\": 0 },\n        { \"id\": 2, \"score\": 0.871, \"payload\": null, \"version\": 0 }\n    ],\n    \"status\": \"ok\",\n    \"time\": 0.000093972\n}\n```\n",
+    "description": "API description for Qdrant vector search engine.\n\nThis document describes CRUD and search operations on collections of points (vectors with payload).\n\nQdrant supports any combinations of `should`, `min_should`, `must` and `must_not` conditions, which makes it possible to use in applications when object could not be described solely by vector. It could be location features, availability flags, and other custom properties businesses should take into account.\n## Examples\nThis examples cover the most basic use-cases - collection creation and basic vector search.\n### Create collection\nFirst - let's create a collection with dot-production metric.\n```\ncurl -X PUT 'http://localhost:6333/collections/test_collection' \\\n  -H 'Content-Type: application/json' \\\n  --data-raw '{\n    \"vectors\": {\n      \"size\": 4,\n      \"distance\": \"Dot\"\n    }\n  }'\n\n```\nExpected response:\n```\n{\n    \"result\": true,\n    \"status\": \"ok\",\n    \"time\": 0.031095451\n}\n```\nWe can ensure that collection was created:\n```\ncurl 'http://localhost:6333/collections/test_collection'\n```\nExpected response:\n```\n{\n  \"result\": {\n    \"status\": \"green\",\n    \"vectors_count\": 0,\n    \"segments_count\": 5,\n    \"disk_data_size\": 0,\n    \"ram_data_size\": 0,\n    \"config\": {\n      \"params\": {\n        \"vectors\": {\n          \"size\": 4,\n          \"distance\": \"Dot\"\n        }\n      },\n      \"hnsw_config\": {\n        \"m\": 16,\n        \"ef_construct\": 100,\n        \"full_scan_threshold\": 10000\n      },\n      \"optimizer_config\": {\n        \"deleted_threshold\": 0.2,\n        \"vacuum_min_vector_number\": 1000,\n        \"max_segment_number\": 5,\n        \"memmap_threshold\": 50000,\n        \"indexing_threshold\": 20000,\n        \"flush_interval_sec\": 1\n      },\n      \"wal_config\": {\n        \"wal_capacity_mb\": 32,\n        \"wal_segments_ahead\": 0\n      }\n    }\n  },\n  \"status\": \"ok\",\n  \"time\": 2.1199e-05\n}\n```\n\n### Add points\nLet's now add vectors with some payload:\n```\ncurl -L -X PUT 'http://localhost:6333/collections/test_collection/points?wait=true' \\ -H 'Content-Type: application/json' \\ --data-raw '{\n  \"points\": [\n    {\"id\": 1, \"vector\": [0.05, 0.61, 0.76, 0.74], \"payload\": {\"city\": \"Berlin\"}},\n    {\"id\": 2, \"vector\": [0.19, 0.81, 0.75, 0.11], \"payload\": {\"city\": [\"Berlin\", \"London\"] }},\n    {\"id\": 3, \"vector\": [0.36, 0.55, 0.47, 0.94], \"payload\": {\"city\": [\"Berlin\", \"Moscow\"] }},\n    {\"id\": 4, \"vector\": [0.18, 0.01, 0.85, 0.80], \"payload\": {\"city\": [\"London\", \"Moscow\"] }},\n    {\"id\": 5, \"vector\": [0.24, 0.18, 0.22, 0.44], \"payload\": {\"count\": [0]}},\n    {\"id\": 6, \"vector\": [0.35, 0.08, 0.11, 0.44]}\n  ]\n}'\n```\nExpected response:\n```\n{\n    \"result\": {\n        \"operation_id\": 0,\n        \"status\": \"completed\"\n    },\n    \"status\": \"ok\",\n    \"time\": 0.000206061\n}\n```\n### Search with filtering\nLet's start with a basic request:\n```\ncurl -L -X POST 'http://localhost:6333/collections/test_collection/points/search' \\ -H 'Content-Type: application/json' \\ --data-raw '{\n    \"vector\": [0.2,0.1,0.9,0.7],\n    \"top\": 3\n}'\n```\nExpected response:\n```\n{\n    \"result\": [\n        { \"id\": 4, \"score\": 1.362, \"payload\": null, \"version\": 0 },\n        { \"id\": 1, \"score\": 1.273, \"payload\": null, \"version\": 0 },\n        { \"id\": 3, \"score\": 1.208, \"payload\": null, \"version\": 0 }\n    ],\n    \"status\": \"ok\",\n    \"time\": 0.000055785\n}\n```\nBut result is different if we add a filter:\n```\ncurl -L -X POST 'http://localhost:6333/collections/test_collection/points/search' \\ -H 'Content-Type: application/json' \\ --data-raw '{\n    \"filter\": {\n        \"should\": [\n            {\n                \"key\": \"city\",\n                \"match\": {\n                    \"value\": \"London\"\n                }\n            }\n        ]\n    },\n    \"vector\": [0.2, 0.1, 0.9, 0.7],\n    \"top\": 3\n}'\n```\nExpected response:\n```\n{\n    \"result\": [\n        { \"id\": 4, \"score\": 1.362, \"payload\": null, \"version\": 0 },\n        { \"id\": 2, \"score\": 0.871, \"payload\": null, \"version\": 0 }\n    ],\n    \"status\": \"ok\",\n    \"time\": 0.000093972\n}\n```\n",
     "contact": {
       "email": "andrey@vasnetsov.com"
     },
@@ -5021,11 +5466,19 @@
     },
     {
       "name": "cluster",
-      "description": "Service distributed setup"
+      "description": "Service distributed setup."
     },
     {
       "name": "snapshots",
-      "description": "Storage and collections snapshots"
+      "description": "Storage and collections snapshots."
+    },
+    {
+      "name": "service",
+      "description": "Qdrant service utilities."
+    },
+    {
+      "name": "beta",
+      "description": "Beta features, do not depend on these yet."
     }
   ],
   "components": {
@@ -5108,7 +5561,7 @@
             "$ref": "#/components/schemas/OptimizersStatus"
           },
           "vectors_count": {
-            "description": "Approximate number of vectors in collection. All vectors in collection are available for querying. Calculated as `points_count x vectors_per_point`. Where `vectors_per_point` is a number of named vectors in schema.",
+            "description": "DEPRECATED: Approximate number of vectors in collection. All vectors in collection are available for querying. Calculated as `points_count x vectors_per_point`. Where `vectors_per_point` is a number of named vectors in schema.",
             "type": "integer",
             "format": "uint",
             "minimum": 0,
@@ -5152,6 +5605,7 @@
         "enum": [
           "green",
           "yellow",
+          "grey",
           "red"
         ]
       },
@@ -5331,6 +5785,27 @@
             "description": "If true, vectors are served from disk, improving RAM usage at the cost of latency Default: false",
             "type": "boolean",
             "nullable": true
+          },
+          "datatype": {
+            "description": "Defines which datatype should be used to represent vectors in the storage. Choosing different datatypes allows to optimize memory usage and performance vs accuracy.\n\n- For `float32` datatype - vectors are stored as single-precision floating point numbers, 4 bytes. - For `float16` datatype - vectors are stored as half-precision floating point numbers, 2 bytes. - For `uint8` datatype - vectors are stored as unsigned 8-bit integers, 1 byte. It expects vector elements to be in range `[0, 255]`.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Datatype"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "multivector_config": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MultiVectorConfig"
+              },
+              {
+                "nullable": true
+              }
+            ]
           }
         }
       },
@@ -5369,7 +5844,7 @@
             "nullable": true
           },
           "max_indexing_threads": {
-            "description": "Number of parallel threads used for background index building. If 0 - auto selection.",
+            "description": "Number of parallel threads used for background index building. If 0 - automatically select from 8 to 16. Best to keep between 8 and 16 to prevent likelihood of building broken/inefficient HNSW graphs. On small CPUs, less threads are used.",
             "type": "integer",
             "format": "uint",
             "minimum": 0,
@@ -5499,6 +5974,31 @@
           }
         }
       },
+      "Datatype": {
+        "type": "string",
+        "enum": [
+          "float32",
+          "uint8",
+          "float16"
+        ]
+      },
+      "MultiVectorConfig": {
+        "type": "object",
+        "required": [
+          "comparator"
+        ],
+        "properties": {
+          "comparator": {
+            "$ref": "#/components/schemas/MultiVectorComparator"
+          }
+        }
+      },
+      "MultiVectorComparator": {
+        "type": "string",
+        "enum": [
+          "max_sim"
+        ]
+      },
       "ShardingMethod": {
         "type": "string",
         "enum": [
@@ -5515,6 +6015,17 @@
             "anyOf": [
               {
                 "$ref": "#/components/schemas/SparseIndexParams"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "modifier": {
+            "description": "Configures addition value modifications for sparse vectors. Default: none",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Modifier"
               },
               {
                 "nullable": true
@@ -5538,8 +6049,27 @@
             "description": "Store index on disk. If set to false, the index will be stored in RAM. Default: false",
             "type": "boolean",
             "nullable": true
+          },
+          "datatype": {
+            "description": "Defines which datatype should be used for the index. Choosing different datatypes allows to optimize memory usage and performance vs accuracy.\n\n- For `float32` datatype - vectors are stored as single-precision floating point numbers, 4 bytes. - For `float16` datatype - vectors are stored as half-precision floating point numbers, 2 bytes. - For `uint8` datatype - vectors are quantized to unsigned 8-bit integers, 1 byte. Quantization to fit byte range `[0, 255]` happens during indexing automatically, so the actual vector data does not need to conform to this range.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Datatype"
+              },
+              {
+                "nullable": true
+              }
+            ]
           }
         }
+      },
+      "Modifier": {
+        "description": "If used, include weight modification, which will be applied to sparse vectors at query time: None - no modification (default) Idf - inverse document frequency, based on statistics of the collection",
+        "type": "string",
+        "enum": [
+          "none",
+          "idf"
+        ]
       },
       "HnswConfig": {
         "description": "Config of HNSW index",
@@ -5569,7 +6099,7 @@
             "minimum": 0
           },
           "max_indexing_threads": {
-            "description": "Number of parallel threads used for background index building. If 0 - auto selection.",
+            "description": "Number of parallel threads used for background index building. If 0 - automatically select from 8 to 16. Best to keep between 8 and 16 to prevent likelihood of slow building or broken/inefficient HNSW graphs. On small CPUs, less threads are used.",
             "default": 0,
             "type": "integer",
             "format": "uint",
@@ -5595,7 +6125,6 @@
           "default_segment_number",
           "deleted_threshold",
           "flush_interval_sec",
-          "max_optimization_threads",
           "vacuum_min_vector_number"
         ],
         "properties": {
@@ -5649,10 +6178,12 @@
             "minimum": 0
           },
           "max_optimization_threads": {
-            "description": "Maximum available threads for optimization workers",
+            "description": "Max number of threads (jobs) for running optimizations per shard. Note: each optimization job will also use `max_indexing_threads` threads by itself for index building. If null - have no limit and choose dynamically to saturate CPU. If 0 - no optimization threads, optimizations will be disabled.",
+            "default": null,
             "type": "integer",
             "format": "uint",
-            "minimum": 0
+            "minimum": 0,
+            "nullable": true
           }
         }
       },
@@ -5715,15 +6246,112 @@
           "float",
           "geo",
           "text",
-          "bool"
+          "bool",
+          "datetime"
         ]
       },
       "PayloadSchemaParams": {
         "description": "Payload type with parameters",
         "anyOf": [
           {
+            "$ref": "#/components/schemas/KeywordIndexParams"
+          },
+          {
+            "$ref": "#/components/schemas/IntegerIndexParams"
+          },
+          {
+            "$ref": "#/components/schemas/FloatIndexParams"
+          },
+          {
+            "$ref": "#/components/schemas/GeoIndexParams"
+          },
+          {
             "$ref": "#/components/schemas/TextIndexParams"
+          },
+          {
+            "$ref": "#/components/schemas/BoolIndexParams"
+          },
+          {
+            "$ref": "#/components/schemas/DatetimeIndexParams"
           }
+        ]
+      },
+      "KeywordIndexParams": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/KeywordIndexType"
+          }
+        }
+      },
+      "KeywordIndexType": {
+        "type": "string",
+        "enum": [
+          "keyword"
+        ]
+      },
+      "IntegerIndexParams": {
+        "type": "object",
+        "required": [
+          "lookup",
+          "range",
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/IntegerIndexType"
+          },
+          "lookup": {
+            "description": "If true - support direct lookups.",
+            "type": "boolean"
+          },
+          "range": {
+            "description": "If true - support ranges filters.",
+            "type": "boolean"
+          }
+        }
+      },
+      "IntegerIndexType": {
+        "type": "string",
+        "enum": [
+          "integer"
+        ]
+      },
+      "FloatIndexParams": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/FloatIndexType"
+          }
+        }
+      },
+      "FloatIndexType": {
+        "type": "string",
+        "enum": [
+          "float"
+        ]
+      },
+      "GeoIndexParams": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/GeoIndexType"
+          }
+        }
+      },
+      "GeoIndexType": {
+        "type": "string",
+        "enum": [
+          "geo"
         ]
       },
       "TextIndexParams": {
@@ -5751,7 +6379,7 @@
             "nullable": true
           },
           "lowercase": {
-            "description": "If true, lowercase all tokens. Default: true",
+            "description": "If true, lowercase all tokens. Default: true.",
             "type": "boolean",
             "nullable": true
           }
@@ -5770,6 +6398,40 @@
           "whitespace",
           "word",
           "multilingual"
+        ]
+      },
+      "BoolIndexParams": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/BoolIndexType"
+          }
+        }
+      },
+      "BoolIndexType": {
+        "type": "string",
+        "enum": [
+          "bool"
+        ]
+      },
+      "DatetimeIndexParams": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/DatetimeIndexType"
+          }
+        }
+      },
+      "DatetimeIndexType": {
+        "type": "string",
+        "enum": [
+          "datetime"
         ]
       },
       "PointRequest": {
@@ -5797,7 +6459,7 @@
             }
           },
           "with_payload": {
-            "description": "Select which payload to return with the response. Default: All",
+            "description": "Select which payload to return with the response. Default is true.",
             "anyOf": [
               {
                 "$ref": "#/components/schemas/WithPayloadInterface"
@@ -5843,11 +6505,13 @@
           {
             "type": "integer",
             "format": "uint64",
-            "minimum": 0
+            "minimum": 0,
+            "example": 42
           },
           {
             "type": "string",
-            "format": "uuid"
+            "format": "uuid",
+            "example": "550e8400-e29b-41d4-a716-446655440000"
           }
         ]
       },
@@ -5948,7 +6612,11 @@
               {
                 "nullable": true
               }
-            ]
+            ],
+            "example": {
+              "city": "London",
+              "color": "green"
+            }
           },
           "vector": {
             "description": "Vector of the point",
@@ -5959,6 +6627,12 @@
               {
                 "nullable": true
               }
+            ],
+            "example": [
+              0.875,
+              0.140625,
+              -0.15625,
+              0.96875
             ]
           },
           "shard_key": {
@@ -5970,7 +6644,19 @@
               {
                 "nullable": true
               }
-            ]
+            ],
+            "example": "region_1"
+          },
+          "order_value": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OrderValue"
+              },
+              {
+                "nullable": true
+              }
+            ],
+            "example": 1
           }
         }
       },
@@ -5986,6 +6672,16 @@
             "items": {
               "type": "number",
               "format": "float"
+            }
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number",
+                "format": "float"
+              }
             }
           },
           {
@@ -6007,6 +6703,16 @@
           },
           {
             "$ref": "#/components/schemas/SparseVector"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number",
+                "format": "float"
+              }
+            }
           }
         ]
       },
@@ -6019,7 +6725,7 @@
         ],
         "properties": {
           "indices": {
-            "description": "indices must be unique",
+            "description": "Indices must be unique",
             "type": "array",
             "items": {
               "type": "integer",
@@ -6028,7 +6734,7 @@
             }
           },
           "values": {
-            "description": "values and indices must be the same length",
+            "description": "Values and indices must be the same length",
             "type": "array",
             "items": {
               "type": "number",
@@ -6036,6 +6742,18 @@
             }
           }
         }
+      },
+      "OrderValue": {
+        "anyOf": [
+          {
+            "type": "integer",
+            "format": "int64"
+          },
+          {
+            "type": "number",
+            "format": "double"
+          }
+        ]
       },
       "SearchRequest": {
         "description": "Search request. Holds all conditions and parameters for the search of most similar points by vector similarity given the filtering restrictions.",
@@ -6095,7 +6813,7 @@
             "nullable": true
           },
           "with_payload": {
-            "description": "Select which payload to return with the response. Default: None",
+            "description": "Select which payload to return with the response. Default is false.",
             "anyOf": [
               {
                 "$ref": "#/components/schemas/WithPayloadInterface"
@@ -6106,7 +6824,7 @@
             ]
           },
           "with_vector": {
-            "description": "Whether to return the point vector with the result?",
+            "description": "Options for specifying which vectors to include into response. Default is false.",
             "default": null,
             "anyOf": [
               {
@@ -6133,7 +6851,13 @@
             "items": {
               "type": "number",
               "format": "float"
-            }
+            },
+            "example": [
+              0.875,
+              0.140625,
+              -0.15625,
+              0.96875
+            ]
           },
           {
             "$ref": "#/components/schemas/NamedVector"
@@ -6144,7 +6868,6 @@
         ]
       },
       "NamedVector": {
-        "description": "Vector data with name",
         "type": "object",
         "required": [
           "name",
@@ -6153,7 +6876,16 @@
         "properties": {
           "name": {
             "description": "Name of vector data",
-            "type": "string"
+            "type": "string",
+            "example": {
+              "name": "image",
+              "vector": [
+                0.875,
+                0.140625,
+                -0.15625,
+                0.96875
+              ]
+            }
           },
           "vector": {
             "description": "Vector data",
@@ -6166,7 +6898,6 @@
         }
       },
       "NamedSparseVector": {
-        "description": "Sparse vector data with name",
         "type": "object",
         "required": [
           "name",
@@ -6175,7 +6906,24 @@
         "properties": {
           "name": {
             "description": "Name of vector data",
-            "type": "string"
+            "type": "string",
+            "example": {
+              "name": "keyword",
+              "vector": {
+                "indices": [
+                  0,
+                  1,
+                  6,
+                  9
+                ],
+                "values": [
+                  0.875,
+                  0.140625,
+                  -0.15625,
+                  0.96875
+                ]
+              }
+            }
           },
           "vector": {
             "$ref": "#/components/schemas/SparseVector"
@@ -6187,27 +6935,68 @@
         "properties": {
           "should": {
             "description": "At least one of those conditions should match",
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Condition"
-            },
-            "nullable": true
+            "default": null,
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Condition"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Condition"
+                }
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "min_should": {
+            "description": "At least minimum amount of given conditions should match",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MinShould"
+              },
+              {
+                "nullable": true
+              }
+            ]
           },
           "must": {
             "description": "All conditions must match",
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Condition"
-            },
-            "nullable": true
+            "default": null,
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Condition"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Condition"
+                }
+              },
+              {
+                "nullable": true
+              }
+            ]
           },
           "must_not": {
             "description": "All conditions must NOT match",
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Condition"
-            },
-            "nullable": true
+            "default": null,
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Condition"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Condition"
+                }
+              },
+              {
+                "nullable": true
+              }
+            ]
           }
         },
         "additionalProperties": false
@@ -6260,7 +7049,7 @@
             "description": "Check if points value lies in a given range",
             "anyOf": [
               {
-                "$ref": "#/components/schemas/Range"
+                "$ref": "#/components/schemas/RangeInterface"
               },
               {
                 "nullable": true
@@ -6386,14 +7175,16 @@
             "type": "array",
             "items": {
               "type": "string"
-            }
+            },
+            "uniqueItems": true
           },
           {
             "type": "array",
             "items": {
               "type": "integer",
               "format": "int64"
-            }
+            },
+            "uniqueItems": true
           }
         ]
       },
@@ -6408,6 +7199,16 @@
             "$ref": "#/components/schemas/AnyVariants"
           }
         }
+      },
+      "RangeInterface": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/Range"
+          },
+          {
+            "$ref": "#/components/schemas/DatetimeRange"
+          }
+        ]
       },
       "Range": {
         "description": "Range filter request",
@@ -6435,6 +7236,36 @@
             "description": "point.key <= range.lte",
             "type": "number",
             "format": "double",
+            "nullable": true
+          }
+        }
+      },
+      "DatetimeRange": {
+        "description": "Range filter request",
+        "type": "object",
+        "properties": {
+          "lt": {
+            "description": "point.key < range.lt",
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "gt": {
+            "description": "point.key > range.gt",
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "gte": {
+            "description": "point.key >= range.gte",
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "lte": {
+            "description": "point.key <= range.lte",
+            "type": "string",
+            "format": "date-time",
             "nullable": true
           }
         }
@@ -6640,6 +7471,26 @@
           }
         }
       },
+      "MinShould": {
+        "type": "object",
+        "required": [
+          "conditions",
+          "min_count"
+        ],
+        "properties": {
+          "conditions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Condition"
+            }
+          },
+          "min_count": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          }
+        }
+      },
       "SearchParams": {
         "description": "Additional parameters of the search",
         "type": "object",
@@ -6716,12 +7567,14 @@
             "description": "Point version",
             "type": "integer",
             "format": "uint64",
-            "minimum": 0
+            "minimum": 0,
+            "example": 1
           },
           "score": {
             "description": "Points vector distance to the query vector",
             "type": "number",
-            "format": "float"
+            "format": "float",
+            "example": 0.75
           },
           "payload": {
             "description": "Payload - values assigned to the point",
@@ -6732,7 +7585,11 @@
               {
                 "nullable": true
               }
-            ]
+            ],
+            "example": {
+              "city": "London",
+              "color": "green"
+            }
           },
           "vector": {
             "description": "Vector of the point",
@@ -6743,6 +7600,12 @@
               {
                 "nullable": true
               }
+            ],
+            "example": [
+              0.875,
+              0.140625,
+              -0.15625,
+              0.96875
             ]
           },
           "shard_key": {
@@ -6754,7 +7617,20 @@
               {
                 "nullable": true
               }
-            ]
+            ],
+            "example": "region_1"
+          },
+          "order_value": {
+            "description": "Order-by value",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OrderValue"
+              },
+              {
+                "nullable": true
+              }
+            ],
+            "example": 1
           }
         }
       },
@@ -6865,7 +7741,7 @@
             "nullable": true
           },
           "with_payload": {
-            "description": "Select which payload to return with the response. Default: None",
+            "description": "Select which payload to return with the response. Default is false.",
             "anyOf": [
               {
                 "$ref": "#/components/schemas/WithPayloadInterface"
@@ -6876,7 +7752,7 @@
             ]
           },
           "with_vector": {
-            "description": "Whether to return the point vector with the result?",
+            "description": "Options for specifying which vectors to include into response. Default is false.",
             "default": null,
             "anyOf": [
               {
@@ -7026,7 +7902,7 @@
             ]
           },
           "with_payload": {
-            "description": "Select which payload to return with the response. Default: All",
+            "description": "Select which payload to return with the response. Default is true.",
             "anyOf": [
               {
                 "$ref": "#/components/schemas/WithPayloadInterface"
@@ -7038,8 +7914,92 @@
           },
           "with_vector": {
             "$ref": "#/components/schemas/WithVector"
+          },
+          "order_by": {
+            "description": "Order the records by a payload field.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OrderByInterface"
+              },
+              {
+                "nullable": true
+              }
+            ]
           }
         }
+      },
+      "OrderByInterface": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "$ref": "#/components/schemas/OrderBy"
+          }
+        ],
+        "example": "timestamp"
+      },
+      "OrderBy": {
+        "type": "object",
+        "required": [
+          "key"
+        ],
+        "properties": {
+          "key": {
+            "description": "Payload key to order by",
+            "type": "string"
+          },
+          "direction": {
+            "description": "Direction of ordering: `asc` or `desc`. Default is ascending.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Direction"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "start_from": {
+            "description": "Which payload value to start scrolling from. Default is the lowest value for `asc` and the highest for `desc`",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartFrom"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          }
+        },
+        "example": {
+          "direction": "desc",
+          "key": "timestamp",
+          "start_from": 123
+        }
+      },
+      "Direction": {
+        "type": "string",
+        "enum": [
+          "asc",
+          "desc"
+        ]
+      },
+      "StartFrom": {
+        "anyOf": [
+          {
+            "type": "integer",
+            "format": "int64"
+          },
+          {
+            "type": "number",
+            "format": "double"
+          },
+          {
+            "type": "string",
+            "format": "date-time"
+          }
+        ]
       },
       "ScrollResult": {
         "description": "Result of the points read request",
@@ -7255,7 +8215,7 @@
             "nullable": true
           },
           "max_optimization_threads": {
-            "description": "Maximum available threads for optimization workers",
+            "description": "Max number of threads (jobs) for running optimizations per shard. Note: each optimization job will also use `max_indexing_threads` threads by itself for index building. If null - have no limit and choose dynamically to saturate CPU. If 0 - no optimization threads, optimizations will be disabled.",
             "type": "integer",
             "format": "uint",
             "minimum": 0,
@@ -7717,6 +8677,19 @@
             }
           },
           {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "number",
+                  "format": "float"
+                }
+              }
+            }
+          },
+          {
             "type": "object",
             "additionalProperties": {
               "type": "array",
@@ -7815,6 +8788,11 @@
                 "nullable": true
               }
             ]
+          },
+          "key": {
+            "description": "Assigns payload to each point that satisfy this path of property",
+            "type": "string",
+            "nullable": true
           }
         }
       },
@@ -8073,6 +9051,12 @@
           "latest_error": {
             "type": "string",
             "nullable": true
+          },
+          "latest_error_timestamp": {
+            "description": "Timestamp of the latest error",
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
           }
         }
       },
@@ -8095,6 +9079,10 @@
             "type": "integer",
             "format": "uint64",
             "minimum": 0
+          },
+          "checksum": {
+            "type": "string",
+            "nullable": true
           }
         }
       },
@@ -8152,6 +9140,7 @@
           "local_shards",
           "peer_id",
           "remote_shards",
+          "resharding_operations",
           "shard_count",
           "shard_transfers"
         ],
@@ -8187,6 +9176,13 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/ShardTransferInfo"
+            }
+          },
+          "resharding_operations": {
+            "description": "Resharding operations",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReshardingInfo"
             }
           }
         }
@@ -8236,7 +9232,8 @@
           "Partial",
           "Initializing",
           "Listener",
-          "PartialSnapshot"
+          "PartialSnapshot",
+          "Recovery"
         ]
       },
       "RemoteShardInfo": {
@@ -8290,11 +9287,13 @@
             "minimum": 0
           },
           "from": {
+            "description": "Source peer id",
             "type": "integer",
             "format": "uint64",
             "minimum": 0
           },
           "to": {
+            "description": "Destination peer id",
             "type": "integer",
             "format": "uint64",
             "minimum": 0
@@ -8312,6 +9311,11 @@
                 "nullable": true
               }
             ]
+          },
+          "comment": {
+            "description": "A human-readable report of the transfer progress. Available only on the source peer.",
+            "type": "string",
+            "nullable": true
           }
         }
       },
@@ -8331,8 +9335,49 @@
             "enum": [
               "snapshot"
             ]
+          },
+          {
+            "description": "Attempt to transfer shard difference by WAL delta.",
+            "type": "string",
+            "enum": [
+              "wal_delta"
+            ]
           }
         ]
+      },
+      "ReshardingInfo": {
+        "type": "object",
+        "required": [
+          "peer_id",
+          "shard_id"
+        ],
+        "properties": {
+          "shard_id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "peer_id": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "shard_key": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ShardKey"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "comment": {
+            "description": "A human-readable report of the operation progress. Available only on the source peer.",
+            "type": "string",
+            "nullable": true
+          }
+        }
       },
       "TelemetryData": {
         "type": "object",
@@ -8394,6 +9439,10 @@
                 "nullable": true
               }
             ]
+          },
+          "jwt_rbac": {
+            "type": "boolean",
+            "nullable": true
           },
           "startup": {
             "type": "string",
@@ -8777,6 +9826,28 @@
                 "nullable": true
               }
             ]
+          },
+          "multivector_config": {
+            "description": "Vector specific configuration to enable multiple vectors per point",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MultiVectorConfig"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "datatype": {
+            "description": "Vector specific configuration to set specific storage element type",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/VectorStorageDatatype"
+              },
+              {
+                "nullable": true
+              }
+            ]
           }
         }
       },
@@ -8849,6 +9920,15 @@
           }
         ]
       },
+      "VectorStorageDatatype": {
+        "description": "Storage types for vectors",
+        "type": "string",
+        "enum": [
+          "float32",
+          "float16",
+          "uint8"
+        ]
+      },
       "SparseVectorDataConfig": {
         "description": "Config of single sparse vector data storage",
         "type": "object",
@@ -8877,6 +9957,17 @@
           },
           "index_type": {
             "$ref": "#/components/schemas/SparseIndexType"
+          },
+          "datatype": {
+            "description": "Datatype used to store weights in the index.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/VectorStorageDatatype"
+              },
+              {
+                "nullable": true
+              }
+            ]
           }
         }
       },
@@ -8989,7 +10080,8 @@
       "OperationDurationStatistics": {
         "type": "object",
         "required": [
-          "count"
+          "count",
+          "total_duration_micros"
         ],
         "properties": {
           "count": {
@@ -9003,19 +10095,28 @@
             "minimum": 0
           },
           "avg_duration_micros": {
+            "description": "The average time taken by 128 latest operations, calculated as a weighted mean.",
             "type": "number",
             "format": "float",
             "nullable": true
           },
           "min_duration_micros": {
+            "description": "The minimum duration of the operations across all the measurements.",
             "type": "number",
             "format": "float",
             "nullable": true
           },
           "max_duration_micros": {
+            "description": "The maximum duration of the operations across all the measurements.",
             "type": "number",
             "format": "float",
             "nullable": true
+          },
+          "total_duration_micros": {
+            "description": "The total duration of all operations in microseconds.",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
           },
           "last_responded": {
             "type": "string",
@@ -9408,6 +10509,9 @@
           },
           {
             "$ref": "#/components/schemas/DropShardingKeyOperation"
+          },
+          {
+            "$ref": "#/components/schemas/RestartTransferOperation"
           }
         ]
       },
@@ -9465,7 +10569,43 @@
         ],
         "properties": {
           "replicate_shard": {
-            "$ref": "#/components/schemas/MoveShard"
+            "$ref": "#/components/schemas/ReplicateShard"
+          }
+        }
+      },
+      "ReplicateShard": {
+        "type": "object",
+        "required": [
+          "from_peer_id",
+          "shard_id",
+          "to_peer_id"
+        ],
+        "properties": {
+          "shard_id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "to_peer_id": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "from_peer_id": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "method": {
+            "description": "Method for transferring the shard from one node to another",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ShardTransferMethod"
+              },
+              {
+                "nullable": true
+              }
+            ]
           }
         }
       },
@@ -9476,7 +10616,32 @@
         ],
         "properties": {
           "abort_transfer": {
-            "$ref": "#/components/schemas/MoveShard"
+            "$ref": "#/components/schemas/AbortShardTransfer"
+          }
+        }
+      },
+      "AbortShardTransfer": {
+        "type": "object",
+        "required": [
+          "from_peer_id",
+          "shard_id",
+          "to_peer_id"
+        ],
+        "properties": {
+          "shard_id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "to_peer_id": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "from_peer_id": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
           }
         }
       },
@@ -9578,6 +10743,46 @@
           }
         }
       },
+      "RestartTransferOperation": {
+        "type": "object",
+        "required": [
+          "restart_transfer"
+        ],
+        "properties": {
+          "restart_transfer": {
+            "$ref": "#/components/schemas/RestartTransfer"
+          }
+        }
+      },
+      "RestartTransfer": {
+        "type": "object",
+        "required": [
+          "from_peer_id",
+          "method",
+          "shard_id",
+          "to_peer_id"
+        ],
+        "properties": {
+          "shard_id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "from_peer_id": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "to_peer_id": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "method": {
+            "$ref": "#/components/schemas/ShardTransferMethod"
+          }
+        }
+      },
       "SearchRequestBatch": {
         "type": "object",
         "required": [
@@ -9643,6 +10848,18 @@
                 "nullable": true
               }
             ]
+          },
+          "checksum": {
+            "description": "Optional SHA256 checksum to verify snapshot integrity before recovery.",
+            "default": null,
+            "type": "string",
+            "nullable": true
+          },
+          "api_key": {
+            "description": "Optional API key used when fetching the snapshot from a remote URL.",
+            "default": null,
+            "type": "string",
+            "nullable": true
           }
         }
       },
@@ -9895,7 +11112,7 @@
             ]
           },
           "with_payload": {
-            "description": "Select which payload to return with the response. Default: None",
+            "description": "Select which payload to return with the response. Default is false.",
             "anyOf": [
               {
                 "$ref": "#/components/schemas/WithPayloadInterface"
@@ -9906,7 +11123,7 @@
             ]
           },
           "with_vector": {
-            "description": "Whether to return the point vector with the result?",
+            "description": "Options for specifying which vectors to include into response. Default is false.",
             "default": null,
             "anyOf": [
               {
@@ -9997,6 +11214,11 @@
               }
             ]
           }
+        },
+        "example": {
+          "collection": "collection_b",
+          "shard_key": "region_1",
+          "vector": "image_vector"
         }
       },
       "RecommendGroupsRequest": {
@@ -10069,7 +11291,7 @@
             ]
           },
           "with_payload": {
-            "description": "Select which payload to return with the response. Default: None",
+            "description": "Select which payload to return with the response. Default is false.",
             "anyOf": [
               {
                 "$ref": "#/components/schemas/WithPayloadInterface"
@@ -10080,7 +11302,7 @@
             ]
           },
           "with_vector": {
-            "description": "Whether to return the point vector with the result?",
+            "description": "Options for specifying which vectors to include into response. Default is false.",
             "default": null,
             "anyOf": [
               {
@@ -10314,6 +11536,18 @@
                 "nullable": true
               }
             ]
+          },
+          "checksum": {
+            "description": "Optional SHA256 checksum to verify snapshot integrity before recovery.",
+            "default": null,
+            "type": "string",
+            "nullable": true
+          },
+          "api_key": {
+            "description": "Optional API key used when fetching the snapshot from a remote URL.",
+            "default": null,
+            "type": "string",
+            "nullable": true
           }
         }
       },
@@ -10401,7 +11635,7 @@
             "nullable": true
           },
           "with_payload": {
-            "description": "Select which payload to return with the response. Default: None",
+            "description": "Select which payload to return with the response. Default is false.",
             "anyOf": [
               {
                 "$ref": "#/components/schemas/WithPayloadInterface"
@@ -10412,7 +11646,7 @@
             ]
           },
           "with_vector": {
-            "description": "Whether to return the point vector with the result?",
+            "description": "Options for specifying which vectors to include into response. Default is false.",
             "anyOf": [
               {
                 "$ref": "#/components/schemas/WithVector"
@@ -10474,6 +11708,985 @@
             "items": {
               "$ref": "#/components/schemas/DiscoverRequest"
             }
+          }
+        }
+      },
+      "VersionInfo": {
+        "type": "object",
+        "required": [
+          "title",
+          "version"
+        ],
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "commit": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "CollectionExistence": {
+        "description": "State of existence of a collection, true = exists, false = does not exist",
+        "type": "object",
+        "required": [
+          "exists"
+        ],
+        "properties": {
+          "exists": {
+            "type": "boolean"
+          }
+        }
+      },
+      "QueryRequest": {
+        "type": "object",
+        "properties": {
+          "shard_key": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ShardKeySelector"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "prefetch": {
+            "description": "Sub-requests to perform first. If present, the query will be performed on the results of the prefetch(es).",
+            "default": null,
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Prefetch"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Prefetch"
+                }
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "query": {
+            "description": "Query to perform. If missing without prefetches, returns points ordered by their IDs.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueryInterface"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "using": {
+            "description": "Define which vector name to use for querying. If missing, the default vector is used.",
+            "type": "string",
+            "nullable": true
+          },
+          "filter": {
+            "description": "Filter conditions - return only those points that satisfy the specified conditions.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Filter"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "params": {
+            "description": "Search params for when there is no prefetch",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SearchParams"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "score_threshold": {
+            "description": "Return points with scores better than this threshold.",
+            "type": "number",
+            "format": "float",
+            "nullable": true
+          },
+          "limit": {
+            "description": "Max number of points to return. Default is 10.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 1,
+            "nullable": true
+          },
+          "offset": {
+            "description": "Offset of the result. Skip this many points. Default is 0",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "with_vector": {
+            "description": "Options for specifying which vectors to include into the response. Default is false.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WithVector"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "with_payload": {
+            "description": "Options for specifying which payload to include or not. Default is false.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WithPayloadInterface"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "lookup_from": {
+            "description": "The location to use for IDs lookup, if not specified - use the current collection and the 'using' vector Note: the other collection vectors should have the same vector size as the 'using' vector in the current collection",
+            "default": null,
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LookupLocation"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          }
+        },
+        "example": {
+          "filter": {
+            "min_should": null,
+            "must": [
+              {
+                "geo_bounding_box": null,
+                "geo_polygon": null,
+                "geo_radius": null,
+                "key": "city",
+                "match": {
+                  "text": "Berlin"
+                },
+                "range": null,
+                "values_count": null
+              }
+            ],
+            "must_not": null,
+            "should": null
+          },
+          "limit": 10,
+          "lookup_from": {
+            "collection": "collection_b",
+            "shard_key": "region_1",
+            "vector": "image_vector"
+          },
+          "offset": 0,
+          "params": {
+            "exact": false,
+            "hnsw_ef": 100,
+            "indexed_only": false,
+            "quantization": null
+          },
+          "prefetch": null,
+          "query": [
+            0.875,
+            0.140625,
+            -0.15625,
+            0.96875
+          ],
+          "score_threshold": 0.25,
+          "shard_key": "region_1",
+          "using": "image_vector",
+          "with_payload": true,
+          "with_vector": true
+        }
+      },
+      "Prefetch": {
+        "type": "object",
+        "properties": {
+          "prefetch": {
+            "description": "Sub-requests to perform first. If present, the query will be performed on the results of the prefetches.",
+            "default": null,
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Prefetch"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Prefetch"
+                }
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "query": {
+            "description": "Query to perform. If missing without prefetches, returns points ordered by their IDs.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueryInterface"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "using": {
+            "description": "Define which vector name to use for querying. If missing, the default vector is used.",
+            "type": "string",
+            "nullable": true
+          },
+          "filter": {
+            "description": "Filter conditions - return only those points that satisfy the specified conditions.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Filter"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "params": {
+            "description": "Search params for when there is no prefetch",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SearchParams"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "score_threshold": {
+            "description": "Return points with scores better than this threshold.",
+            "type": "number",
+            "format": "float",
+            "nullable": true
+          },
+          "limit": {
+            "description": "Max number of points to return. Default is 10.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 1,
+            "nullable": true
+          },
+          "lookup_from": {
+            "description": "The location to use for IDs lookup, if not specified - use the current collection and the 'using' vector Note: the other collection vectors should have the same vector size as the 'using' vector in the current collection",
+            "default": null,
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LookupLocation"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          }
+        }
+      },
+      "QueryInterface": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/VectorInput"
+          },
+          {
+            "$ref": "#/components/schemas/Query"
+          }
+        ]
+      },
+      "VectorInput": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "float"
+            },
+            "example": [
+              0.875,
+              0.140625,
+              -0.15625,
+              0.96875
+            ]
+          },
+          {
+            "$ref": "#/components/schemas/SparseVector"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number",
+                "format": "float"
+              }
+            },
+            "example": [
+              [
+                1,
+                2,
+                3
+              ],
+              [
+                4,
+                5,
+                6
+              ],
+              [
+                7,
+                8,
+                9
+              ]
+            ]
+          },
+          {
+            "$ref": "#/components/schemas/ExtendedPointId"
+          }
+        ]
+      },
+      "Query": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/NearestQuery"
+          },
+          {
+            "$ref": "#/components/schemas/RecommendQuery"
+          },
+          {
+            "$ref": "#/components/schemas/DiscoverQuery"
+          },
+          {
+            "$ref": "#/components/schemas/ContextQuery"
+          },
+          {
+            "$ref": "#/components/schemas/OrderByQuery"
+          },
+          {
+            "$ref": "#/components/schemas/FusionQuery"
+          }
+        ]
+      },
+      "NearestQuery": {
+        "type": "object",
+        "required": [
+          "nearest"
+        ],
+        "properties": {
+          "nearest": {
+            "$ref": "#/components/schemas/VectorInput"
+          }
+        },
+        "example": {
+          "nearest": [
+            0.875,
+            0.140625,
+            -0.15625,
+            0.96875
+          ]
+        }
+      },
+      "RecommendQuery": {
+        "type": "object",
+        "required": [
+          "recommend"
+        ],
+        "properties": {
+          "recommend": {
+            "$ref": "#/components/schemas/RecommendInput"
+          }
+        },
+        "example": {
+          "recommend": {
+            "negative": [
+              [
+                0.4749999940395355,
+                0.44062501192092896,
+                -0.2562499940395355,
+                0.3687500059604645
+              ]
+            ],
+            "positive": [
+              [
+                0.875,
+                0.140625,
+                -0.15625,
+                0.96875
+              ]
+            ],
+            "strategy": "average_vector"
+          }
+        }
+      },
+      "RecommendInput": {
+        "type": "object",
+        "properties": {
+          "positive": {
+            "description": "Look for vectors closest to the vectors from these points",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VectorInput"
+            },
+            "nullable": true
+          },
+          "negative": {
+            "description": "Try to avoid vectors like the vector from these points",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VectorInput"
+            },
+            "nullable": true
+          },
+          "strategy": {
+            "description": "How to use the provided vectors to find the results",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RecommendStrategy"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          }
+        },
+        "example": {
+          "negative": [
+            [
+              0.4749999940395355,
+              0.44062501192092896,
+              -0.2562499940395355,
+              0.3687500059604645
+            ]
+          ],
+          "positive": [
+            [
+              0.875,
+              0.140625,
+              -0.15625,
+              0.96875
+            ]
+          ],
+          "strategy": "average_vector"
+        }
+      },
+      "DiscoverQuery": {
+        "type": "object",
+        "required": [
+          "discover"
+        ],
+        "properties": {
+          "discover": {
+            "$ref": "#/components/schemas/DiscoverInput"
+          }
+        },
+        "example": {
+          "discover": {
+            "context": [
+              {
+                "negative": [
+                  0.4749999940395355,
+                  0.44062501192092896,
+                  -0.2562499940395355,
+                  0.3687500059604645
+                ],
+                "positive": [
+                  0.875,
+                  0.140625,
+                  -0.15625,
+                  0.96875
+                ]
+              }
+            ],
+            "target": [
+              0.875,
+              0.140625,
+              -0.15625,
+              0.96875
+            ]
+          }
+        }
+      },
+      "DiscoverInput": {
+        "type": "object",
+        "required": [
+          "context",
+          "target"
+        ],
+        "properties": {
+          "target": {
+            "$ref": "#/components/schemas/VectorInput"
+          },
+          "context": {
+            "description": "Search space will be constrained by these pairs of vectors",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ContextPair"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ContextPair"
+                }
+              },
+              {
+                "nullable": true
+              }
+            ]
+          }
+        },
+        "example": {
+          "context": [
+            {
+              "negative": [
+                0.4749999940395355,
+                0.44062501192092896,
+                -0.2562499940395355,
+                0.3687500059604645
+              ],
+              "positive": [
+                0.875,
+                0.140625,
+                -0.15625,
+                0.96875
+              ]
+            }
+          ],
+          "target": [
+            0.875,
+            0.140625,
+            -0.15625,
+            0.96875
+          ]
+        }
+      },
+      "ContextPair": {
+        "type": "object",
+        "required": [
+          "negative",
+          "positive"
+        ],
+        "properties": {
+          "positive": {
+            "$ref": "#/components/schemas/VectorInput"
+          },
+          "negative": {
+            "$ref": "#/components/schemas/VectorInput"
+          }
+        },
+        "example": {
+          "negative": [
+            0.4749999940395355,
+            0.44062501192092896,
+            -0.2562499940395355,
+            0.3687500059604645
+          ],
+          "positive": [
+            0.875,
+            0.140625,
+            -0.15625,
+            0.96875
+          ]
+        }
+      },
+      "ContextQuery": {
+        "type": "object",
+        "required": [
+          "context"
+        ],
+        "properties": {
+          "context": {
+            "$ref": "#/components/schemas/ContextInput"
+          }
+        },
+        "example": {
+          "context": [
+            {
+              "negative": [
+                0.4749999940395355,
+                0.44062501192092896,
+                -0.2562499940395355,
+                0.3687500059604645
+              ],
+              "positive": [
+                0.875,
+                0.140625,
+                -0.15625,
+                0.96875
+              ]
+            }
+          ]
+        }
+      },
+      "ContextInput": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/ContextPair"
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ContextPair"
+            }
+          },
+          {
+            "nullable": true
+          }
+        ],
+        "example": [
+          {
+            "negative": [
+              0.4749999940395355,
+              0.44062501192092896,
+              -0.2562499940395355,
+              0.3687500059604645
+            ],
+            "positive": [
+              0.875,
+              0.140625,
+              -0.15625,
+              0.96875
+            ]
+          }
+        ]
+      },
+      "OrderByQuery": {
+        "type": "object",
+        "required": [
+          "order_by"
+        ],
+        "properties": {
+          "order_by": {
+            "$ref": "#/components/schemas/OrderByInterface"
+          }
+        },
+        "example": {
+          "order_by": "timestamp"
+        }
+      },
+      "FusionQuery": {
+        "type": "object",
+        "required": [
+          "fusion"
+        ],
+        "properties": {
+          "fusion": {
+            "$ref": "#/components/schemas/Fusion"
+          }
+        },
+        "example": {
+          "fusion": "rrf"
+        }
+      },
+      "Fusion": {
+        "description": "Fusion algorithm allows to combine results of multiple prefetches. Available fusion algorithms: * `rrf` - Rank Reciprocal Fusion",
+        "type": "string",
+        "enum": [
+          "rrf"
+        ],
+        "example": "rrf"
+      },
+      "QueryRequestBatch": {
+        "type": "object",
+        "required": [
+          "searches"
+        ],
+        "properties": {
+          "searches": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QueryRequest"
+            }
+          }
+        },
+        "example": {
+          "searches": [
+            {
+              "filter": {
+                "min_should": null,
+                "must": [
+                  {
+                    "geo_bounding_box": null,
+                    "geo_polygon": null,
+                    "geo_radius": null,
+                    "key": "city",
+                    "match": {
+                      "text": "Berlin"
+                    },
+                    "range": null,
+                    "values_count": null
+                  }
+                ],
+                "must_not": null,
+                "should": null
+              },
+              "limit": 10,
+              "lookup_from": {
+                "collection": "collection_b",
+                "shard_key": "region_1",
+                "vector": "image_vector"
+              },
+              "offset": 0,
+              "params": {
+                "exact": false,
+                "hnsw_ef": 100,
+                "indexed_only": false,
+                "quantization": null
+              },
+              "prefetch": null,
+              "query": [
+                0.875,
+                0.140625,
+                -0.15625,
+                0.96875
+              ],
+              "score_threshold": 0.25,
+              "shard_key": "region_1",
+              "using": "image_vector",
+              "with_payload": true,
+              "with_vector": true
+            },
+            {
+              "filter": {
+                "min_should": null,
+                "must": [
+                  {
+                    "geo_bounding_box": null,
+                    "geo_polygon": null,
+                    "geo_radius": null,
+                    "key": "city",
+                    "match": {
+                      "text": "New York"
+                    },
+                    "range": null,
+                    "values_count": null
+                  }
+                ],
+                "must_not": null,
+                "should": null
+              },
+              "limit": 10,
+              "lookup_from": {
+                "collection": "collection_b",
+                "shard_key": "region_1",
+                "vector": "image_vector"
+              },
+              "offset": 0,
+              "params": {
+                "exact": false,
+                "hnsw_ef": 100,
+                "indexed_only": false,
+                "quantization": null
+              },
+              "prefetch": null,
+              "query": [
+                0.875,
+                0.140625,
+                -0.15625,
+                0.96875
+              ],
+              "score_threshold": 0.25,
+              "shard_key": "region_1",
+              "using": "code_vector",
+              "with_payload": true,
+              "with_vector": true
+            }
+          ]
+        }
+      },
+      "QueryResponse": {
+        "type": "object",
+        "required": [
+          "points"
+        ],
+        "properties": {
+          "points": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ScoredPoint"
+            }
+          }
+        },
+        "example": {
+          "points": [
+            {
+              "id": 1,
+              "order_value": 1,
+              "payload": {
+                "city": "London",
+                "color": "green"
+              },
+              "score": 0.25,
+              "shard_key": "region_1",
+              "vector": [
+                0.875,
+                0.140625,
+                -0.15625,
+                0.96875
+              ],
+              "version": 1
+            },
+            {
+              "id": 2,
+              "order_value": 1,
+              "payload": {
+                "city": "Berlin",
+                "color": "red"
+              },
+              "score": 0.25,
+              "shard_key": "region_1",
+              "vector": [
+                0.4749999940395355,
+                0.44062501192092896,
+                -0.2562499940395355,
+                0.3687500059604645
+              ],
+              "version": 1
+            }
+          ]
+        }
+      },
+      "QueryGroupsRequest": {
+        "type": "object",
+        "required": [
+          "group_by"
+        ],
+        "properties": {
+          "shard_key": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ShardKeySelector"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "prefetch": {
+            "description": "Sub-requests to perform first. If present, the query will be performed on the results of the prefetch(es).",
+            "default": null,
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Prefetch"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Prefetch"
+                }
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "query": {
+            "description": "Query to perform. If missing without prefetches, returns points ordered by their IDs.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueryInterface"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "using": {
+            "description": "Define which vector name to use for querying. If missing, the default vector is used.",
+            "type": "string",
+            "nullable": true
+          },
+          "filter": {
+            "description": "Filter conditions - return only those points that satisfy the specified conditions.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Filter"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "params": {
+            "description": "Search params for when there is no prefetch",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SearchParams"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "score_threshold": {
+            "description": "Return points with scores better than this threshold.",
+            "type": "number",
+            "format": "float",
+            "nullable": true
+          },
+          "with_vector": {
+            "description": "Options for specifying which vectors to include into the response. Default is false.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WithVector"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "with_payload": {
+            "description": "Options for specifying which payload to include or not. Default is false.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WithPayloadInterface"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "group_by": {
+            "description": "Payload field to group by, must be a string or number field. If the field contains more than 1 value, all values will be used for grouping. One point can be in multiple groups.",
+            "type": "string",
+            "minLength": 1
+          },
+          "group_size": {
+            "description": "Maximum amount of points to return per group. Default is 3.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 1,
+            "nullable": true
+          },
+          "limit": {
+            "description": "Maximum amount of groups to return. Default is 10.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 1,
+            "nullable": true
+          },
+          "with_lookup": {
+            "description": "Look for points in another collection using the group ids",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WithLookupInterface"
+              },
+              {
+                "nullable": true
+              }
+            ]
           }
         }
       }

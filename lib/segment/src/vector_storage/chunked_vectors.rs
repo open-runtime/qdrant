@@ -7,14 +7,15 @@ use std::path::Path;
 
 use common::types::PointOffsetType;
 
-use crate::common::vector_utils::TrySetCapacityExact;
+use crate::common::vector_utils::{TrySetCapacity, TrySetCapacityExact};
 
 // chunk size in bytes
-const CHUNK_SIZE: usize = 32 * 1024 * 1024;
+pub const CHUNK_SIZE: usize = 32 * 1024 * 1024;
 
 // if dimension is too high, use this capacity
 const MIN_CHUNK_CAPACITY: usize = 16;
 
+#[derive(Debug)]
 pub struct ChunkedVectors<T> {
     /// Vector's dimension.
     ///
@@ -52,10 +53,41 @@ impl<T: Copy + Clone + Default> ChunkedVectors<T> {
     where
         TKey: num_traits::cast::AsPrimitive<usize>,
     {
+        self.get_opt(key).expect("vector not found")
+    }
+
+    pub fn get_opt<TKey>(&self, key: TKey) -> Option<&[T]>
+    where
+        TKey: num_traits::cast::AsPrimitive<usize>,
+    {
+        if self.chunks.is_empty() {
+            return None;
+        }
         let key: usize = key.as_();
-        let chunk_data = &self.chunks[key / self.chunk_capacity];
-        let idx = (key % self.chunk_capacity) * self.dim;
-        &chunk_data[idx..idx + self.dim]
+        self.chunks
+            .get(key / self.chunk_capacity)
+            .and_then(|chunk_data| {
+                let idx = (key % self.chunk_capacity) * self.dim;
+                let range = idx..idx + self.dim;
+                chunk_data.get(range)
+            })
+    }
+
+    pub fn get_many<TKey>(&self, key: TKey, count: usize) -> Option<&[T]>
+    where
+        TKey: num_traits::cast::AsPrimitive<usize>,
+    {
+        if self.chunks.is_empty() {
+            return None;
+        }
+        let key: usize = key.as_();
+        self.chunks
+            .get(key / self.chunk_capacity)
+            .and_then(|chunk_data| {
+                let idx = (key % self.chunk_capacity) * self.dim;
+                let range = idx..idx + count * self.dim;
+                chunk_data.get(range)
+            })
     }
 
     pub fn push(&mut self, vector: &[T]) -> Result<PointOffsetType, TryReserveError> {
@@ -64,11 +96,71 @@ impl<T: Copy + Clone + Default> ChunkedVectors<T> {
         Ok(new_id)
     }
 
-    pub fn insert(&mut self, key: PointOffsetType, vector: &[T]) -> Result<(), TryReserveError> {
-        let key = key as usize;
-        self.len = max(self.len, key + 1);
-        self.chunks
-            .resize_with(self.len.div_ceil(self.chunk_capacity), Vec::new);
+    // returns how many flattened vectors can be inserted starting from key
+    pub fn get_chunk_left_keys<TKey>(&mut self, start_key: TKey) -> usize
+    where
+        TKey: num_traits::cast::AsPrimitive<usize>,
+    {
+        self.chunk_capacity - (start_key.as_() % self.chunk_capacity)
+    }
+
+    pub fn insert<TKey>(&mut self, key: TKey, vector: &[T]) -> Result<(), TryReserveError>
+    where
+        TKey: num_traits::cast::AsPrimitive<usize>,
+    {
+        assert_eq!(vector.len(), self.dim, "Vector size mismatch");
+        self.insert_many(key, vector, 1)
+    }
+
+    pub fn insert_many<TKey>(
+        &mut self,
+        key: TKey,
+        vectors: &[T],
+        vectors_count: usize,
+    ) -> Result<(), TryReserveError>
+    where
+        TKey: num_traits::cast::AsPrimitive<usize>,
+    {
+        let key = key.as_();
+        assert_eq!(
+            vectors.len(),
+            vectors_count * self.dim,
+            "Vector size mismatch"
+        );
+        assert!(
+            self.get_chunk_left_keys(key) >= vectors_count,
+            "Index out of bounds"
+        );
+
+        let desired_capacity = self.chunk_capacity * self.dim;
+        let new_len = max(self.len, key + vectors_count);
+        let chunks_len = new_len.div_ceil(self.chunk_capacity);
+
+        if chunks_len > self.chunks.len() {
+            // All chunks except the last one should be fully allocated.
+            // If we are going to add new chunks, resize last one which may be partially allocated.
+            if let Some(last_chunk) = self.chunks.last_mut() {
+                last_chunk.try_set_capacity_exact(desired_capacity)?;
+                last_chunk.resize_with(desired_capacity, T::default);
+            }
+
+            self.chunks.try_set_capacity(chunks_len)?;
+
+            let new_chunks = chunks_len - self.chunks.len();
+            let skipped_chunks = new_chunks - 1;
+
+            // All skipped chunks should be fully allocated.
+            for _ in 0..skipped_chunks {
+                let mut chunk = Vec::new();
+                chunk.try_set_capacity_exact(desired_capacity)?;
+                chunk.resize_with(desired_capacity, T::default);
+                self.chunks.push(chunk);
+            }
+
+            // Add new chunk with lower capacity.
+            self.chunks.push(Default::default());
+            assert_eq!(self.chunks.len(), chunks_len);
+        }
 
         let chunk_idx = key / self.chunk_capacity;
         let chunk_data = &mut self.chunks[chunk_idx];
@@ -84,17 +176,20 @@ impl<T: Copy + Clone + Default> ChunkedVectors<T> {
         // <https://doc.rust-lang.org/std/vec/struct.Vec.html#capacity-and-reallocation>).
         // All other chunks allocate their capacity in full on first use to prevent expensive
         // reallocations when their data grows.
-        if chunk_data.len() < idx + self.dim {
+        if chunk_data.len() < idx + vectors.len() {
             // If the chunk is not the first one, allocate it fully on first use
             if chunk_idx != 0 {
-                let desired_capacity = self.chunk_capacity * self.dim;
                 chunk_data.try_set_capacity_exact(desired_capacity)?;
             }
-            chunk_data.resize_with(idx + self.dim, T::default);
+            chunk_data.resize_with(idx + vectors.len(), T::default);
         }
 
-        let data = &mut chunk_data[idx..idx + self.dim];
-        data.copy_from_slice(vector);
+        let data = &mut chunk_data[idx..idx + vectors.len()];
+        data.copy_from_slice(vectors);
+
+        // Update `self.len` only after the vector is successfully inserted.
+        // In case of OOM, `self.len` will not be updated.
+        self.len = new_len;
 
         Ok(())
     }
@@ -180,5 +275,31 @@ impl quantization::EncodedStorageBuilder<ChunkedVectors<u8>> for ChunkedVectors<
         // Memory for ChunkedVectors are already pre-allocated,
         // so we do not expect any errors here.
         self.push(other).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_chunked_vectors_with_skipped_chunks() {
+        let mut vectors = ChunkedVectors::new(3);
+        assert_eq!(vectors.get_opt(0), None);
+
+        vectors.insert(0, &[1, 2, 3]).unwrap();
+        vectors.insert(10_000_000, &[4, 5, 6]).unwrap();
+        assert!(vectors.chunks.len() > 3);
+
+        assert_eq!(vectors.get(0), &[1, 2, 3]);
+        assert_eq!(vectors.get(10_000_000), &[4, 5, 6]);
+
+        assert_eq!(vectors.get_opt(10_000_001), None);
+
+        // check if first chunk is fully allocated
+        assert_eq!(vectors.get(100), &[0, 0, 0]);
+
+        // check if middle chunk is fully allocated
+        assert_eq!(vectors.get(5_000_000), &[0, 0, 0]);
     }
 }

@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
-use std::ops::Bound::{Excluded, Unbounded};
-use std::ops::{Bound, Range};
+use std::ops::Bound;
 use std::sync::Arc;
 
 use common::types::PointOffsetType;
@@ -10,17 +9,18 @@ use rocksdb::DB;
 use super::mutable_numeric_index::MutableNumericIndex;
 use super::{Encodable, NumericIndex, HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION};
 use crate::common::operation_error::OperationResult;
+use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
 use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
 use crate::index::field_index::histogram::{Histogram, Numericable, Point};
+use crate::index::field_index::immutable_point_to_values::ImmutablePointToValues;
 
-pub struct ImmutableNumericIndex<T: Encodable + Numericable> {
+pub struct ImmutableNumericIndex<T: Encodable + Numericable + Default> {
     map: NumericKeySortedVec<T>,
-    db_wrapper: DatabaseColumnWrapper,
+    db_wrapper: DatabaseColumnScheduledDeleteWrapper,
     pub(super) histogram: Histogram<T>,
     pub(super) points_count: usize,
     pub(super) max_values_per_point: usize,
-    point_to_values: Vec<Range<u32>>,
-    point_to_values_container: Vec<T>,
+    point_to_values: ImmutablePointToValues<T>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -132,7 +132,7 @@ impl<T: Encodable + Numericable> NumericKeySortedVec<T> {
         end_bound: Bound<NumericIndexKey<T>>,
     ) -> NumericKeySortedVecIterator<'_, T> {
         let start_index = self.find_start_index(start_bound);
-        let end_index = self.find_end_index(end_bound);
+        let end_index = self.find_end_index(start_index, end_bound);
         NumericKeySortedVecIterator {
             set: self,
             start_index,
@@ -151,13 +151,20 @@ impl<T: Encodable + Numericable> NumericKeySortedVec<T> {
         }
     }
 
-    fn find_end_index(&self, bound: Bound<NumericIndexKey<T>>) -> usize {
+    fn find_end_index(&self, start: usize, bound: Bound<NumericIndexKey<T>>) -> usize {
+        if start >= self.data.len() {
+            // the range `end` should never be less than `start`
+            return start;
+        }
         match bound {
-            Bound::Included(bound) => match self.data.binary_search(&bound) {
-                Ok(idx) => idx + 1,
-                Err(idx) => idx,
+            Bound::Included(bound) => match self.data[start..].binary_search(&bound) {
+                Ok(idx) => idx + 1 + start,
+                Err(idx) => idx + start,
             },
-            Bound::Excluded(bound) => self.data.binary_search(&bound).unwrap_or_else(|idx| idx),
+            Bound::Excluded(bound) => {
+                let end_bound = self.data[start..].binary_search(&bound);
+                end_bound.unwrap_or_else(|idx| idx) + start
+            }
             Bound::Unbounded => self.data.len(),
         }
     }
@@ -193,10 +200,13 @@ impl<'a, T: Encodable + Numericable> DoubleEndedIterator for NumericKeySortedVec
     }
 }
 
-impl<T: Encodable + Numericable> ImmutableNumericIndex<T> {
+impl<T: Encodable + Numericable + Default> ImmutableNumericIndex<T> {
     pub(super) fn new(db: Arc<RwLock<DB>>, field: &str) -> Self {
         let store_cf_name = NumericIndex::<T>::storage_cf_name(field);
-        let db_wrapper = DatabaseColumnWrapper::new(db, &store_cf_name);
+        let db_wrapper = DatabaseColumnScheduledDeleteWrapper::new(DatabaseColumnWrapper::new(
+            db,
+            &store_cf_name,
+        ));
         Self {
             map: NumericKeySortedVec {
                 data: Default::default(),
@@ -207,18 +217,15 @@ impl<T: Encodable + Numericable> ImmutableNumericIndex<T> {
             points_count: 0,
             max_values_per_point: 1,
             point_to_values: Default::default(),
-            point_to_values_container: Default::default(),
         }
     }
 
-    pub(super) fn get_db_wrapper(&self) -> &DatabaseColumnWrapper {
+    pub(super) fn get_db_wrapper(&self) -> &DatabaseColumnScheduledDeleteWrapper {
         &self.db_wrapper
     }
 
     pub(super) fn get_values(&self, idx: PointOffsetType) -> Option<&[T]> {
-        let range = self.point_to_values.get(idx as usize)?.clone();
-        let range = range.start as usize..range.end as usize;
-        Some(&self.point_to_values_container[range])
+        self.point_to_values.get_values(idx)
     }
 
     pub(super) fn get_values_count(&self) -> usize {
@@ -233,6 +240,16 @@ impl<T: Encodable + Numericable> ImmutableNumericIndex<T> {
         self.map
             .values_range(start_bound, end_bound)
             .map(|NumericIndexKey { idx, .. }| idx)
+    }
+
+    pub(super) fn orderable_values_range(
+        &self,
+        start_bound: Bound<NumericIndexKey<T>>,
+        end_bound: Bound<NumericIndexKey<T>>,
+    ) -> impl DoubleEndedIterator<Item = (T, PointOffsetType)> + '_ {
+        self.map
+            .values_range(start_bound, end_bound)
+            .map(|NumericIndexKey { key, idx, .. }| (key, idx))
     }
 
     pub(super) fn load(&mut self) -> OperationResult<bool> {
@@ -259,40 +276,27 @@ impl<T: Encodable + Numericable> ImmutableNumericIndex<T> {
         self.points_count = points_count;
         self.max_values_per_point = max_values_per_point;
 
-        // flatten points-to-values map
-        for values in point_to_values {
-            let values = values.into_iter().collect::<Vec<_>>();
-            let container_len = self.point_to_values_container.len() as u32;
-            let range = container_len..container_len + values.len() as u32;
-            self.point_to_values.push(range.clone());
-            self.point_to_values_container.extend(values);
-        }
+        self.point_to_values = ImmutablePointToValues::new(point_to_values);
 
         Ok(true)
     }
 
     pub(super) fn remove_point(&mut self, idx: PointOffsetType) -> OperationResult<()> {
-        if self.point_to_values.len() <= idx as usize {
-            return Ok(());
+        if let Some(removed_values) = self.point_to_values.get_values(idx) {
+            if !removed_values.is_empty() {
+                self.points_count -= 1;
+            }
+
+            for value in removed_values {
+                let key = NumericIndexKey::new(*value, idx);
+                Self::remove_from_map(&mut self.map, &mut self.histogram, key);
+
+                // update db
+                let encoded = value.encode_key(idx);
+                self.db_wrapper.remove(encoded)?;
+            }
         }
-
-        let removed_values_range = self.point_to_values[idx as usize].clone();
-        self.point_to_values[idx as usize] = Default::default();
-
-        if !removed_values_range.is_empty() {
-            self.points_count -= 1;
-        }
-
-        for value_index in removed_values_range {
-            let value = self.point_to_values_container[value_index as usize];
-            let key = NumericIndexKey::new(value, idx);
-            Self::remove_from_map(&mut self.map, &mut self.histogram, key);
-
-            // update db
-            let encoded = value.encode_key(idx);
-            self.db_wrapper.remove(encoded)?;
-        }
-
+        self.point_to_values.remove_point(idx);
         Ok(())
     }
 
@@ -315,7 +319,7 @@ impl<T: Encodable + Numericable> ImmutableNumericIndex<T> {
         point: &Point<T>,
     ) -> Option<Point<T>> {
         let key: NumericIndexKey<T> = point.clone().into();
-        map.values_range(Unbounded, Excluded(key))
+        map.values_range(Bound::Unbounded, Bound::Excluded(key))
             .next_back()
             .map(|key| key.into())
     }
@@ -325,7 +329,7 @@ impl<T: Encodable + Numericable> ImmutableNumericIndex<T> {
         point: &Point<T>,
     ) -> Option<Point<T>> {
         let key: NumericIndexKey<T> = point.clone().into();
-        map.values_range(Excluded(key), Unbounded)
+        map.values_range(Bound::Excluded(key), Bound::Unbounded)
             .next()
             .map(|key| key.into())
     }

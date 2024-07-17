@@ -1,14 +1,16 @@
-use actix_web::rt::time::Instant;
-use actix_web::{delete, get, post, web, Responder};
+use std::future::Future;
+
+use actix_web::{delete, get, post, web, HttpResponse};
 use actix_web_validator::Query;
 use serde::Deserialize;
 use storage::content_manager::consensus_ops::ConsensusOperations;
 use storage::content_manager::errors::StorageError;
-use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
+use storage::rbac::AccessRequirements;
 use validator::Validate;
 
-use crate::actix::helpers::process_response;
+use crate::actix::auth::ActixAccess;
+use crate::actix::helpers;
 
 #[derive(Debug, Deserialize, Validate)]
 struct QueryParams {
@@ -20,52 +22,63 @@ struct QueryParams {
 }
 
 #[get("/cluster")]
-async fn cluster_status(dispatcher: web::Data<Dispatcher>) -> impl Responder {
-    let timing = Instant::now();
-    let response = dispatcher.cluster_status();
-    process_response(Ok(response), timing)
+fn cluster_status(
+    dispatcher: web::Data<Dispatcher>,
+    ActixAccess(access): ActixAccess,
+) -> impl Future<Output = HttpResponse> {
+    helpers::time(async move {
+        access.check_global_access(AccessRequirements::new())?;
+        Ok(dispatcher.cluster_status())
+    })
 }
 
 #[post("/cluster/recover")]
-async fn recover_current_peer(toc: web::Data<TableOfContent>) -> impl Responder {
-    let timing = Instant::now();
-    process_response(toc.request_snapshot().map(|_| true), timing)
+fn recover_current_peer(
+    dispatcher: web::Data<Dispatcher>,
+    ActixAccess(access): ActixAccess,
+) -> impl Future<Output = HttpResponse> {
+    helpers::time(async move {
+        access.check_global_access(AccessRequirements::new().manage())?;
+        dispatcher.toc(&access).request_snapshot()?;
+        Ok(true)
+    })
 }
 
 #[delete("/cluster/peer/{peer_id}")]
-async fn remove_peer(
+fn remove_peer(
     dispatcher: web::Data<Dispatcher>,
     peer_id: web::Path<u64>,
     Query(params): Query<QueryParams>,
-) -> impl Responder {
-    let timing = Instant::now();
-    let dispatcher = dispatcher.into_inner();
-    let peer_id = peer_id.into_inner();
+    ActixAccess(access): ActixAccess,
+) -> impl Future<Output = HttpResponse> {
+    helpers::time(async move {
+        access.check_global_access(AccessRequirements::new().manage())?;
 
-    let has_shards = dispatcher.peer_has_shards(peer_id).await;
-    if !params.force && has_shards {
-        return process_response::<()>(
-            Err(StorageError::BadRequest {
+        let dispatcher = dispatcher.into_inner();
+        let toc = dispatcher.toc(&access);
+        let peer_id = peer_id.into_inner();
+
+        let has_shards = toc.peer_has_shards(peer_id).await;
+        if !params.force && has_shards {
+            return Err(StorageError::BadRequest {
                 description: format!("Cannot remove peer {peer_id} as there are shards on it"),
-            }),
-            timing,
-        );
-    }
-
-    let response = match dispatcher.consensus_state() {
-        Some(consensus_state) => {
-            consensus_state
-                .propose_consensus_op_with_await(
-                    ConsensusOperations::RemovePeer(peer_id),
-                    params.timeout.map(std::time::Duration::from_secs),
-                )
-                .await
+            });
         }
-        None => Err(StorageError::BadRequest {
-            description: "Distributed mode disabled.".to_string(),
-        }),
-    };
-    process_response(response, timing)
+
+        match dispatcher.consensus_state() {
+            Some(consensus_state) => {
+                consensus_state
+                    .propose_consensus_op_with_await(
+                        ConsensusOperations::RemovePeer(peer_id),
+                        params.timeout.map(std::time::Duration::from_secs),
+                    )
+                    .await
+            }
+            None => Err(StorageError::BadRequest {
+                description: "Distributed mode disabled.".to_string(),
+            }),
+        }
+    })
 }
 
 // Configure services

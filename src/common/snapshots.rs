@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use collection::collection::Collection;
+use collection::common::sha_256::hash_file;
 use collection::operations::snapshot_ops::{
     ShardSnapshotLocation, SnapshotDescription, SnapshotPriority,
 };
@@ -11,6 +12,7 @@ use collection::shards::shard::ShardId;
 use storage::content_manager::errors::StorageError;
 use storage::content_manager::snapshots;
 use storage::content_manager::toc::TableOfContent;
+use storage::rbac::{Access, AccessRequirements};
 
 use super::http_client::HttpClient;
 
@@ -19,10 +21,13 @@ use super::http_client::HttpClient;
 /// This function is cancel safe.
 pub async fn create_shard_snapshot(
     toc: Arc<TableOfContent>,
+    access: Access,
     collection_name: String,
     shard_id: ShardId,
 ) -> Result<SnapshotDescription, StorageError> {
-    let collection = toc.get_collection(&collection_name).await?;
+    let collection_pass = access
+        .check_collection_access(&collection_name, AccessRequirements::new().write().whole())?;
+    let collection = toc.get_collection(&collection_pass).await?;
 
     let snapshot = collection
         .create_shard_snapshot(shard_id, &toc.optional_temp_or_snapshot_temp_path()?)
@@ -36,10 +41,13 @@ pub async fn create_shard_snapshot(
 /// This function is cancel safe.
 pub async fn list_shard_snapshots(
     toc: Arc<TableOfContent>,
+    access: Access,
     collection_name: String,
     shard_id: ShardId,
 ) -> Result<Vec<SnapshotDescription>, StorageError> {
-    let collection = toc.get_collection(&collection_name).await?;
+    let collection_pass =
+        access.check_collection_access(&collection_name, AccessRequirements::new().whole())?;
+    let collection = toc.get_collection(&collection_pass).await?;
     let snapshots = collection.list_shard_snapshots(shard_id).await?;
     Ok(snapshots)
 }
@@ -49,17 +57,27 @@ pub async fn list_shard_snapshots(
 /// This function is cancel safe.
 pub async fn delete_shard_snapshot(
     toc: Arc<TableOfContent>,
+    access: Access,
     collection_name: String,
     shard_id: ShardId,
     snapshot_name: String,
 ) -> Result<(), StorageError> {
-    let collection = toc.get_collection(&collection_name).await?;
-    let snapshot_path = collection
-        .get_shard_snapshot_path(shard_id, &snapshot_name)
+    let collection_pass = access
+        .check_collection_access(&collection_name, AccessRequirements::new().write().whole())?;
+    let collection = toc.get_collection(&collection_pass).await?;
+    let snapshot_manager = collection.get_snapshots_storage_manager()?;
+    let snapshot_path = snapshot_manager
+        .get_shard_snapshot_path(
+            collection.shards_holder(),
+            shard_id,
+            collection.snapshots_path(),
+            snapshot_name,
+        )
         .await?;
 
     check_shard_snapshot_file_exists(&snapshot_path)?;
-    tokio::fs::remove_file(&snapshot_path).await?;
+
+    let _task = tokio::spawn(async move { snapshot_manager.delete_snapshot(&snapshot_path).await });
 
     Ok(())
 }
@@ -67,14 +85,23 @@ pub async fn delete_shard_snapshot(
 /// # Cancel safety
 ///
 /// This function is cancel safe.
+#[allow(clippy::too_many_arguments)]
 pub async fn recover_shard_snapshot(
     toc: Arc<TableOfContent>,
+    access: Access,
     collection_name: String,
     shard_id: ShardId,
     snapshot_location: ShardSnapshotLocation,
     snapshot_priority: SnapshotPriority,
+    checksum: Option<String>,
     client: HttpClient,
+    api_key: Option<String>,
 ) -> Result<(), StorageError> {
+    let collection_pass = access
+        .check_global_access(AccessRequirements::new().manage())?
+        .issue_pass(&collection_name)
+        .into_static();
+
     // - `download_dir` handled by `tempfile` and would be deleted, if request is cancelled
     //   - remote snapshot is downloaded into `download_dir` and would be deleted with it
     // - `recover_shard_snapshot_impl` is *not* cancel safe
@@ -82,7 +109,7 @@ pub async fn recover_shard_snapshot(
 
     cancel::future::spawn_cancel_on_drop(move |cancel| async move {
         let future = async {
-            let collection = toc.get_collection(&collection_name).await?;
+            let collection = toc.get_collection(&collection_pass).await?;
             collection.assert_shard_exists(shard_id).await?;
 
             let download_dir = toc.snapshots_download_tempdir()?;
@@ -98,7 +125,7 @@ pub async fn recover_shard_snapshot(
                         return Err(StorageError::bad_input(description));
                     }
 
-                    let client = client.client()?;
+                    let client = client.client(api_key.as_deref())?;
 
                     let (snapshot_path, snapshot_temp_path) =
                         snapshots::download::download_snapshot(&client, url, download_dir.path())
@@ -107,12 +134,29 @@ pub async fn recover_shard_snapshot(
                     (snapshot_path, snapshot_temp_path)
                 }
 
-                ShardSnapshotLocation::Path(path) => {
-                    let snapshot_path = collection.get_shard_snapshot_path(shard_id, path).await?;
+                ShardSnapshotLocation::Path(snapshot_file_name) => {
+                    let snapshot_storage_manager = collection.get_snapshots_storage_manager()?;
+                    let snapshot_path = snapshot_storage_manager
+                        .get_shard_snapshot_path(
+                            collection.shards_holder(),
+                            shard_id,
+                            collection.snapshots_path(),
+                            snapshot_file_name,
+                        )
+                        .await?;
                     check_shard_snapshot_file_exists(&snapshot_path)?;
                     (snapshot_path, None)
                 }
             };
+
+            if let Some(checksum) = checksum {
+                let snapshot_checksum = hash_file(&snapshot_path).await?;
+                if snapshot_checksum != checksum {
+                    return Err(StorageError::bad_input(format!(
+                        "Snapshot checksum mismatch: expected {checksum}, got {snapshot_checksum}"
+                    )));
+                }
+            }
 
             Result::<_, StorageError>::Ok((
                 collection,

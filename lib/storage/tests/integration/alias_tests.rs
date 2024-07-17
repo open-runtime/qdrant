@@ -1,9 +1,10 @@
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use collection::operations::types::VectorParams;
+use collection::operations::vector_params_builder::VectorParamsBuilder;
 use collection::optimizers_builder::OptimizersConfig;
 use collection::shards::channel_service::ChannelService;
+use common::cpu::CpuBudget;
 use memory::madvise;
 use segment::types::Distance;
 use storage::content_manager::collection_meta_ops::{
@@ -13,9 +14,12 @@ use storage::content_manager::collection_meta_ops::{
 use storage::content_manager::consensus::operation_sender::OperationSender;
 use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
+use storage::rbac::{Access, AccessRequirements};
 use storage::types::{PerformanceConfig, StorageConfig};
 use tempfile::Builder;
 use tokio::runtime::Runtime;
+
+const FULL_ACCESS: Access = Access::full("For test");
 
 #[test]
 fn test_alias_operation() {
@@ -29,6 +33,7 @@ fn test_alias_operation() {
             .to_str()
             .unwrap()
             .to_string(),
+        snapshots_config: Default::default(),
         temp_path: None,
         on_disk_payload: false,
         optimizers: OptimizersConfig {
@@ -39,19 +44,20 @@ fn test_alias_operation() {
             memmap_threshold: Some(100),
             indexing_threshold: Some(100),
             flush_interval_sec: 2,
-            max_optimization_threads: 2,
+            max_optimization_threads: Some(2),
         },
+        optimizers_overwrite: None,
         wal: Default::default(),
         performance: PerformanceConfig {
             max_search_threads: 1,
             max_optimization_threads: 1,
+            optimizer_cpu_budget: 0,
             update_rate_limit: None,
             search_timeout_sec: None,
             incoming_shard_transfers_limit: Some(1),
             outgoing_shard_transfers_limit: Some(1),
         },
         hnsw_index: Default::default(),
-        quantization: None,
         mmap_advice: madvise::Advice::Random,
         node_type: Default::default(),
         update_queue_size: Default::default(),
@@ -60,6 +66,8 @@ fn test_alias_operation() {
         async_scorer: false,
         update_concurrency: Some(NonZeroUsize::new(2).unwrap()),
         // update_concurrency: None,
+        shard_transfer_method: None,
+        collection: None,
     };
 
     let search_runtime = Runtime::new().unwrap();
@@ -77,7 +85,8 @@ fn test_alias_operation() {
         search_runtime,
         update_runtime,
         general_runtime,
-        ChannelService::new(6333),
+        CpuBudget::default(),
+        ChannelService::new(6333, None),
         0,
         Some(propose_operation_sender),
     ));
@@ -89,14 +98,9 @@ fn test_alias_operation() {
                 CollectionMetaOperations::CreateCollection(CreateCollectionOperation::new(
                     "test".to_string(),
                     CreateCollection {
-                        vectors: VectorParams {
-                            size: NonZeroU64::new(10).unwrap(),
-                            distance: Distance::Cosine,
-                            hnsw_config: None,
-                            quantization_config: None,
-                            on_disk: None,
-                        }
-                        .into(),
+                        vectors: VectorParamsBuilder::new(10, Distance::Cosine)
+                            .build()
+                            .into(),
                         sparse_vectors: None,
                         hnsw_config: None,
                         wal_config: None,
@@ -110,6 +114,7 @@ fn test_alias_operation() {
                         sharding_method: None,
                     },
                 )),
+                FULL_ACCESS.clone(),
                 None,
             ),
         )
@@ -124,6 +129,7 @@ fn test_alias_operation() {
                     }
                     .into()],
             }),
+            FULL_ACCESS.clone(),
             None,
         ))
         .unwrap();
@@ -148,11 +154,18 @@ fn test_alias_operation() {
                         .into(),
                     ],
             }),
+            FULL_ACCESS.clone(),
             None,
         ))
         .unwrap();
 
     let _ = handle
-        .block_on(dispatcher.get_collection("test_alias3"))
+        .block_on(
+            dispatcher.toc(&FULL_ACCESS).get_collection(
+                &FULL_ACCESS
+                    .check_collection_access("test_alias3", AccessRequirements::new())
+                    .unwrap(),
+            ),
+        )
         .unwrap();
 }

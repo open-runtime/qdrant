@@ -11,16 +11,20 @@ use api::grpc::qdrant::shard_snapshots_client::ShardSnapshotsClient;
 use api::grpc::qdrant::{
     CollectionOperationResponse, CoreSearchBatchPointsInternal, CountPoints, CountPointsInternal,
     GetCollectionInfoRequest, GetCollectionInfoRequestInternal, GetPoints, GetPointsInternal,
-    HealthCheckRequest, InitiateShardTransferRequest, RecoverShardSnapshotRequest,
+    GetShardRecoveryPointRequest, HealthCheckRequest, InitiateShardTransferRequest,
+    QueryBatchPointsInternal, QueryShardPoints, RecoverShardSnapshotRequest,
     RecoverSnapshotResponse, ScrollPoints, ScrollPointsInternal, ShardSnapshotLocation,
-    WaitForShardStateRequest,
+    UpdateShardCutoffPointRequest, WaitForShardStateRequest,
 };
 use api::grpc::transport_channel_pool::{AddTimeout, MAX_GRPC_CHANNEL_TIMEOUT};
 use async_trait::async_trait;
+use common::types::TelemetryDetail;
+use itertools::Itertools;
 use parking_lot::Mutex;
 use segment::common::operation_time_statistics::{
     OperationDurationsAggregator, ScopeDurationMeasurer,
 };
+use segment::data_types::order_by::OrderBy;
 use segment::types::{
     ExtendedPointId, Filter, ScoredPoint, WithPayload, WithPayloadInterface, WithVector,
 };
@@ -33,6 +37,7 @@ use url::Url;
 use super::conversions::{
     internal_delete_vectors, internal_delete_vectors_by_filter, internal_update_vectors,
 };
+use super::local_shard::clock_map::RecoveryPoint;
 use super::replica_set::ReplicaState;
 use crate::operations::conversions::try_record_from_grpc;
 use crate::operations::payload_ops::PayloadOps;
@@ -40,11 +45,11 @@ use crate::operations::point_ops::{PointOperations, WriteOrdering};
 use crate::operations::snapshot_ops::SnapshotPriority;
 use crate::operations::types::{
     CollectionError, CollectionInfo, CollectionResult, CoreSearchRequest, CoreSearchRequestBatch,
-    CountRequestInternal, CountResult, PointRequestInternal, Record, SearchRequestInternal,
-    UpdateResult,
+    CountRequestInternal, CountResult, PointRequestInternal, Record, UpdateResult,
 };
+use crate::operations::universal_query::shard_query::{ShardQueryRequest, ShardQueryResponse};
 use crate::operations::vector_ops::VectorOperations;
-use crate::operations::{CollectionUpdateOperations, FieldIndexOperations};
+use crate::operations::{CollectionUpdateOperations, FieldIndexOperations, OperationWithClockTag};
 use crate::shards::channel_service::ChannelService;
 use crate::shards::conversions::{
     internal_clear_payload, internal_clear_payload_by_filter, internal_create_index,
@@ -177,12 +182,18 @@ impl RemoteShard {
             .map_err(|err| err.into())
     }
 
-    pub fn get_telemetry_data(&self) -> RemoteShardTelemetry {
+    pub fn get_telemetry_data(&self, detail: TelemetryDetail) -> RemoteShardTelemetry {
         RemoteShardTelemetry {
             shard_id: self.id,
             peer_id: Some(self.peer_id),
-            searches: self.telemetry_search_durations.lock().get_statistics(),
-            updates: self.telemetry_update_durations.lock().get_statistics(),
+            searches: self
+                .telemetry_search_durations
+                .lock()
+                .get_statistics(detail),
+            updates: self
+                .telemetry_update_durations
+                .lock()
+                .get_statistics(detail),
         }
     }
 
@@ -201,12 +212,17 @@ impl RemoteShard {
         Ok(res)
     }
 
+    /// # Cancel safety
+    ///
+    /// This method is cancel safe.
     pub async fn forward_update(
         &self,
-        operation: CollectionUpdateOperations,
+        operation: OperationWithClockTag,
         wait: bool,
         ordering: WriteOrdering,
     ) -> CollectionResult<UpdateResult> {
+        // `RemoteShard::execute_update_operation` is cancel safe, so this method is cancel safe.
+
         self.execute_update_operation(
             Some(self.id),
             self.collection_id.clone(),
@@ -217,22 +233,29 @@ impl RemoteShard {
         .await
     }
 
+    /// # Cancel safety
+    ///
+    /// This method is cancel safe.
     pub async fn execute_update_operation(
         &self,
         shard_id: Option<ShardId>,
         collection_name: String,
-        operation: CollectionUpdateOperations,
+        operation: OperationWithClockTag,
         wait: bool,
         ordering: Option<WriteOrdering>,
     ) -> CollectionResult<UpdateResult> {
+        // Cancelling remote request should always be safe on the client side and update API
+        // *should be* cancel safe on the server side, so this method is cancel safe.
+
         let mut timer = ScopeDurationMeasurer::new(&self.telemetry_update_durations);
         timer.set_success(false);
 
-        let point_operation_response = match operation {
+        let point_operation_response = match operation.operation {
             CollectionUpdateOperations::PointOperation(point_ops) => match point_ops {
                 PointOperations::UpsertPoints(point_insert_operations) => {
                     let request = &internal_upsert_points(
                         shard_id,
+                        operation.clock_tag,
                         collection_name,
                         point_insert_operations,
                         wait,
@@ -245,8 +268,14 @@ impl RemoteShard {
                     .into_inner()
                 }
                 PointOperations::DeletePoints { ids } => {
-                    let request =
-                        &internal_delete_points(shard_id, collection_name, ids, wait, ordering);
+                    let request = &internal_delete_points(
+                        shard_id,
+                        operation.clock_tag,
+                        collection_name,
+                        ids,
+                        wait,
+                        ordering,
+                    );
                     self.with_points_client(|mut client| async move {
                         client.delete(tonic::Request::new(request.clone())).await
                     })
@@ -256,6 +285,7 @@ impl RemoteShard {
                 PointOperations::DeletePointsByFilter(filter) => {
                     let request = &internal_delete_points_by_filter(
                         shard_id,
+                        operation.clock_tag,
                         collection_name,
                         filter,
                         wait,
@@ -270,6 +300,7 @@ impl RemoteShard {
                 PointOperations::SyncPoints(operation) => {
                     let request = &internal_sync_points(
                         shard_id,
+                        None, // TODO!?
                         collection_name,
                         operation,
                         wait,
@@ -286,6 +317,7 @@ impl RemoteShard {
                 VectorOperations::UpdateVectors(update_operation) => {
                     let request = &internal_update_vectors(
                         shard_id,
+                        operation.clock_tag,
                         collection_name,
                         update_operation,
                         wait,
@@ -302,6 +334,7 @@ impl RemoteShard {
                 VectorOperations::DeleteVectors(ids, vector_names) => {
                     let request = &internal_delete_vectors(
                         shard_id,
+                        operation.clock_tag,
                         collection_name,
                         ids.points,
                         vector_names.clone(),
@@ -319,6 +352,7 @@ impl RemoteShard {
                 VectorOperations::DeleteVectorsByFilter(filter, vector_names) => {
                     let request = &internal_delete_vectors_by_filter(
                         shard_id,
+                        operation.clock_tag,
                         collection_name,
                         filter,
                         vector_names.clone(),
@@ -338,6 +372,7 @@ impl RemoteShard {
                 PayloadOps::SetPayload(set_payload) => {
                     let request = &internal_set_payload(
                         shard_id,
+                        operation.clock_tag,
                         collection_name,
                         set_payload,
                         wait,
@@ -354,6 +389,7 @@ impl RemoteShard {
                 PayloadOps::DeletePayload(delete_payload) => {
                     let request = &internal_delete_payload(
                         shard_id,
+                        operation.clock_tag,
                         collection_name,
                         delete_payload,
                         wait,
@@ -368,8 +404,14 @@ impl RemoteShard {
                     .into_inner()
                 }
                 PayloadOps::ClearPayload { points } => {
-                    let request =
-                        &internal_clear_payload(shard_id, collection_name, points, wait, ordering);
+                    let request = &internal_clear_payload(
+                        shard_id,
+                        operation.clock_tag,
+                        collection_name,
+                        points,
+                        wait,
+                        ordering,
+                    );
                     self.with_points_client(|mut client| async move {
                         client
                             .clear_payload(tonic::Request::new(request.clone()))
@@ -381,6 +423,7 @@ impl RemoteShard {
                 PayloadOps::ClearPayloadByFilter(filter) => {
                     let request = &internal_clear_payload_by_filter(
                         shard_id,
+                        operation.clock_tag,
                         collection_name,
                         filter,
                         wait,
@@ -397,6 +440,7 @@ impl RemoteShard {
                 PayloadOps::OverwritePayload(set_payload) => {
                     let request = &internal_set_payload(
                         shard_id,
+                        operation.clock_tag,
                         collection_name,
                         set_payload,
                         wait,
@@ -416,6 +460,7 @@ impl RemoteShard {
                 FieldIndexOperations::CreateIndex(create_index) => {
                     let request = &internal_create_index(
                         shard_id,
+                        operation.clock_tag,
                         collection_name,
                         create_index,
                         wait,
@@ -432,6 +477,7 @@ impl RemoteShard {
                 FieldIndexOperations::DeleteIndex(delete_index) => {
                     let request = &internal_delete_index(
                         shard_id,
+                        operation.clock_tag,
                         collection_name,
                         delete_index,
                         wait,
@@ -461,6 +507,9 @@ impl RemoteShard {
     ///
     /// This method specifies a timeout of 24 hours.
     ///
+    /// Setting an API key may leak when requesting a snapshot file from a malicious server.
+    /// This is potentially dangerous if a user has control over what URL is accessed.
+    ///
     /// # Cancel safety
     ///
     /// This method is cancel safe.
@@ -470,6 +519,7 @@ impl RemoteShard {
         shard_id: ShardId,
         url: &Url,
         snapshot_priority: SnapshotPriority,
+        api_key: Option<&str>,
     ) -> CollectionResult<RecoverSnapshotResponse> {
         let res = self
             .with_shard_snapshots_client_timeout(
@@ -484,6 +534,8 @@ impl RemoteShard {
                             snapshot_priority: api::grpc::qdrant::ShardSnapshotPriority::from(
                                 snapshot_priority,
                             ) as i32,
+                            checksum: None,
+                            api_key: api_key.map(Into::into),
                         })
                         .await
                 },
@@ -519,6 +571,53 @@ impl RemoteShard {
         Ok(res)
     }
 
+    /// Request the recovery point on the remote shard
+    pub async fn shard_recovery_point(
+        &self,
+        collection_name: &str,
+        shard_id: ShardId,
+    ) -> CollectionResult<RecoveryPoint> {
+        let res = self
+            .with_collections_client(|mut client| async move {
+                client
+                    .get_shard_recovery_point(GetShardRecoveryPointRequest {
+                        collection_name: collection_name.into(),
+                        shard_id,
+                    })
+                    .await
+            })
+            .await?
+            .into_inner();
+
+        let Some(recovery_point) = res.recovery_point else {
+            return Err(CollectionError::service_error(
+                "Recovery point data is missing in recovery point response",
+            ));
+        };
+
+        Ok(recovery_point.try_into()?)
+    }
+
+    /// Update the shard cutoff point on the remote shard
+    pub async fn update_shard_cutoff_point(
+        &self,
+        collection_name: &str,
+        shard_id: ShardId,
+        cutoff: &RecoveryPoint,
+    ) -> CollectionResult<()> {
+        self.with_collections_client(|mut client| async move {
+            client
+                .update_shard_cutoff_point(UpdateShardCutoffPointRequest {
+                    collection_name: collection_name.into(),
+                    shard_id,
+                    cutoff: Some(cutoff.into()),
+                })
+                .await
+        })
+        .await?;
+        Ok(())
+    }
+
     pub async fn health_check(&self) -> CollectionResult<()> {
         let _ = self
             .with_qdrant_client(|mut client| async move {
@@ -532,17 +631,20 @@ impl RemoteShard {
 }
 
 // New-type to own the type in the crate for conversions via From
-pub struct CollectionSearchRequest<'a>(pub(crate) (CollectionId, &'a SearchRequestInternal));
 pub struct CollectionCoreSearchRequest<'a>(pub(crate) (CollectionId, &'a CoreSearchRequest));
 
 #[async_trait]
-#[allow(unused_variables)]
 impl ShardOperation for RemoteShard {
+    /// # Cancel safety
+    ///
+    /// This method is cancel safe.
     async fn update(
         &self,
-        operation: CollectionUpdateOperations,
+        operation: OperationWithClockTag,
         wait: bool,
     ) -> CollectionResult<UpdateResult> {
+        // `RemoteShard::execute_update_operation` is cancel safe, so this method is cancel safe.
+
         // targets the shard explicitly
         let shard_id = Some(self.id);
         self.execute_update_operation(shard_id, self.collection_id.clone(), operation, wait, None)
@@ -556,7 +658,8 @@ impl ShardOperation for RemoteShard {
         with_payload_interface: &WithPayloadInterface,
         with_vector: &WithVector,
         filter: Option<&Filter>,
-        search_runtime_handle: &Handle,
+        _search_runtime_handle: &Handle,
+        order_by: Option<&OrderBy>,
     ) -> CollectionResult<Vec<Record>> {
         let scroll_points = ScrollPoints {
             collection_name: self.collection_id.clone(),
@@ -567,6 +670,7 @@ impl ShardOperation for RemoteShard {
             with_vectors: Some(with_vector.clone().into()),
             read_consistency: None,
             shard_key_selector: None,
+            order_by: order_by.map(|o| o.clone().into()),
         };
         let request = &ScrollPointsInternal {
             scroll_points: Some(scroll_points),
@@ -580,10 +684,13 @@ impl ShardOperation for RemoteShard {
             .await?
             .into_inner();
 
+        // We need the `____ordered_with____` value even if the user didn't request payload
+        let parse_payload = with_payload_interface.is_required() || order_by.is_some();
+
         let result: Result<Vec<Record>, Status> = scroll_response
             .result
             .into_iter()
-            .map(|point| try_record_from_grpc(point, with_payload_interface.is_required()))
+            .map(|point| try_record_from_grpc(point, parse_payload))
             .collect();
 
         result.map_err(|e| e.into())
@@ -610,7 +717,7 @@ impl ShardOperation for RemoteShard {
     async fn core_search(
         &self,
         batch_request: Arc<CoreSearchRequestBatch>,
-        search_runtime_handle: &Handle,
+        _search_runtime_handle: &Handle,
         timeout: Option<Duration>,
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
         let mut timer = ScopeDurationMeasurer::new(&self.telemetry_search_durations);
@@ -727,5 +834,67 @@ impl ShardOperation for RemoteShard {
             .collect();
 
         result.map_err(|e| e.into())
+    }
+
+    async fn query_batch(
+        &self,
+        requests: Arc<Vec<ShardQueryRequest>>,
+        _search_runtime_handle: &Handle,
+        timeout: Option<Duration>,
+    ) -> CollectionResult<Vec<ShardQueryResponse>> {
+        let mut timer = ScopeDurationMeasurer::new(&self.telemetry_search_durations);
+        timer.set_success(false);
+
+        let requests = requests.as_ref();
+
+        let batch_response = self
+            .with_points_client(|mut client| async move {
+                let query_points = requests
+                    .iter()
+                    .map(|request| QueryShardPoints::from(request.clone()))
+                    .collect();
+
+                let request = &QueryBatchPointsInternal {
+                    collection_name: self.collection_id.clone(),
+                    query_points,
+                    shard_id: Some(self.id),
+                    timeout: timeout.map(|t| t.as_secs()),
+                };
+
+                let mut request = tonic::Request::new(request.clone());
+
+                if let Some(timeout) = timeout {
+                    request.set_timeout(timeout);
+                }
+
+                client.query_batch(request).await
+            })
+            .await?
+            .into_inner();
+
+        let result = batch_response
+            .results
+            .into_iter()
+            .zip(requests.iter())
+            .map(|(query_result, request)| {
+                let is_payload_required = request.with_payload.is_required();
+
+                query_result
+                    .intermediate_results
+                    .into_iter()
+                    .map(|intermediate| {
+                        intermediate
+                            .result
+                            .into_iter()
+                            .map(|point| try_scored_point_from_grpc(point, is_payload_required))
+                            .collect()
+                    })
+                    .collect()
+            })
+            .try_collect()?;
+
+        timer.set_success(true);
+
+        Ok(result)
     }
 }

@@ -17,8 +17,8 @@ pub const PROCESS_CANCELLED_BY_SERVICE_MESSAGE: &str = "process cancelled by ser
 #[derive(Error, Debug, Clone)]
 #[error("{0}")]
 pub enum OperationError {
-    #[error("Vector inserting error: expected dim: {expected_dim}, got {received_dim}")]
-    WrongVector {
+    #[error("Vector dimension error: expected dim: {expected_dim}, got {received_dim}")]
+    WrongVectorDimension {
         expected_dim: usize,
         received_dim: usize,
     },
@@ -52,6 +52,12 @@ pub enum OperationError {
     ValidationError { description: String },
     #[error("Wrong usage of sparse vectors")]
     WrongSparse,
+    #[error("Wrong usage of multi vectors")]
+    WrongMulti,
+    #[error("Wrong key of payload")]
+    WrongPayloadKey { description: String },
+    #[error("No range index for `order_by` key: `{key}`. Please create one to use `order_by`. Check https://qdrant.tech/documentation/concepts/indexing/#payload-index to see which payload schemas support Range conditions")]
+    MissingRangeIndexForOrderBy { key: String },
 }
 
 impl OperationError {
@@ -78,15 +84,6 @@ pub struct SegmentFailedState {
     pub version: SeqNumberType,
     pub point_id: Option<PointIdType>,
     pub error: OperationError,
-}
-
-impl From<semver::Error> for OperationError {
-    fn from(error: semver::Error) -> Self {
-        OperationError::ServiceError {
-            description: error.to_string(),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
-    }
 }
 
 impl From<ThreadPoolBuildError> for OperationError {
