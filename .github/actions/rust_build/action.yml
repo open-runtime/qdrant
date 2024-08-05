@@ -1,0 +1,49 @@
+# This is a Composite Action that enables step re-use
+
+name: Rust Build
+description: Cross-platform rust build function
+inputs:
+  platform:
+    description: OS and architecture to build for
+    required: true
+  analyze:
+    description: Whether to run analyze
+    required: false
+    default: 'false'
+  coverage_dir:
+    description: Where coverage artifacts should be saved
+    required: false
+    default: .coverage
+
+runs:
+  using: "composite"
+  steps:
+
+    - name: Install latest stable version
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        override: true
+        toolchain: stable
+
+    - name: Set up Cargo cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install Protoc
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Cargo Build
+      shell: bash
+      run: cargo build --release
+      working-directory: 3rdparty/qdrant
+
+    - name: Archive build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: build_${{ inputs.platform }}
+        path: |
+          3rdparty/qdrant/target/release/pieces_qdrant_server
+          3rdparty/qdrant/target/release/pieces_qdrant_server.exe
+        if-no-files-found: error
